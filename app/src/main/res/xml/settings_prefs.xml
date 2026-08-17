@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <EditTextPreference
+        android:key="blur_radius"
+        android:title="背景模糊度 combined_blur_max_radius"
+        android:summary="数值越大越模糊，建议 0-60，默认 40。修改后重启系统界面生效。"
+        android:defaultValue="40"
+        android:numeric="integer" />
+
+    <EditTextPreference
+        android:key="shade_color"
+        android:title="下拉背景压暗 shade_blend_colors_bionics"
+        android:summary="十六进制颜色（含透明度），如 #80000000 表示 50% 黑。默认 #80000000。"
+        android:defaultValue="#80000000" />
+
+    <Preference
+        android:key="about"
+        android:title="说明"
+        android:summary="作用域已默认选中 com.android.systemui。本模块强制保留液态玻璃模糊，并覆盖上述两个资源参数。" />
+
+</PreferenceScreen>
