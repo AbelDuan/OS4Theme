@@ -19,10 +19,10 @@
         <meta-data
             android:name="xposedscope"
             android:resource="@array/xposed_scope" />
-        <!-- LSPosed 设置入口 -->
+        <!-- LSPosed 设置入口（指向 PreferenceScreen 资源） -->
         <meta-data
             android:name="xposedsettings"
-            android:value=".SettingsActivity" />
+            android:resource="@xml/settings_prefs" />
 
         <activity
             android:name=".SettingsActivity"
