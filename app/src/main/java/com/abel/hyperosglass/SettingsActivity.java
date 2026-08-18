@@ -87,7 +87,7 @@ public class SettingsActivity extends Activity {
         card.setBackgroundColor(Color.WHITE);
         card.setPadding(dp(14), dp(14), dp(14), dp(14));
 
-        // 液态玻璃开关（CheckBox，无括号备注，布局简洁）
+        // 液态玻璃：启用/不启用 单选
         TextView glassHead = new TextView(this);
         glassHead.setText("液态玻璃");
         glassHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
@@ -96,20 +96,28 @@ public class SettingsActivity extends Activity {
         glassHead.setPadding(0, 0, 0, dp(2));
         card.addView(glassHead, mw());
 
-        final CheckBox cbGlass = new CheckBox(this);
-        cbGlass.setText("启用液态玻璃");
-        cbGlass.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        cbGlass.setTextColor(Color.parseColor("#222222"));
-        cbGlass.setChecked(sp().getBoolean(Constants.PREFS_GLASS_ENABLED,
-                Constants.DEFAULT_GLASS_ENABLED));
-        cbGlass.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+        final RadioGroup rgGlass = new RadioGroup(this);
+        rgGlass.setOrientation(RadioGroup.VERTICAL);
+        final RadioButton glassOn = radio("启用");
+        final RadioButton glassOff = radio("不启用");
+        rgGlass.addView(glassOn, mw());
+        rgGlass.addView(glassOff, mw());
+        if (sp().getBoolean(Constants.PREFS_GLASS_ENABLED, Constants.DEFAULT_GLASS_ENABLED)) {
+            glassOn.setChecked(true);
+        } else {
+            glassOff.setChecked(true);
+        }
+        sInit = false;
+        rgGlass.setOnCheckedChangeListener(new RadioGroup.OnCheckedChangeListener() {
             @Override
-            public void onCheckedChanged(CompoundButton b, boolean checked) {
-                sp().edit().putBoolean(Constants.PREFS_GLASS_ENABLED, checked).apply();
-                toast(checked ? "已启用（重启系统界面后生效）" : "已关闭（重启系统界面后生效）");
+            public void onCheckedChanged(RadioGroup group, int checkedId) {
+                if (sInit) return;
+                sp().edit().putBoolean(Constants.PREFS_GLASS_ENABLED,
+                        checkedId == glassOn.getId()).apply();
+                toast("已保存（重启系统界面后生效）");
             }
         });
-        card.addView(cbGlass, mw());
+        card.addView(rgGlass, mw());
 
         // 锁屏通知下沉：三态单选
         TextView fodHead = new TextView(this);
@@ -201,7 +209,7 @@ public class SettingsActivity extends Activity {
                 + "· 修改设置后，点「重启系统界面」立即生效\n"
                 + "\n"
                 + "功能说明\n"
-                + "· 液态玻璃：第三方主题下保留系统界面玻璃模糊\n"
+                + "· 液态玻璃：第三方主题下保留玻璃模糊，并修复通知展开按钮颜色\n"
                 + "· 锁屏通知下沉：隐藏或覆盖指纹图标区域\n"
                 + "\n"
                 + "开启日志记录后，日志保存于本应用私有目录，\n"

@@ -52,6 +52,8 @@ public class MainHook implements IXposedHookLoadPackage {
     // ---- 展开按钮修复缓存 ----
     private static boolean sViewHooked = false;
     private static final Set<String> sConfirmedViewClass = new HashSet<>();
+    /** 已确认「非展开按钮」的类名（快路径缓存，避免重复查资源名，功耗优化） */
+    private static final Set<String> sNonExpandClasses = new HashSet<>();
     /** 已记录过日志的 (类名#id)，避免命中日志刷屏（功耗优化） */
     private static final Set<String> sLoggedExpandBg = new HashSet<>();
     private static final Set<String> sLoggedExpandTint = new HashSet<>();
@@ -354,11 +356,24 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static void handleSetBackground(XC_MethodHook.MethodHookParam p) {
         try {
+            // 展开按钮颜色修复与「液态玻璃」绑定：玻璃关闭时不干预
+            if (!sGlassEnabled) return;
+
             View v = (View) p.thisObject;
             String cls = v.getClass().getName();
 
-            // 快路径：非展开按钮类直接放行（不做资源名查询，降低高频开销）
-            if (!isExpandClass(cls) && !sConfirmedViewClass.contains(cls)) return;
+            // 快路径：已确认无关的类直接跳过（不重复查资源名）
+            if (sNonExpandClasses.contains(cls)) return;
+            if (!isExpandClass(cls) && !sConfirmedViewClass.contains(cls)) {
+                // 类名不含关键词：首次遇到才查资源 id 名（展开按钮类名不含特征，
+                // 靠 id=expand_button_pill 命中），命中则记住该类，否则缓存为无关
+                String idName = viewIdName(v);
+                if (!isExpandButton(cls, idName)) {
+                    if (sNonExpandClasses.size() < 300) sNonExpandClasses.add(cls);
+                    return;
+                }
+                sConfirmedViewClass.add(cls);
+            }
 
             String idName = viewIdName(v);
             boolean suspect = isExpandButton(cls, idName);
@@ -379,11 +394,22 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static void handleSetBackgroundTintList(XC_MethodHook.MethodHookParam p) {
         try {
+            // 展开按钮颜色修复与「液态玻璃」绑定：玻璃关闭时不干预
+            if (!sGlassEnabled) return;
+
             View v = (View) p.thisObject;
             String cls = v.getClass().getName();
 
-            // 快路径：非展开按钮类直接放行
-            if (!isExpandClass(cls) && !sConfirmedViewClass.contains(cls)) return;
+            // 快路径：已确认无关的类直接跳过
+            if (sNonExpandClasses.contains(cls)) return;
+            if (!isExpandClass(cls) && !sConfirmedViewClass.contains(cls)) {
+                String idName = viewIdName(v);
+                if (!isExpandButton(cls, idName)) {
+                    if (sNonExpandClasses.size() < 300) sNonExpandClasses.add(cls);
+                    return;
+                }
+                sConfirmedViewClass.add(cls);
+            }
 
             String idName = viewIdName(v);
             boolean suspect = isExpandButton(cls, idName);
