@@ -19,10 +19,10 @@
         <meta-data
             android:name="xposedscope"
             android:resource="@array/xposed_scope" />
-        <!-- LSPosed 设置入口（指向 PreferenceScreen 资源） -->
+        <!-- LSPosed 设置入口（指向本模块设置 Activity，内含重启 SystemUI 按钮） -->
         <meta-data
             android:name="xposedsettings"
-            android:resource="@xml/settings_prefs" />
+            android:value=".SettingsActivity" />
 
         <activity
             android:name=".SettingsActivity"

@@ -1,19 +1,27 @@
 package com.abel.hyperosglass;
 
+/**
+ * 模块常量。
+ *
+ * 真实命中点（已在真机 MIUISystemUIPlugin.apk 的 classes2.dex 中 dexdump 确认）：
+ *   class  miui.systemui.util.ThemeUtils
+ *   method public final boolean getDefaultSysUiTheme()  // ()Z
+ *   method public final boolean getDefaultPluginTheme() // ()Z
+ * 两者强制返回 true，等价于直接修改 smali，使应用第三方主题后仍保留液态玻璃模糊。
+ */
 public final class Constants {
-    /** 本模块自身包名（用于读取设置） */
-    public static final String MODULE_PACKAGE = "com.abel.hyperosglass";
-    /** SharedPreferences 文件名 */
-    public static final String PREF_NAME = "settings";
 
-    /** 背景模糊度：对应资源 combined_blur_max_radius，单位约等于 dp */
-    public static final String KEY_BLUR_RADIUS = "blur_radius";
-    /** 下拉背景压暗：对应资源 shade_blend_colors_bionics，十六进制颜色 */
-    public static final String KEY_SHADE_COLOR = "shade_color";
-    /** 是否启用「模糊度/压暗」资源覆盖（默认关闭，避免个别机型触发安全模式） */
-    public static final String KEY_RESOURCE_OVERRIDE = "resource_override";
+    /** 作用域：系统界面组件所在进程 */
+    public static final String TARGET_PKG = "com.android.systemui";
 
-    public static final float DEFAULT_BLUR_RADIUS = 40.0f;
-    public static final String DEFAULT_SHADE_COLOR = "#80000000";
-    public static final int DEFAULT_SHADE_COLOR_INT = 0x80000000;
+    /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
+    public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
+
+    /** 需要强制返回 true 的两个判定方法 */
+    public static final String[] TARGET_METHODS = {
+            "getDefaultSysUiTheme",
+            "getDefaultPluginTheme",
+    };
+
+    public static final String LOG_TAG = "[HyperOSGlass]";
 }

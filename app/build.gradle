@@ -31,6 +31,7 @@ android {
 }
 
 dependencies {
-    // Xposed API 仅编译期需要，运行时由 LSPosed 提供（来自 https://api.xposed.info ）。
-    compileOnly 'de.robv.android.xposed:api:82'
+    // Xposed API 仅编译期需要，运行时由 LSPosed 提供。
+    // 已内置到 app/libs/XposedBridgeApi-82.jar（来自 https://api.xposed.info ），无需联网。
+    compileOnly files('libs/XposedBridgeApi-82.jar')
 }
