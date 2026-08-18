@@ -1,6 +1,4 @@
 <resources>
     <string name="app_name">OS4 玻璃模糊</string>
-    <string name="module_description">HyperOS 4 液态玻璃：应用第三方主题后强制保留玻璃模糊（挂钩 miui.systemui.util.ThemeUtils）</string>
-    <string name="pref_restart_title">重启系统界面 (SystemUI)</string>
-    <string name="pref_restart_summary">需要 root 权限。点击后强制重启系统界面，使模块/设置立即生效，无需整机重启。</string>
+    <string name="module_description">HyperOS 4 液态玻璃：应用第三方主题后强制保留玻璃模糊（挂钩 miui.systemui.util.ThemeUtils）；修复第三方主题下通知展开按钮深色</string>
 </resources>

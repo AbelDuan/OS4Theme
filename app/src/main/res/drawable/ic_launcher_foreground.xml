@@ -1,0 +1,21 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 玻璃面板主体 -->
+    <path
+        android:pathData="M28,32 h52 a10,10 0 0 1 10,10 v28 a10,10 0 0 1 -10,10 h-52 a10,10 0 0 1 -10,-10 v-28 a10,10 0 0 1 10,-10 z"
+        android:fillColor="#FFFFFF"
+        android:fillAlpha="0.95" />
+    <!-- 斜向高光 -->
+    <path
+        android:pathData="M38,38 L60,38 L44,82 L26,82 Z"
+        android:fillColor="#BFE6FF"
+        android:fillAlpha="0.85" />
+    <!-- 小气泡 -->
+    <path
+        android:pathData="M76,42 m-9,0 a9,9 0 1 0 18,0 a9,9 0 1 0 -18,0"
+        android:fillColor="#E3F4FF"
+        android:fillAlpha="0.9" />
+</vector>

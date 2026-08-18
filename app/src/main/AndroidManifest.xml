@@ -3,6 +3,8 @@
 
     <application
         android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
         android:label="@string/app_name">
 
         <!-- LSPosed 模块声明 -->
@@ -33,6 +35,14 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- 导出日志时以 content:// 形式只读分享日志文件（query 返回文件信息，
+             澎湃互联等接收端才能正常读取） -->
+        <provider
+            android:name=".LogFileProvider"
+            android:authorities="com.abel.hyperosglass.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true" />
     </application>
 
 </manifest>
