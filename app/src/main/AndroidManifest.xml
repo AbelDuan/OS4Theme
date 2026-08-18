@@ -36,6 +36,12 @@
             </intent-filter>
         </activity>
 
+        <!-- 设置通道：SystemUI 进程读取用户开关（锁屏通知下沉） -->
+        <provider
+            android:name=".StatusProvider"
+            android:authorities="com.abel.hyperosglass.status"
+            android:exported="true" />
+
         <!-- 导出日志时以 content:// 形式只读分享日志文件（query 返回文件信息，
              澎湃互联等接收端才能正常读取） -->
         <provider

@@ -40,6 +40,54 @@ public final class Constants {
     /** 本模块自身包名 */
     public static final String MODULE_PKG = "com.abel.hyperosglass";
 
+    /** SharedPreferences 文件名（设置页写入 / StatusProvider 读取） */
+    public static final String PREFS = "hyperosglass";
+
+    // ── 设置项（由 StatusProvider 下发）──
+    /** 液态玻璃启用开关（默认开：第三方主题上保留玻璃模糊） */
+    public static final String PREFS_GLASS_ENABLED = "glass_enabled";
+    public static final boolean DEFAULT_GLASS_ENABLED = true;
+
+    /** 锁屏通知下沉模式：0=不启用 / 1=下沉+隐藏指纹图标 / 2=下沉+覆盖指纹图标 */
+    public static final String PREFS_FOD_MODE = "fod_mode";
+    public static final int FOD_MODE_OFF = 0;
+    public static final int FOD_MODE_HIDE_ICON = 1;
+    public static final int FOD_MODE_COVER_ICON = 2;
+    public static final int DEFAULT_FOD_MODE = FOD_MODE_OFF;
+
+    /** 日志记录开关（默认关；日志经 StatusProvider 存入模块私有目录） */
+    public static final String PREFS_ENABLE_LOG = "enable_log";
+    public static final boolean DEFAULT_ENABLE_LOG = false;
+
+    /** StatusProvider authority（SystemUI 进程读取开关 / 推送日志） */
+    public static final String STATUS_AUTHORITY = "com.abel.hyperosglass.status";
+    public static final String STATUS_URI = "content://" + STATUS_AUTHORITY;
+    public static final String METHOD_GET_PREFS = "get_prefs";
+    public static final String METHOD_APPEND_LOG = "append_log";
+    /** append_log 时携带的日志行 key */
+    public static final String KEY_LOG_LINE = "line";
+
+    // ── 锁屏通知下沉 / 隐藏指纹图标（参照 HyperChanger）──
+    /** 通知是否使用额外 shelf 空间（指纹让位）的 suspend lambda */
+    public static final String FOD_SHELF_SPACE_FLOW_CLASS =
+            "com.android.systemui.statusbar.notification.stack.domain.interactor."
+                    + "SharedNotificationContainerInteractor$useExtraShelfSpace$1";
+    /** 通知位置计算的 suspend lambda（输入含 HAS_ENROLLED 位） */
+    public static final String FOD_NOTIFICATION_POSITION_FLOW_CLASS =
+            "com.android.keyguard.panel.KeyguardPanelViewController"
+                    + "$nsslLockYPosition_delegate$lambda$106$$inlined$combine$1$3";
+    /** MIUI/HyperOS 屏下指纹图标 View */
+    public static final String MIUI_GXZW_ICON_VIEW_CLASS =
+            "com.miui.keyguard.biometrics.fod.MiuiGxzwIconView";
+    /** 隐藏指纹图标的方法（原版拼写如此：Fingerpirnt） */
+    public static final String FOD_DISMISS_ICON_METHOD = "dismissFingerpirntIcon";
+    /** flow 输入数组中「已录入指纹」位的下标 */
+    public static final int FOD_FLOW_HAS_ENROLLED_INDEX = 6;
+
+    // ── 日志存储（模块私有目录，绕开 /sdcard 权限）──
+    public static final String LOG_FILE = "hyperos_glass.log";
+    public static final long LOG_MAX = 512 * 1024L;
+
     // ── 导出日志（参照 WechatLive）──
     /** 导出日志用 FileProvider authority */
     public static final String FILE_AUTH = "com.abel.hyperosglass.fileprovider";
@@ -48,10 +96,10 @@ public final class Constants {
      * 展开按钮「药丸」背景色（澎湃 OS4 液态玻璃风格搭配色）。
      * 用户反馈完全透明（null）与原生「半透白」不符——液态玻璃浅色面板上的
      * 小控件为半透明白，深色玻璃上为更亮的半透明白，因此按深浅模式返回：
-     *   - 浅色模式：0x33FFFFFF（约 20% 白）
-     *   - 深色模式：0x40FFFFFF（约 25% 白，深色玻璃上更可见）
+     *   - 浅色模式：0x1FFFFFFF（约 12% 白）
+     *   - 深色模式：0x26FFFFFF（约 15% 白，深色玻璃上更可见）
      * 圆角较大呈药丸状，贴近液态玻璃小控件观感。
      */
-    public static final int EXPAND_PILL_BG_LIGHT = 0x33FFFFFF;
-    public static final int EXPAND_PILL_BG_DARK = 0x40FFFFFF;
+    public static final int EXPAND_PILL_BG_LIGHT = 0x1FFFFFFF;
+    public static final int EXPAND_PILL_BG_DARK = 0x26FFFFFF;
 }

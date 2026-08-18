@@ -1,4 +1,4 @@
 <resources>
-    <string name="app_name">OS4 玻璃模糊</string>
-    <string name="module_description">HyperOS 4 液态玻璃：应用第三方主题后强制保留玻璃模糊（挂钩 miui.systemui.util.ThemeUtils）；修复第三方主题下通知展开按钮深色</string>
+    <string name="app_name">OS4 Themer</string>
+    <string name="module_description">HyperOS 4 主题增强：第三方主题上保留液态玻璃模糊；锁屏通知下沉（隐藏/覆盖指纹图标）</string>
 </resources>

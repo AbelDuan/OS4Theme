@@ -1,7 +1,8 @@
 package com.abel.hyperosglass;
 
+import android.app.Activity;
 import android.content.Intent;
-import android.content.res.ColorStateList;
+import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.net.Uri;
@@ -11,25 +12,36 @@ import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
+import android.widget.CheckBox;
+import android.widget.CompoundButton;
 import android.widget.LinearLayout;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.text.SimpleDateFormat;
 import java.util.Date;
+import java.util.List;
 import java.util.Locale;
 
 /**
- * 模块设置界面（极简版，参照 WechatLive 风格）。
- *  - 「重启系统界面 (SystemUI)」：root 执行 am crash，让挂钩/设置立即生效。
- *  - 「导出日志」：把模块运行日志写到外部私有目录，弹出系统分享面板直接分享文件。
- *  - 默认已开启「展开按钮修复」，无开关。
- *  - 无状态横幅、无开关、无实时日志预览、无清空按钮——按用户要求精简。
+ * 模块设置界面（参照 WechatLive 风格，纯代码构建，无 AndroidX）。
+ *
+ * 【铁律】本类不得 import / 引用任何 de.robv.android.xposed.* 或 MainHook。
+ * 模块 App 自己的进程里没有 XposedBridge，一旦引用就会 NoClassDefFoundError 闪退。
+ *
+ * 功能：
+ *  - 锁屏通知下沉三态：不启用 / 隐藏指纹图标 / 覆盖指纹图标
+ *  - 日志记录开关（默认关；经 StatusProvider 写入模块私有目录）
+ *  - 重启系统界面（root）、导出日志（content:// 分享）
  */
-public class SettingsActivity extends android.app.Activity {
+public class SettingsActivity extends Activity {
+
+    private boolean sInit = true;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -41,6 +53,10 @@ public class SettingsActivity extends android.app.Activity {
         }
     }
 
+    private SharedPreferences sp() {
+        return getSharedPreferences(Constants.PREFS, MODE_PRIVATE);
+    }
+
     private void buildUi() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -50,7 +66,7 @@ public class SettingsActivity extends android.app.Activity {
 
         // 标题
         TextView title = new TextView(this);
-        title.setText("OS4 玻璃模糊");
+        title.setText("OS4 Themer");
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setTextColor(Color.parseColor("#1A1A1A"));
@@ -58,18 +74,108 @@ public class SettingsActivity extends android.app.Activity {
         root.addView(title, mw());
 
         TextView sub = new TextView(this);
-        sub.setText("HyperOS 4 液态玻璃 · 展开按钮跟随系统原生外观");
+        sub.setText("HyperOS 4 主题增强 · 液态玻璃 · 锁屏通知下沉");
         sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         sub.setTextColor(Color.parseColor("#666666"));
         sub.setGravity(Gravity.CENTER);
         sub.setPadding(0, dp(6), 0, dp(20));
         root.addView(sub, mw());
 
-        // 按钮卡片
+        // ── 功能卡片 ──
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
         card.setBackgroundColor(Color.WHITE);
         card.setPadding(dp(14), dp(14), dp(14), dp(14));
+
+        // 液态玻璃：是/否单选
+        TextView glassHead = new TextView(this);
+        glassHead.setText("启用液态玻璃");
+        glassHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        glassHead.setTypeface(Typeface.DEFAULT_BOLD);
+        glassHead.setTextColor(Color.parseColor("#222222"));
+        glassHead.setPadding(0, 0, 0, dp(4));
+        card.addView(glassHead, mw());
+
+        final RadioGroup rgGlass = new RadioGroup(this);
+        rgGlass.setOrientation(RadioGroup.HORIZONTAL);
+        final RadioButton glassYes = radio("是");
+        final RadioButton glassNo = radio("否");
+        rgGlass.addView(glassYes, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        rgGlass.addView(glassNo, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        boolean glassOn = sp().getBoolean(Constants.PREFS_GLASS_ENABLED,
+                Constants.DEFAULT_GLASS_ENABLED);
+        if (glassOn) glassYes.setChecked(true);
+        else glassNo.setChecked(true);
+        sInit = false;
+        rgGlass.setOnCheckedChangeListener(new RadioGroup.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(RadioGroup group, int checkedId) {
+                if (sInit) return;
+                sp().edit().putBoolean(Constants.PREFS_GLASS_ENABLED,
+                        checkedId == glassYes.getId()).apply();
+                toast("已保存（重启系统界面后生效）");
+            }
+        });
+        card.addView(rgGlass, mw());
+
+        // 锁屏通知下沉：三态单选
+        TextView fodHead = new TextView(this);
+        fodHead.setText("锁屏通知下沉");
+        fodHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        fodHead.setTypeface(Typeface.DEFAULT_BOLD);
+        fodHead.setTextColor(Color.parseColor("#222222"));
+        LinearLayout.LayoutParams lpFodHead = mw();
+        lpFodHead.topMargin = dp(12);
+        card.addView(fodHead, lpFodHead);
+
+        final RadioGroup rg = new RadioGroup(this);
+        rg.setOrientation(RadioGroup.VERTICAL);
+        final RadioButton rb0 = radio("不启用");
+        final RadioButton rb1 = radio("锁屏通知下沉（隐藏指纹图标）");
+        final RadioButton rb2 = radio("锁屏通知下沉（覆盖指纹图标）");
+        rg.addView(rb0, mw());
+        rg.addView(rb1, mw());
+        rg.addView(rb2, mw());
+        int mode = sp().getInt(Constants.PREFS_FOD_MODE, Constants.DEFAULT_FOD_MODE);
+        if (mode == Constants.FOD_MODE_HIDE_ICON) {
+            rb1.setChecked(true);
+        } else if (mode == Constants.FOD_MODE_COVER_ICON) {
+            rb2.setChecked(true);
+        } else {
+            rb0.setChecked(true);
+        }
+        sInit = false;
+        rg.setOnCheckedChangeListener(new RadioGroup.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(RadioGroup group, int checkedId) {
+                if (sInit) return;
+                int val = Constants.FOD_MODE_OFF;
+                if (checkedId == rb1.getId()) val = Constants.FOD_MODE_HIDE_ICON;
+                else if (checkedId == rb2.getId()) val = Constants.FOD_MODE_COVER_ICON;
+                sp().edit().putInt(Constants.PREFS_FOD_MODE, val).apply();
+                toast("已保存（重启系统界面后生效）");
+            }
+        });
+        card.addView(rg, mw());
+
+        // 日志记录开关
+        final CheckBox cbLog = new CheckBox(this);
+        cbLog.setText("日志记录");
+        cbLog.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        cbLog.setTextColor(Color.parseColor("#222222"));
+        cbLog.setChecked(sp().getBoolean(Constants.PREFS_ENABLE_LOG, Constants.DEFAULT_ENABLE_LOG));
+        cbLog.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(CompoundButton b, boolean checked) {
+                sp().edit().putBoolean(Constants.PREFS_ENABLE_LOG, checked).apply();
+                toast(checked ? "已开启（重启系统界面后生效）" : "已关闭（重启系统界面后生效）");
+            }
+        });
+        LinearLayout.LayoutParams lpLog = mw();
+        lpLog.topMargin = dp(4);
+        card.addView(cbLog, lpLog);
 
         // 重启系统界面
         Button btnRestart = makeButton("重启系统界面 (SystemUI)");
@@ -79,7 +185,9 @@ public class SettingsActivity extends android.app.Activity {
                 restartSystemUi();
             }
         });
-        card.addView(btnRestart, mw());
+        LinearLayout.LayoutParams lpRestart = mw();
+        lpRestart.topMargin = dp(10);
+        card.addView(btnRestart, lpRestart);
 
         // 导出日志
         Button btnExport = makeButton("导出日志");
@@ -97,9 +205,16 @@ public class SettingsActivity extends android.app.Activity {
 
         // 底部说明
         TextView hint = new TextView(this);
-        hint.setText("作用域：com.android.systemui\n"
-                + "LSPosed Manager → 模块 → OS4 玻璃模糊 → 启用并勾选作用域后，\n"
-                + "点「重启系统界面」让挂钩立即生效。");
+        hint.setText("使用方法\n"
+                + "· LSPosed 中启用本模块，作用域勾选「系统界面」\n"
+                + "· 修改任何设置后，点「重启系统界面」立即生效\n"
+                + "\n"
+                + "功能说明\n"
+                + "· 液态玻璃：应用第三方主题后仍保留系统界面玻璃模糊\n"
+                + "· 锁屏通知下沉：隐藏/覆盖指纹图标区域，通知占满显示\n"
+                + "\n"
+                + "日志记录开启后，日志存入本应用私有目录，\n"
+                + "可在「导出日志」中直接分享。");
         hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
         hint.setTextColor(Color.parseColor("#888888"));
         hint.setPadding(dp(4), dp(18), dp(4), 0);
@@ -109,6 +224,14 @@ public class SettingsActivity extends android.app.Activity {
         setContentView(root);
     }
 
+    private RadioButton radio(String text) {
+        RadioButton rb = new RadioButton(this);
+        rb.setText(text);
+        rb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        rb.setTextColor(Color.parseColor("#222222"));
+        return rb;
+    }
+
     private Button makeButton(String text) {
         Button b = new Button(this);
         b.setText(text);
@@ -116,7 +239,6 @@ public class SettingsActivity extends android.app.Activity {
         b.setTextColor(Color.parseColor("#1A1A1A"));
         b.setAllCaps(false);
         b.setPadding(dp(8), dp(14), dp(8), dp(14));
-        // 轻微圆角白底
         android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
         bg.setColor(Color.parseColor("#F0F2F5"));
         bg.setCornerRadius(dp(8));
@@ -146,15 +268,20 @@ public class SettingsActivity extends android.app.Activity {
         }
     }
 
-    /**
-     * 导出日志：把日志写到外部私有目录（无需任何存储权限），
-     * 再调起系统分享面板（澎湃互联 / 微信文件传输 / WorkBuddy 等）发送。
-     */
+    /** 导出日志：读模块私有日志 → 写外部私有目录 → 系统分享面板 */
     private void exportLog() {
         try {
-            String content = readLogContent();
+            java.io.File logFile = LogStore.file(this);
+            String content = LogStore.readFully(this);
             if (content.length() == 0) {
-                toast("暂无日志（产生日志需要：启用模块 → 重启系统界面 → 拉出通知）");
+                String diag = "日志文件：" + (logFile.exists() ? "存在(" + logFile.length() + "B)"
+                        : "不存在") + "，开关="
+                        + sp().getBoolean(Constants.PREFS_ENABLE_LOG, false);
+                if (!sp().getBoolean(Constants.PREFS_ENABLE_LOG, false)) {
+                    toast("日志记录为关闭，导出为空。请开启「日志记录」→ 重启系统界面。" + diag);
+                } else {
+                    toast("日志为空（需重启系统界面并锁屏后再导出）。" + diag);
+                }
                 return;
             }
             File dir = getExternalFilesDir(null);
@@ -183,40 +310,21 @@ public class SettingsActivity extends android.app.Activity {
         }
     }
 
-    private String readLogContent() {
-        // 优先 /sdcard 主日志（LogUtil 写入点），其次回退 /data/local/tmp
-        String[] paths = {Constants.LOG_FILE_PRIMARY, Constants.LOG_FILE_SECONDARY};
-        for (String path : paths) {
-            try {
-                File f = new File(path);
-                if (!f.exists()) continue;
-                FileInputStream fis = new FileInputStream(f);
-                try {
-                    byte[] buf = new byte[(int) f.length()];
-                    int n = fis.read(buf);
-                    String s = new String(buf, 0, n < 0 ? 0 : n, "UTF-8");
-                    if (s.length() > 0) return s;
-                } finally {
-                    fis.close();
-                }
-            } catch (Throwable ignored) {
-            }
-        }
-        return "";
-    }
-
     // ────────────────────────────── 兜底 ──────────────────────────────
 
     private void showFatal(Throwable t) {
         try {
+            ScrollView sv = new ScrollView(this);
             TextView tv = new TextView(this);
             tv.setPadding(dp(16), dp(16), dp(16), dp(16));
             tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
             tv.setTypeface(Typeface.MONOSPACE);
             tv.setTextIsSelectable(true);
             tv.setMovementMethod(new ScrollingMovementMethod());
-            tv.setText("界面初始化异常（已拦截，未闪退）：\n\n" + android.util.Log.getStackTraceString(t));
-            setContentView(tv);
+            tv.setText("界面初始化异常（已拦截，未闪退）：\n\n"
+                    + android.util.Log.getStackTraceString(t));
+            sv.addView(tv);
+            setContentView(sv);
         } catch (Throwable ignored) {
         }
     }
