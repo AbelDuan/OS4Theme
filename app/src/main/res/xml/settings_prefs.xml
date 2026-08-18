@@ -1,6 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <SwitchPreference
+        android:key="resource_override"
+        android:title="启用模糊度/压暗覆盖"
+        android:summary="关闭时只保留强制玻璃效果（最稳）。开启后会覆盖 combined_blur_max_radius 与 shade_blend_colors_bionics，个别机型可能触发安全模式，请谨慎。"
+        android:defaultValue="false" />
+
     <EditTextPreference
         android:key="blur_radius"
         android:title="背景模糊度 combined_blur_max_radius"
