@@ -74,11 +74,11 @@ public class SettingsActivity extends Activity {
         root.addView(title, mw());
 
         TextView sub = new TextView(this);
-        sub.setText("HyperOS 4 主题增强 · 液态玻璃 · 锁屏通知下沉");
+        sub.setText("HyperOS 4 主题增强");
         sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         sub.setTextColor(Color.parseColor("#666666"));
         sub.setGravity(Gravity.CENTER);
-        sub.setPadding(0, dp(6), 0, dp(20));
+        sub.setPadding(0, dp(4), 0, dp(18));
         root.addView(sub, mw());
 
         // ── 功能卡片 ──
@@ -87,38 +87,29 @@ public class SettingsActivity extends Activity {
         card.setBackgroundColor(Color.WHITE);
         card.setPadding(dp(14), dp(14), dp(14), dp(14));
 
-        // 液态玻璃：是/否单选
+        // 液态玻璃开关（CheckBox，无括号备注，布局简洁）
         TextView glassHead = new TextView(this);
-        glassHead.setText("启用液态玻璃");
+        glassHead.setText("液态玻璃");
         glassHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         glassHead.setTypeface(Typeface.DEFAULT_BOLD);
         glassHead.setTextColor(Color.parseColor("#222222"));
-        glassHead.setPadding(0, 0, 0, dp(4));
+        glassHead.setPadding(0, 0, 0, dp(2));
         card.addView(glassHead, mw());
 
-        final RadioGroup rgGlass = new RadioGroup(this);
-        rgGlass.setOrientation(RadioGroup.HORIZONTAL);
-        final RadioButton glassYes = radio("是");
-        final RadioButton glassNo = radio("否");
-        rgGlass.addView(glassYes, new LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        rgGlass.addView(glassNo, new LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        boolean glassOn = sp().getBoolean(Constants.PREFS_GLASS_ENABLED,
-                Constants.DEFAULT_GLASS_ENABLED);
-        if (glassOn) glassYes.setChecked(true);
-        else glassNo.setChecked(true);
-        sInit = false;
-        rgGlass.setOnCheckedChangeListener(new RadioGroup.OnCheckedChangeListener() {
+        final CheckBox cbGlass = new CheckBox(this);
+        cbGlass.setText("启用液态玻璃");
+        cbGlass.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        cbGlass.setTextColor(Color.parseColor("#222222"));
+        cbGlass.setChecked(sp().getBoolean(Constants.PREFS_GLASS_ENABLED,
+                Constants.DEFAULT_GLASS_ENABLED));
+        cbGlass.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
             @Override
-            public void onCheckedChanged(RadioGroup group, int checkedId) {
-                if (sInit) return;
-                sp().edit().putBoolean(Constants.PREFS_GLASS_ENABLED,
-                        checkedId == glassYes.getId()).apply();
-                toast("已保存（重启系统界面后生效）");
+            public void onCheckedChanged(CompoundButton b, boolean checked) {
+                sp().edit().putBoolean(Constants.PREFS_GLASS_ENABLED, checked).apply();
+                toast(checked ? "已启用（重启系统界面后生效）" : "已关闭（重启系统界面后生效）");
             }
         });
-        card.addView(rgGlass, mw());
+        card.addView(cbGlass, mw());
 
         // 锁屏通知下沉：三态单选
         TextView fodHead = new TextView(this);
@@ -127,7 +118,7 @@ public class SettingsActivity extends Activity {
         fodHead.setTypeface(Typeface.DEFAULT_BOLD);
         fodHead.setTextColor(Color.parseColor("#222222"));
         LinearLayout.LayoutParams lpFodHead = mw();
-        lpFodHead.topMargin = dp(12);
+        lpFodHead.topMargin = dp(10);
         card.addView(fodHead, lpFodHead);
 
         final RadioGroup rg = new RadioGroup(this);
@@ -207,18 +198,18 @@ public class SettingsActivity extends Activity {
         TextView hint = new TextView(this);
         hint.setText("使用方法\n"
                 + "· LSPosed 中启用本模块，作用域勾选「系统界面」\n"
-                + "· 修改任何设置后，点「重启系统界面」立即生效\n"
+                + "· 修改设置后，点「重启系统界面」立即生效\n"
                 + "\n"
                 + "功能说明\n"
-                + "· 液态玻璃：应用第三方主题后仍保留系统界面玻璃模糊\n"
-                + "· 锁屏通知下沉：隐藏/覆盖指纹图标区域，通知占满显示\n"
+                + "· 液态玻璃：第三方主题下保留系统界面玻璃模糊\n"
+                + "· 锁屏通知下沉：隐藏或覆盖指纹图标区域\n"
                 + "\n"
-                + "日志记录开启后，日志存入本应用私有目录，\n"
-                + "可在「导出日志」中直接分享。");
+                + "开启日志记录后，日志保存于本应用私有目录，\n"
+                + "可通过「导出日志」直接分享。");
         hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
         hint.setTextColor(Color.parseColor("#888888"));
-        hint.setPadding(dp(4), dp(18), dp(4), 0);
-        hint.setLineSpacing(dp(4), 1f);
+        hint.setPadding(dp(4), dp(16), dp(4), 0);
+        hint.setLineSpacing(dp(3), 1f);
         root.addView(hint, mw());
 
         setContentView(root);
