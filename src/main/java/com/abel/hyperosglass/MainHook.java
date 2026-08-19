@@ -65,6 +65,11 @@ public class MainHook extends XposedModule {
     private volatile boolean sGlassEnabled = Constants.DEFAULT_GLASS_ENABLED;
     private volatile boolean sHideNotifClear = Constants.DEFAULT_HIDE_NOTIF_CLEAR;
     private volatile boolean sHideRecentsClear = Constants.DEFAULT_HIDE_RECENTS_CLEAR;
+    /** 隐藏按钮开关的原子引用（供 setVisibility 拦截器读取；与 sHide* 同步） */
+    private static final java.util.concurrent.atomic.AtomicBoolean sHideNotifClearFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HIDE_NOTIF_CLEAR);
+    private static final java.util.concurrent.atomic.AtomicBoolean sHideRecentsClearFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HIDE_RECENTS_CLEAR);
 
     /** flow 诊断计数（前 5 次调用记日志，确认锁屏时是否真的被调用） */
     private static int sFlow1Logs = 0;
@@ -150,6 +155,8 @@ public class MainHook extends XposedModule {
             sGlassEnabled = newGlass;
             sHideNotifClear = newNotifClear;
             sHideRecentsClear = newRecentsClear;
+            sHideNotifClearFlag.set(newNotifClear);
+            sHideRecentsClearFlag.set(newRecentsClear);
             LogUtil.setEnabled(log);
             LogUtil.logAlways("设置(框架)：sink=" + sSinkEnabled + "，glass=" + sGlassEnabled
                     + "，hideNotifClear=" + sHideNotifClear
@@ -610,111 +617,102 @@ public class MainHook extends XposedModule {
     }
 
     // ============================================================
-    // 隐藏「清除通知」按钮（v3.1.0 通知栏下拉 → 精准命中 mClearAllButton）
+    // 隐藏「清除」按钮（v3.1.3 统一：按资源 id 精准过滤 setVisibility）
     // ============================================================
     /**
-     * 精准命中（uiautomator dump + aapt2 资源表交叉确认）：
-     *   - 类：com.android.systemui.statusbar.notification.stack.SectionHeaderView
-     *   - 字段：mClearAllButton : ImageView（public 字段，aapt2 dump sysui_base.apk
-     *     确认 id=0x7f0b01e9 = id/btn_clear_all）
-     *   - 时机：hook 该类实例方法 onFinishInflate（该类 override，dexdump 确认），
-     *     after 回调里反射读 mClearAllButton → setVisibility(INVISIBLE)。
-     *   命中面：仅通知 section header 内的 1 个 ImageView，其他界面零影响。
+     * v3.1.0~v3.1.2 静态猜宿主类（SectionHeaderView / FooterView）均失败：
+     * HyperOS 通知面板 header 布局由 shade_header_container 承载，宿主不是
+     * AOSP FooterView，setClearAllButtonVisible 从未被调用。
+     * v3.1.3 改为运行时方案：
+     *   - hook android.view.View.setVisibility(int)；
+     *   - 回调里 v.getId() == 目标资源 id 才短路为 INVISIBLE（不 proceed，
+     *     避免递归），其他 View 仅做 O(1) int 比对、零副作用（不构造对象、
+     *     无 IO、无日志）；
+     *   - 目标 id 从 pkg.R$id 运行时反射一次性拿（volatile int 缓存）；
+     *   - 命中面仍仅 1 个 View（通知栏 notification_dismiss_view /
+     *     多任务 clearAnimView），时机可靠（任何显示/隐藏控制必经 setVisibility）。
      */
-    private void installNotifClearButtonHide(ClassLoader cl) {
+    private void installHideButtonById(final ClassLoader cl, final String pkg,
+                                       final String idName, final String tag,
+                                       final java.util.concurrent.atomic.AtomicBoolean enabled) {
         try {
-            Class<?> fv = Class.forName(Constants.NOTIF_FOOTER_VIEW_CLASS, false, cl);
-            final Method setClearAllButtonVisible = fv.getDeclaredMethod(
-                    "setClearAllButtonVisible", boolean.class, boolean.class);
-            setClearAllButtonVisible.setAccessible(true);
-            hook(setClearAllButtonVisible)
+            final Method setVis = View.class.getMethod("setVisibility", int.class);
+            hook(setVis)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("notif-clear-button-hide")
+                    .setId("hide-button-" + idName)
                     .intercept(new XposedInterface.Hooker() {
+                        private volatile int sId;       // 0=未解析
+                        private boolean sLogged;
+                        private int sDiag;
+
                         @Override
                         public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                            // 先执行原方法（按调用方意愿设置 visible），
-                            // 然后强制把 mClearAllButton 设为 INVISIBLE（覆盖）。
-                            // 这样无论 FooterView 何时 inflate / setClearAllButtonVisible 被调，
-                            // 清除按钮始终隐藏。命中面仅 FooterView.mClearAllButton。
-                            chain.proceed();
-                            if (!sHideNotifClear) return null;
-                            try {
-                                Object self = chain.getThisObject();
-                                if (!(self instanceof View)) return null;
-                                Field f = fv.getDeclaredField(Constants.NOTIF_CLEAR_BUTTON_FIELD);
-                                f.setAccessible(true);
-                                Object btn = f.get(self);
-                                if (btn instanceof View) {
-                                    ((View) btn).setVisibility(View.INVISIBLE);
-                                    LogUtil.logAlways("[清除按钮] 通知栏 mClearAllButton 已强制隐藏（FooterView.setClearAllButtonVisible）");
+                            if (!enabled.get()) return chain.proceed();
+                            Object self = chain.getThisObject();
+                            if (!(self instanceof View)) return chain.proceed();
+                            View v = (View) self;
+                            int id = v.getId();
+                            // 诊断：前 5 次任何 setVisibility 调用记录（id 名解析可能失败，
+                            // 需要确认 hook 是否在路径上）
+                            if (sDiag < 5) {
+                                sDiag++;
+                                String idName = "?";
+                                try {
+                                    if (id != View.NO_ID) {
+                                        idName = v.getResources().getResourceEntryName(id);
+                                    }
+                                } catch (Throwable ignored) {
                                 }
-                            } catch (Throwable t) {
-                                LogUtil.logAlways("[清除按钮] 通知栏处理异常: " + t);
+                                LogUtil.logAlways(tag + " [诊断] setVisibility 被调 类="
+                                        + v.getClass().getName() + " id=" + id + "(" + idName + ")");
                             }
-                            return null;
+                            int target = sId;
+                            if (target == 0) {
+                                // R$id 反射不可靠：资源可能定义在运行时 overlay（RRO）里，
+                                // R 类无字段但 Resources 资源表有。用 getIdentifier 运行时解析。
+                                try {
+                                    android.content.Context ctx = v.getContext();
+                                    if (ctx == null) return chain.proceed();
+                                    int tid = ctx.getResources().getIdentifier(
+                                            idName, "id", pkg);
+                                    if (tid == 0) return chain.proceed(); // 尚未就绪，稍后重试
+                                    target = tid;
+                                    sId = target;
+                                    LogUtil.logAlways(tag + " getIdentifier 解析: " + idName
+                                            + " = " + target + " (pkg=" + pkg + ")");
+                                } catch (Throwable t) {
+                                    return chain.proceed();
+                                }
+                            }
+                            if (id == target) {
+                                if (!sLogged) {
+                                    sLogged = true;
+                                    LogUtil.logAlways(tag + " setVisibility 命中 id=" + idName
+                                            + " 类=" + v.getClass().getName()
+                                            + " → 强制 INVISIBLE");
+                                }
+                                // 短路：不执行原 setVisibility，避免递归
+                                return null;
+                            }
+                            return chain.proceed();
                         }
                     });
-            LogUtil.logAlways("[清除按钮] 已挂钩 FooterView.setClearAllButtonVisible（通知栏精准）");
+            LogUtil.logAlways(tag + " 已挂钩 View.setVisibility（id=" + idName + " 精准过滤）");
         } catch (Throwable t) {
-            LogUtil.logAlways("[清除按钮] 通知栏挂钩失败: " + t);
+            LogUtil.logAlways(tag + " 挂钩失败: " + t);
         }
     }
 
-    // ============================================================
-    // 隐藏「清理任务」按钮（v3.1.0 桌面多任务 → 精准命中 clearAnimView）
-    // ============================================================
-    /**
-     * 精准命中（uiautomator dump 确认）：
-     *   - 进程：com.miui.home（Launcher），需 scope.list 包含此包
-     *   - Activity：com.miui.home.launcher.Launcher（同一 Activity 承载桌面/多任务
-     *     两种 fragment 模式）
-     *   - View：resource-id=com.miui.home:id/clearAnimView，class=android.view.View，
-     *     content-desc="清理任务"，bounds 底部居中
-     *   - 时机：hook Launcher.onResume()（实例方法），after 回调里反射读
-     *     com.miui.home.R$id.clearAnimView 拿 int → activity.findViewById
-     *     → setVisibility(INVISIBLE)。桌面模式 View 不存在（findViewById 返回
-     *     null），多任务模式精准命中 1 个 View。
-     */
+    /** 通知栏「清除所有通知」按钮（com.android.systemui:id/notification_dismiss_view） */
+    private void installNotifClearButtonHide(ClassLoader cl) {
+        installHideButtonById(cl, Constants.TARGET_PKG, Constants.NOTIF_DISMISS_VIEW_ID_NAME,
+                "[清除按钮] 通知栏", sHideNotifClearFlag);
+    }
+
+    /** 桌面多任务「清理任务」按钮（com.miui.home:id/clearAnimView） */
     private void installRecentsClearButtonHide(ClassLoader cl) {
-        try {
-            Class<?> launcher = Class.forName(Constants.RECENTS_LAUNCHER_CLASS, false, cl);
-            Method onResume = launcher.getDeclaredMethod("onResume");
-            onResume.setAccessible(true);
-            final java.lang.reflect.Method fid = launcher.getMethod(
-                    "findViewById", int.class);
-            hook(onResume)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("recents-clear-button-hide")
-                    .intercept(new XposedInterface.Hooker() {
-                        @Override
-                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                            chain.proceed();
-                            if (!sHideRecentsClear) return null;
-                            try {
-                                Object self = chain.getThisObject();
-                                if (!(self instanceof android.app.Activity)) return null;
-                                android.app.Activity act = (android.app.Activity) self;
-                                // 反射读 com.miui.home.R$id.clearAnimView 拿 int
-                                Class<?> rid = Class.forName(
-                                        "com.miui.home.R$id", false, cl);
-                                int id = rid.getDeclaredField(Constants.RECENTS_CLEAR_BUTTON_ID)
-                                        .getInt(null);
-                                View v = (View) fid.invoke(act, id);
-                                if (v != null) {
-                                    v.setVisibility(View.INVISIBLE);
-                                    LogUtil.logAlways("[清除按钮] 多任务 clearAnimView 已隐藏（Launcher.onResume）");
-                                }
-                            } catch (Throwable t) {
-                                LogUtil.logAlways("[清除按钮] 多任务处理异常: " + t);
-                            }
-                            return null;
-                        }
-                    });
-            LogUtil.logAlways("[清除按钮] 已挂钩 Launcher.onResume（多任务精准）");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[清除按钮] 多任务挂钩失败: " + t);
-        }
+        installHideButtonById(cl, Constants.LAUNCHER_PKG, Constants.RECENTS_CLEAR_BUTTON_ID,
+                "[清除按钮] 多任务", sHideRecentsClearFlag);
     }
 
     // ============================================================
