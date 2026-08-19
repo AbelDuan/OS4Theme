@@ -11,8 +11,8 @@ android {
         applicationId 'com.abel.hyperosglass'
         minSdk 33
         targetSdk 34
-        versionCode 12
-        versionName '1.6.2'
+        versionCode 39
+        versionName '3.0.9'
     }
 
     signingConfigs {
@@ -49,7 +49,7 @@ android {
 }
 
 dependencies {
-    // Xposed API 仅编译期需要，运行时由 LSPosed 提供。
-    // 已内置到 app/libs/XposedBridgeApi-82.jar（来自 https://api.xposed.info ），无需联网。
-    compileOnly files('libs/XposedBridgeApi-82.jar')
+    // LibXposed API 仅编译期需要，运行时由 LSPosed 提供。
+    // 已内置到 app/libs/libxposed-api-102.jar（零传递依赖），无需联网。
+    compileOnly files('libs/libxposed-api-102.jar')
 }

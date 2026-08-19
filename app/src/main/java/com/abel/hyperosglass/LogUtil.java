@@ -3,42 +3,53 @@ package com.abel.hyperosglass;
 import android.content.Context;
 import android.net.Uri;
 import android.os.Bundle;
+import android.util.Log;
 
+import java.lang.reflect.Method;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
+import io.github.libxposed.api.XposedModule;
 
 /**
- * 模块运行日志。
+ * 模块运行日志（LibXposed 版）。
  *
  * 输出通道：
- *   1) XposedBridge.log（LSPosed / LSPosed Manager 的日志里能看到）
+ *   1) Xposed 日志：XposedModule.log()（LSPosed / LSPosed Manager 日志页可见）
  *   2) 经 StatusProvider.call("append_log") 跨进程推送到模块 App 私有目录
  *      （LogStore / getFilesDir），由设置页读取展示与导出。
  *
  * 关键设计：
  *   - 推送在【后台线程】执行，绝不阻塞 SystemUI 主线程（主线程同步跨进程
  *     call 冷启动模块 App 会卡死 → 之前日志全吞、开关全失效的根因）；
- *   - 推送失败时进入内存缓冲，最多保留 200 行，避免丢失。
+ *   - 推送失败时进入内存缓冲，最多保留 200 行，避免丢失；
+ *   - 获取 Context 用纯反射 android.app.ActivityThread.currentApplication()
+ *     （框架类，与 Xposed API 无关，LibXposed 环境同样可用）；
+ *   - 热路径（ThemeUtils 判定回调）严禁调用本类任何方法。
  *
- * 日志开关：默认关（由设置项控制）。所有操作都包在 try/catch 中。
+ * 日志开关：log() 默认关（由设置项控制）；logAlways() 常开（排障用，仅低频点调用）。
+ * 所有操作都包在 try/catch 中。
  */
 public final class LogUtil {
 
     private LogUtil() {}
 
-    /** 日志总开关（由 StatusProvider 下发，后台线程更新） */
+    /** 日志总开关（由设置项控制，作用于 log()） */
     private static volatile boolean sEnabled = Constants.DEFAULT_ENABLE_LOG;
+    /** XposedModule 实例（onModuleLoaded 时 attach，用于写 Xposed 日志） */
+    private static volatile XposedModule sLogger;
     /** 跨进程推送用的 Context（首次成功获取后缓存） */
     private static volatile Context sCtx;
     /** 推送失败时的内存缓冲 */
     private static final List<String> sPending = new ArrayList<String>();
     private static final int MAX_PENDING = 200;
+
+    public static void attach(XposedModule module) {
+        sLogger = module;
+    }
 
     public static void setEnabled(boolean enabled) {
         sEnabled = enabled;
@@ -48,13 +59,26 @@ public final class LogUtil {
         return sEnabled;
     }
 
+    /** 业务日志：受「日志记录」开关控制 */
     public static void log(String msg) {
         if (!sEnabled) return;
+        write(msg);
+    }
+
+    /** 常开日志（排障）：不依赖「日志记录」开关，仅低频点调用（加载/挂钩/设置/命中） */
+    public static void logAlways(String msg) {
+        write(msg);
+    }
+
+    private static void write(String msg) {
         final String line = ts() + " " + Constants.LOG_TAG + " " + msg;
-        // 1) 标准 Xposed 日志（LSPosed Manager 里能看）
-        try {
-            XposedBridge.log(Constants.LOG_TAG + " " + msg);
-        } catch (Throwable ignored) {
+        // 1) Xposed 日志（LSPosed Manager 里能看）
+        XposedModule m = sLogger;
+        if (m != null) {
+            try {
+                m.log(Log.INFO, Constants.LOG_TAG, msg);
+            } catch (Throwable ignored) {
+            }
         }
         // 2) 后台线程推送到模块私有目录（不阻塞主线程）
         Thread t = new Thread(new Runnable() {
@@ -67,24 +91,10 @@ public final class LogUtil {
         t.start();
     }
 
-    /**
-     * 常开日志：不依赖「日志记录」开关，只写 XposedBridge.log（LSPosed 日志页），
-     * 用于确认模块是否注入、开关是否读到、挂钩是否安装——排障必备。
-     */
-    public static void logAlways(String msg) {
-        try {
-            XposedBridge.log(Constants.LOG_TAG + " " + msg);
-        } catch (Throwable ignored) {
-        }
-    }
-
     private static void pushToApp(String line) {
         try {
             if (sCtx == null) {
-                Object app = XposedHelpers.callStaticMethod(
-                        XposedHelpers.findClass("android.app.ActivityThread", null),
-                        "currentApplication");
-                if (app instanceof Context) sCtx = (Context) app;
+                sCtx = currentApplication();
             }
             if (sCtx == null) {
                 buffer(line);
@@ -116,6 +126,18 @@ public final class LogUtil {
             }
         } catch (Throwable t) {
             buffer(line);
+        }
+    }
+
+    /** 纯反射拿当前进程的 Application（android.app.ActivityThread 为 hide，运行时存在） */
+    private static Context currentApplication() {
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Method m = at.getMethod("currentApplication");
+            Object app = m.invoke(null);
+            return app instanceof Context ? (Context) app : null;
+        } catch (Throwable t) {
+            return null;
         }
     }
 

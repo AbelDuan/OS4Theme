@@ -35,7 +35,7 @@ import java.util.Locale;
  * 模块 App 自己的进程里没有 XposedBridge，一旦引用就会 NoClassDefFoundError 闪退。
  *
  * 功能：
- *  - 锁屏通知下沉三态：不启用 / 隐藏指纹图标 / 覆盖指纹图标
+ *  - 通知下沉：启用 / 不启用（二选一）
  *  - 日志记录开关（默认关；经 StatusProvider 写入模块私有目录）
  *  - 重启系统界面（root）、导出日志（content:// 分享）
  */
@@ -47,14 +47,77 @@ public class SettingsActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         try {
+            // 首次运行：把旧 CE（凭据加密）存储的设置迁移到 DE（设备保护）存储
+            migratePrefsToDe();
+            // 打开设置页即强制重写全部 key：触发 LSPosed 框架把最新设置同步给
+            // SystemUI 进程的 getRemotePreferences（框架只在模块 App 写入时同步；
+            // root 直接改 prefs 文件不会同步——v2.0 升级后下沉失效的根因）。
+            forceSyncPrefs();
             buildUi();
         } catch (Throwable t) {
             showFatal(t);
         }
     }
 
+    /** 首次运行：把 CE prefs 迁移到 DE（设备保护）存储。
+     *  DE 存储在用户解锁前也可读写 → SystemUI 在开机 Direct Boot 阶段即可经
+     *  StatusProvider（directBootAware）读到设置 → 重启后通知下沉零空窗。
+     *  v3.0.9：sink 默认启用。仅当存在 legacy fod_mode 时才迁移旧值；
+     *  全新安装（CE/DE 均无 legacy）保持默认 true，不得覆盖成 false。 */
+    private void migratePrefsToDe() {
+        try {
+            SharedPreferences de = createDeviceProtectedStorageContext()
+                    .getSharedPreferences(Constants.PREFS, MODE_PRIVATE);
+            SharedPreferences ce = getSharedPreferences(Constants.PREFS, MODE_PRIVATE);
+            // 1) 玻璃/日志：无旧值则用默认
+            boolean glass = ce.getBoolean(Constants.PREFS_GLASS_ENABLED,
+                    Constants.DEFAULT_GLASS_ENABLED);
+            boolean log = ce.getBoolean(Constants.PREFS_ENABLE_LOG,
+                    Constants.DEFAULT_ENABLE_LOG);
+            // 2) 下沉：默认启用；仅当存在 legacy fod_mode 时才迁移旧值
+            boolean sink = Constants.DEFAULT_SINK_ENABLED;
+            if (ce.contains(Constants.PREFS_FOD_MODE_LEGACY)) {
+                sink = ce.getInt(Constants.PREFS_FOD_MODE_LEGACY,
+                        Constants.FOD_MODE_OFF_LEGACY) != Constants.FOD_MODE_OFF_LEGACY;
+                ce.edit().remove(Constants.PREFS_FOD_MODE_LEGACY).commit();
+            }
+            if (de.contains(Constants.PREFS_FOD_MODE_LEGACY)) {
+                int old = de.getInt(Constants.PREFS_FOD_MODE_LEGACY,
+                        Constants.FOD_MODE_OFF_LEGACY);
+                if (old != Constants.FOD_MODE_OFF_LEGACY) sink = true;
+                de.edit().remove(Constants.PREFS_FOD_MODE_LEGACY).commit();
+            }
+            de.edit()
+                    .putBoolean(Constants.PREFS_GLASS_ENABLED, glass)
+                    .putBoolean(Constants.PREFS_SINK_ENABLED, sink)
+                    .putBoolean(Constants.PREFS_ENABLE_LOG, log)
+                    .commit();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 把当前 3 个设置 key 原值重写一次（commit），触发框架同步 */
+    private void forceSyncPrefs() {
+        try {
+            SharedPreferences sp = sp();
+            sp.edit()
+                    .putBoolean(Constants.PREFS_GLASS_ENABLED,
+                            sp.getBoolean(Constants.PREFS_GLASS_ENABLED,
+                                    Constants.DEFAULT_GLASS_ENABLED))
+                    .putBoolean(Constants.PREFS_SINK_ENABLED,
+                            sp.getBoolean(Constants.PREFS_SINK_ENABLED,
+                                    Constants.DEFAULT_SINK_ENABLED))
+                    .putBoolean(Constants.PREFS_ENABLE_LOG,
+                            sp.getBoolean(Constants.PREFS_ENABLE_LOG,
+                                    Constants.DEFAULT_ENABLE_LOG))
+                    .commit();
+        } catch (Throwable ignored) {
+        }
+    }
+
     private SharedPreferences sp() {
-        return getSharedPreferences(Constants.PREFS, MODE_PRIVATE);
+        // DE（设备保护）存储：解锁前也可读写，保证 SystemUI 开机即读到设置
+        return createDeviceProtectedStorageContext().getSharedPreferences(Constants.PREFS, MODE_PRIVATE);
     }
 
     private void buildUi() {
@@ -64,22 +127,15 @@ public class SettingsActivity extends Activity {
         int p = dp(20);
         root.setPadding(p, dp(28), p, dp(20));
 
-        // 标题
+        // 标题（仅保留「HyperOS 4 主题增强」，删去 OS4 Themer）
         TextView title = new TextView(this);
-        title.setText("OS4 Themer");
-        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
+        title.setText("HyperOS 4 主题增强");
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setTextColor(Color.parseColor("#1A1A1A"));
         title.setGravity(Gravity.CENTER);
+        title.setPadding(0, 0, 0, dp(18));
         root.addView(title, mw());
-
-        TextView sub = new TextView(this);
-        sub.setText("HyperOS 4 主题增强");
-        sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        sub.setTextColor(Color.parseColor("#666666"));
-        sub.setGravity(Gravity.CENTER);
-        sub.setPadding(0, dp(4), 0, dp(18));
-        root.addView(sub, mw());
 
         // ── 功能卡片 ──
         LinearLayout card = new LinearLayout(this);
@@ -113,51 +169,44 @@ public class SettingsActivity extends Activity {
             public void onCheckedChanged(RadioGroup group, int checkedId) {
                 if (sInit) return;
                 sp().edit().putBoolean(Constants.PREFS_GLASS_ENABLED,
-                        checkedId == glassOn.getId()).apply();
+                        checkedId == glassOn.getId()).commit();
                 toast("已保存（重启系统界面后生效）");
             }
         });
         card.addView(rgGlass, mw());
 
-        // 锁屏通知下沉：三态单选
-        TextView fodHead = new TextView(this);
-        fodHead.setText("锁屏通知下沉");
-        fodHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        fodHead.setTypeface(Typeface.DEFAULT_BOLD);
-        fodHead.setTextColor(Color.parseColor("#222222"));
-        LinearLayout.LayoutParams lpFodHead = mw();
-        lpFodHead.topMargin = dp(10);
-        card.addView(fodHead, lpFodHead);
+        // 通知下沉：启用/不启用 单选（与液态玻璃一致）
+        TextView sinkHead = new TextView(this);
+        sinkHead.setText("通知下沉");
+        sinkHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        sinkHead.setTypeface(Typeface.DEFAULT_BOLD);
+        sinkHead.setTextColor(Color.parseColor("#222222"));
+        LinearLayout.LayoutParams lpSinkHead = mw();
+        lpSinkHead.topMargin = dp(10);
+        card.addView(sinkHead, lpSinkHead);
 
-        final RadioGroup rg = new RadioGroup(this);
-        rg.setOrientation(RadioGroup.VERTICAL);
-        final RadioButton rb0 = radio("不启用");
-        final RadioButton rb1 = radio("锁屏通知下沉（隐藏指纹图标）");
-        final RadioButton rb2 = radio("锁屏通知下沉（覆盖指纹图标）");
-        rg.addView(rb0, mw());
-        rg.addView(rb1, mw());
-        rg.addView(rb2, mw());
-        int mode = sp().getInt(Constants.PREFS_FOD_MODE, Constants.DEFAULT_FOD_MODE);
-        if (mode == Constants.FOD_MODE_HIDE_ICON) {
-            rb1.setChecked(true);
-        } else if (mode == Constants.FOD_MODE_COVER_ICON) {
-            rb2.setChecked(true);
+        final RadioGroup rgSink = new RadioGroup(this);
+        rgSink.setOrientation(RadioGroup.VERTICAL);
+        final RadioButton sinkOn = radio("启用");
+        final RadioButton sinkOff = radio("不启用");
+        rgSink.addView(sinkOn, mw());
+        rgSink.addView(sinkOff, mw());
+        if (sp().getBoolean(Constants.PREFS_SINK_ENABLED, Constants.DEFAULT_SINK_ENABLED)) {
+            sinkOn.setChecked(true);
         } else {
-            rb0.setChecked(true);
+            sinkOff.setChecked(true);
         }
         sInit = false;
-        rg.setOnCheckedChangeListener(new RadioGroup.OnCheckedChangeListener() {
+        rgSink.setOnCheckedChangeListener(new RadioGroup.OnCheckedChangeListener() {
             @Override
             public void onCheckedChanged(RadioGroup group, int checkedId) {
                 if (sInit) return;
-                int val = Constants.FOD_MODE_OFF;
-                if (checkedId == rb1.getId()) val = Constants.FOD_MODE_HIDE_ICON;
-                else if (checkedId == rb2.getId()) val = Constants.FOD_MODE_COVER_ICON;
-                sp().edit().putInt(Constants.PREFS_FOD_MODE, val).apply();
+                sp().edit().putBoolean(Constants.PREFS_SINK_ENABLED,
+                        checkedId == sinkOn.getId()).commit();
                 toast("已保存（重启系统界面后生效）");
             }
         });
-        card.addView(rg, mw());
+        card.addView(rgSink, mw());
 
         // 日志记录开关
         final CheckBox cbLog = new CheckBox(this);
@@ -168,7 +217,7 @@ public class SettingsActivity extends Activity {
         cbLog.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
             @Override
             public void onCheckedChanged(CompoundButton b, boolean checked) {
-                sp().edit().putBoolean(Constants.PREFS_ENABLE_LOG, checked).apply();
+                sp().edit().putBoolean(Constants.PREFS_ENABLE_LOG, checked).commit();
                 toast(checked ? "已开启（重启系统界面后生效）" : "已关闭（重启系统界面后生效）");
             }
         });
@@ -188,37 +237,38 @@ public class SettingsActivity extends Activity {
         lpRestart.topMargin = dp(10);
         card.addView(btnRestart, lpRestart);
 
-        // 导出日志
-        Button btnExport = makeButton("导出日志");
-        btnExport.setOnClickListener(new View.OnClickListener() {
+        // 日志：分享 + 清空（同一行，参照 WechatLive）
+        LinearLayout logRow = new LinearLayout(this);
+        logRow.setOrientation(LinearLayout.HORIZONTAL);
+
+        Button btnClear = makeButton("清空日志");
+        btnClear.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                LogStore.clear(SettingsActivity.this);
+                toast("日志已清空");
+            }
+        });
+        logRow.addView(btnClear, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        Button btnShare = makeButton("分享日志");
+        btnShare.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 exportLog();
             }
         });
-        LinearLayout.LayoutParams lpExport = mw();
-        lpExport.topMargin = dp(10);
-        card.addView(btnExport, lpExport);
+        LinearLayout.LayoutParams lpShare = new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        lpShare.leftMargin = dp(10);
+        logRow.addView(btnShare, lpShare);
+
+        LinearLayout.LayoutParams lpLogRow = mw();
+        lpLogRow.topMargin = dp(10);
+        card.addView(logRow, lpLogRow);
 
         root.addView(card, mw());
-
-        // 底部说明
-        TextView hint = new TextView(this);
-        hint.setText("使用方法\n"
-                + "· LSPosed 中启用本模块，作用域勾选「系统界面」\n"
-                + "· 修改设置后，点「重启系统界面」立即生效\n"
-                + "\n"
-                + "功能说明\n"
-                + "· 液态玻璃：第三方主题下保留玻璃模糊，并修复通知展开按钮颜色\n"
-                + "· 锁屏通知下沉：隐藏或覆盖指纹图标区域\n"
-                + "\n"
-                + "开启日志记录后，日志保存于本应用私有目录，\n"
-                + "可通过「导出日志」直接分享。");
-        hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        hint.setTextColor(Color.parseColor("#888888"));
-        hint.setPadding(dp(4), dp(16), dp(4), 0);
-        hint.setLineSpacing(dp(3), 1f);
-        root.addView(hint, mw());
 
         setContentView(root);
     }

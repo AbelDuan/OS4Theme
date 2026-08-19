@@ -7,24 +7,8 @@
         android:roundIcon="@mipmap/ic_launcher"
         android:label="@string/app_name">
 
-        <!-- LSPosed 模块声明 -->
-        <meta-data
-            android:name="xposedmodule"
-            android:value="true" />
-        <meta-data
-            android:name="xposedminversion"
-            android:value="82" />
-        <meta-data
-            android:name="xposeddescription"
-            android:value="@string/module_description" />
-        <!-- 默认选中的作用域：系统界面组件 -->
-        <meta-data
-            android:name="xposedscope"
-            android:resource="@array/xposed_scope" />
-        <!-- LSPosed 设置入口（指向本模块设置 Activity，内含重启 SystemUI 按钮） -->
-        <meta-data
-            android:name="xposedsettings"
-            android:value=".SettingsActivity" />
+        <!-- LibXposed 模块声明在 resources/META-INF/xposed/（module.prop / java_init.list /
+             scope.list），不再使用 manifest meta-data（那是 XposedBridge 82 时代的做法） -->
 
         <activity
             android:name=".SettingsActivity"
@@ -36,11 +20,15 @@
             </intent-filter>
         </activity>
 
-        <!-- 设置通道：SystemUI 进程读取用户开关（锁屏通知下沉） -->
+        <!-- 日志通道：SystemUI 进程推送日志到模块私有目录（设置开关由 LibXposed
+             框架直供，不再经此 provider）。
+             directBootAware：用户解锁前（Direct Boot 阶段）也可拉起本 provider，
+             读取 DE 存储的设置 → 重启后通知下沉零空窗 -->
         <provider
             android:name=".StatusProvider"
             android:authorities="com.abel.hyperosglass.status"
-            android:exported="true" />
+            android:exported="true"
+            android:directBootAware="true" />
 
         <!-- 导出日志时以 content:// 形式只读分享日志文件（query 返回文件信息，
              澎湃互联等接收端才能正常读取） -->

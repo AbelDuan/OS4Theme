@@ -27,7 +27,11 @@ public class StatusProvider extends ContentProvider {
     public Bundle call(String method, String arg, Bundle extras) {
         Context ctx = getContext();
         if (ctx == null) return null;
-        SharedPreferences sp = ctx.getSharedPreferences(Constants.PREFS, Context.MODE_PRIVATE);
+        // DE（设备保护）存储：解锁前也可读写。配合本 provider 的
+        // directBootAware=true，SystemUI 在开机 Direct Boot 阶段即可经
+        // call("get_prefs") 读到用户设置 → 重启后下沉零空窗。
+        SharedPreferences sp = ctx.createDeviceProtectedStorageContext()
+                .getSharedPreferences(Constants.PREFS, Context.MODE_PRIVATE);
 
         if (Constants.METHOD_APPEND_LOG.equals(method)) {
             if (extras != null) {
@@ -38,11 +42,27 @@ public class StatusProvider extends ContentProvider {
         }
 
         // get_prefs 及其它：返回当前开关
+        // 关键：返回前把当前值原样重写一遍 commit —— 若模块 App 进程已被
+        // LSPosed 注入（LibXposed 模块），该 commit 会触发框架的 prefs 同步
+        // hook，把最新设置同步进 daemon 快照；此后 SystemUI 侧
+        // getRemotePreferences 即可直接读到（重启手机也无需 CE 兜底重试）。
+        try {
+            sp.edit()
+                    .putBoolean(Constants.PREFS_GLASS_ENABLED, sp.getBoolean(
+                            Constants.PREFS_GLASS_ENABLED, Constants.DEFAULT_GLASS_ENABLED))
+                    .putBoolean(Constants.PREFS_SINK_ENABLED, sp.getBoolean(
+                            Constants.PREFS_SINK_ENABLED, Constants.DEFAULT_SINK_ENABLED))
+                    .putBoolean(Constants.PREFS_ENABLE_LOG, sp.getBoolean(
+                            Constants.PREFS_ENABLE_LOG, Constants.DEFAULT_ENABLE_LOG))
+                    .commit();
+        } catch (Throwable ignored) {
+        }
+
         Bundle out = new Bundle();
         out.putBoolean(Constants.PREFS_GLASS_ENABLED,
                 sp.getBoolean(Constants.PREFS_GLASS_ENABLED, Constants.DEFAULT_GLASS_ENABLED));
-        out.putInt(Constants.PREFS_FOD_MODE,
-                sp.getInt(Constants.PREFS_FOD_MODE, Constants.DEFAULT_FOD_MODE));
+        out.putBoolean(Constants.PREFS_SINK_ENABLED,
+                sp.getBoolean(Constants.PREFS_SINK_ENABLED, Constants.DEFAULT_SINK_ENABLED));
         out.putBoolean(Constants.PREFS_ENABLE_LOG,
                 sp.getBoolean(Constants.PREFS_ENABLE_LOG, Constants.DEFAULT_ENABLE_LOG));
         out.putBoolean("ok", true);
