@@ -63,13 +63,6 @@ public class MainHook extends XposedModule {
     private volatile SharedPreferences sPrefs;
     private volatile boolean sSinkEnabled = Constants.DEFAULT_SINK_ENABLED;
     private volatile boolean sGlassEnabled = Constants.DEFAULT_GLASS_ENABLED;
-    private volatile boolean sHideNotifClear = Constants.DEFAULT_HIDE_NOTIF_CLEAR;
-    private volatile boolean sHideRecentsClear = Constants.DEFAULT_HIDE_RECENTS_CLEAR;
-    /** 隐藏按钮开关的原子引用（供 setVisibility 拦截器读取；与 sHide* 同步） */
-    private static final java.util.concurrent.atomic.AtomicBoolean sHideNotifClearFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HIDE_NOTIF_CLEAR);
-    private static final java.util.concurrent.atomic.AtomicBoolean sHideRecentsClearFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HIDE_RECENTS_CLEAR);
 
     /** flow 诊断计数（前 5 次调用记日志，确认锁屏时是否真的被调用） */
     private static int sFlow1Logs = 0;
@@ -99,27 +92,19 @@ public class MainHook extends XposedModule {
     public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam param) {
         try {
             String pkg = param.getPackageName();
-            // 宿主 SystemUI 包：通知下沉 + 玻璃 + 媒体岛防御 + 展开按钮 + 通知清除按钮
-            // Launcher 包：多任务清除任务按钮（hyperos 桌面是 Flutter 混合应用，
-            //  多任务 fragment 是 Java View，hook 入口 = launcher.Launcher.onResume）
-            if (!Constants.TARGET_PKG.equals(pkg) && !Constants.LAUNCHER_PKG.equals(pkg)) {
-                return;
-            }
+            if (!Constants.TARGET_PKG.equals(pkg)) return;
             ClassLoader cl = param.getDefaultClassLoader();
             LogUtil.logAlways("onPackageLoaded: " + pkg);
 
             reloadPrefs();
 
-            if (Constants.TARGET_PKG.equals(pkg)) {
-                installNotificationSinkHooks(cl);
-                installGlassHooks(cl);
-                installMediaIslandDefense(cl);
-                installExpandButtonColor(cl);
-                installNotifClearButtonHide(cl);
-            }
-            if (Constants.LAUNCHER_PKG.equals(pkg)) {
-                installRecentsClearButtonHide(cl);
-            }
+            // 宿主包：通知下沉（flow 类在宿主 loader）+ 玻璃（插件工厂在宿主 loader）
+            // + 媒体岛崩溃防御（吞异常版，系统 bug 必要保护）
+            // + 展开按钮药丸（v3.0.2 精准命中：仅 2 参构造 + 严格 id 匹配）
+            installNotificationSinkHooks(cl);
+            installGlassHooks(cl);
+            installMediaIslandDefense(cl);
+            installExpandButtonColor(cl);
         } catch (Throwable t) {
             LogUtil.logAlways("onPackageLoaded 异常: " + t);
         }
@@ -145,22 +130,13 @@ public class MainHook extends XposedModule {
                     Constants.DEFAULT_SINK_ENABLED);
             boolean newGlass = sPrefs.getBoolean(Constants.PREFS_GLASS_ENABLED,
                     Constants.DEFAULT_GLASS_ENABLED);
-            boolean newNotifClear = sPrefs.getBoolean(Constants.PREFS_HIDE_NOTIF_CLEAR,
-                    Constants.DEFAULT_HIDE_NOTIF_CLEAR);
-            boolean newRecentsClear = sPrefs.getBoolean(Constants.PREFS_HIDE_RECENTS_CLEAR,
-                    Constants.DEFAULT_HIDE_RECENTS_CLEAR);
             boolean log = sPrefs.getBoolean(Constants.PREFS_ENABLE_LOG,
                     Constants.DEFAULT_ENABLE_LOG);
             sSinkEnabled = newSink;
             sGlassEnabled = newGlass;
-            sHideNotifClear = newNotifClear;
-            sHideRecentsClear = newRecentsClear;
-            sHideNotifClearFlag.set(newNotifClear);
-            sHideRecentsClearFlag.set(newRecentsClear);
             LogUtil.setEnabled(log);
             LogUtil.logAlways("设置(框架)：sink=" + sSinkEnabled + "，glass=" + sGlassEnabled
-                    + "，hideNotifClear=" + sHideNotifClear
-                    + "，hideRecentsClear=" + sHideRecentsClear + "，日志=" + log);
+                    + "，日志=" + log);
             // 兜底：框架快照若显示「关闭」（可能因覆盖安装/root 改文件未同步），
             // 后台读一次模块 App 的 CE prefs（设置页写入的）覆盖，保证旧设置生效。
             if (!newSink && newGlass == Constants.DEFAULT_GLASS_ENABLED) {
@@ -614,105 +590,6 @@ public class MainHook extends XposedModule {
         float r = 14f * res.getDisplayMetrics().density;
         d.setCornerRadius(r);
         return d;
-    }
-
-    // ============================================================
-    // 隐藏「清除」按钮（v3.1.3 统一：按资源 id 精准过滤 setVisibility）
-    // ============================================================
-    /**
-     * v3.1.0~v3.1.2 静态猜宿主类（SectionHeaderView / FooterView）均失败：
-     * HyperOS 通知面板 header 布局由 shade_header_container 承载，宿主不是
-     * AOSP FooterView，setClearAllButtonVisible 从未被调用。
-     * v3.1.3 改为运行时方案：
-     *   - hook android.view.View.setVisibility(int)；
-     *   - 回调里 v.getId() == 目标资源 id 才短路为 INVISIBLE（不 proceed，
-     *     避免递归），其他 View 仅做 O(1) int 比对、零副作用（不构造对象、
-     *     无 IO、无日志）；
-     *   - 目标 id 从 pkg.R$id 运行时反射一次性拿（volatile int 缓存）；
-     *   - 命中面仍仅 1 个 View（通知栏 notification_dismiss_view /
-     *     多任务 clearAnimView），时机可靠（任何显示/隐藏控制必经 setVisibility）。
-     */
-    private void installHideButtonById(final ClassLoader cl, final String pkg,
-                                       final String idName, final String tag,
-                                       final java.util.concurrent.atomic.AtomicBoolean enabled) {
-        try {
-            final Method setVis = View.class.getMethod("setVisibility", int.class);
-            hook(setVis)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("hide-button-" + idName)
-                    .intercept(new XposedInterface.Hooker() {
-                        private volatile int sId;       // 0=未解析
-                        private boolean sLogged;
-                        private int sDiag;
-
-                        @Override
-                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                            if (!enabled.get()) return chain.proceed();
-                            Object self = chain.getThisObject();
-                            if (!(self instanceof View)) return chain.proceed();
-                            View v = (View) self;
-                            int id = v.getId();
-                            // 诊断：前 5 次任何 setVisibility 调用记录（id 名解析可能失败，
-                            // 需要确认 hook 是否在路径上）
-                            if (sDiag < 5) {
-                                sDiag++;
-                                String idName = "?";
-                                try {
-                                    if (id != View.NO_ID) {
-                                        idName = v.getResources().getResourceEntryName(id);
-                                    }
-                                } catch (Throwable ignored) {
-                                }
-                                LogUtil.logAlways(tag + " [诊断] setVisibility 被调 类="
-                                        + v.getClass().getName() + " id=" + id + "(" + idName + ")");
-                            }
-                            int target = sId;
-                            if (target == 0) {
-                                // R$id 反射不可靠：资源可能定义在运行时 overlay（RRO）里，
-                                // R 类无字段但 Resources 资源表有。用 getIdentifier 运行时解析。
-                                try {
-                                    android.content.Context ctx = v.getContext();
-                                    if (ctx == null) return chain.proceed();
-                                    int tid = ctx.getResources().getIdentifier(
-                                            idName, "id", pkg);
-                                    if (tid == 0) return chain.proceed(); // 尚未就绪，稍后重试
-                                    target = tid;
-                                    sId = target;
-                                    LogUtil.logAlways(tag + " getIdentifier 解析: " + idName
-                                            + " = " + target + " (pkg=" + pkg + ")");
-                                } catch (Throwable t) {
-                                    return chain.proceed();
-                                }
-                            }
-                            if (id == target) {
-                                if (!sLogged) {
-                                    sLogged = true;
-                                    LogUtil.logAlways(tag + " setVisibility 命中 id=" + idName
-                                            + " 类=" + v.getClass().getName()
-                                            + " → 强制 INVISIBLE");
-                                }
-                                // 短路：不执行原 setVisibility，避免递归
-                                return null;
-                            }
-                            return chain.proceed();
-                        }
-                    });
-            LogUtil.logAlways(tag + " 已挂钩 View.setVisibility（id=" + idName + " 精准过滤）");
-        } catch (Throwable t) {
-            LogUtil.logAlways(tag + " 挂钩失败: " + t);
-        }
-    }
-
-    /** 通知栏「清除所有通知」按钮（com.android.systemui:id/notification_dismiss_view） */
-    private void installNotifClearButtonHide(ClassLoader cl) {
-        installHideButtonById(cl, Constants.TARGET_PKG, Constants.NOTIF_DISMISS_VIEW_ID_NAME,
-                "[清除按钮] 通知栏", sHideNotifClearFlag);
-    }
-
-    /** 桌面多任务「清理任务」按钮（com.miui.home:id/clearAnimView） */
-    private void installRecentsClearButtonHide(ClassLoader cl) {
-        installHideButtonById(cl, Constants.LAUNCHER_PKG, Constants.RECENTS_CLEAR_BUTTON_ID,
-                "[清除按钮] 多任务", sHideRecentsClearFlag);
     }
 
     // ============================================================

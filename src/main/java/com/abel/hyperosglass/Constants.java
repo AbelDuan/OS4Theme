@@ -32,11 +32,8 @@ public final class Constants {
     /** 作用域：系统界面组件所在进程（MIUISystemUIPlugin 是被它动态加载的插件，不占独立进程） */
     public static final String TARGET_PKG = "com.android.systemui";
 
-    /** 桌面 Launcher 包（v3.1.0 扩展作用域：用于 hook 多任务清除任务按钮） */
-    public static final String LAUNCHER_PKG = "com.miui.home";
-
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.1.5";
+    public static final String VERSION = "3.0.10";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -101,14 +98,6 @@ public final class Constants {
     public static final String PREFS_SINK_ENABLED = "sink_enabled";
     public static final boolean DEFAULT_SINK_ENABLED = true;
 
-    /** 隐藏通知栏「清除通知」按钮背景圆圈和叉叉（v3.1.0）：精准命中 SectionHeaderView.mClearAllButton */
-    public static final String PREFS_HIDE_NOTIF_CLEAR = "hide_notif_clear";
-    public static final boolean DEFAULT_HIDE_NOTIF_CLEAR = true;
-
-    /** 隐藏桌面多任务「清理任务」按钮背景圆圈和叉叉（v3.1.0）：精准命中 com.miui.home:id/clearAnimView */
-    public static final String PREFS_HIDE_RECENTS_CLEAR = "hide_recents_clear";
-    public static final boolean DEFAULT_HIDE_RECENTS_CLEAR = true;
-
     /** 遗留升级迁移：v2.1.8 及更早用 fod_mode(int 三态)，v2.1.9 起改用 sink_enabled(bool) */
     public static final String PREFS_FOD_MODE_LEGACY = "fod_mode";
     public static final int FOD_MODE_OFF_LEGACY = 0;
@@ -164,30 +153,4 @@ public final class Constants {
      */
     public static final int EXPAND_PILL_BG_LIGHT = 0x1FFFFFFF;
     public static final int EXPAND_PILL_BG_DARK = 0x26FFFFFF;
-
-    // ── 隐藏「清除」按钮（v3.1.3 统一：按资源 id 精准过滤 setVisibility）──
-    /**
-     * v3.1.1/v3.1.2 教训：静态猜测宿主类（SectionHeaderView/FooterView）都不可靠
-     * （HyperOS 通知面板 header 布局由 shade_header_container 承载，宿主不是
-     * AOSP FooterView）。v3.1.3 改为**运行时按资源 id 精准过滤**：
-     *   hook android.view.View.setVisibility(int)，回调里 v.getId() == 目标 id
-     *   才短路为 INVISIBLE —— 命中面仍仅 1 个 View，其他 View 只是 O(1) int 比对、
-     *   零副作用（不构造对象、无 IO、无日志），时机可靠（任何显示/隐藏控制都经过
-     *   setVisibility）。id 从 pkg.R$id 运行时反射一次性拿（缓存 volatile int）。
-     */
-    /** 通知栏「清除所有通知」按钮（uiautomator dump：id/notification_dismiss_view，
-     *  class=Button，content-desc="清除所有通知。"，位于 shade_header_container） */
-    public static final String NOTIF_DISMISS_VIEW_ID_NAME = "notification_dismiss_view";
-
-    /**
-     * 桌面（com.miui.home）多任务清除任务按钮（uiautomator dump 确认）：
-     *   - resource-id=com.miui.home:id/clearAnimView，class=android.view.View，
-     *     content-desc="清理任务"，bounds 底部居中。
-     *   - com.miui.home 是 Flutter+Rust 混合应用，但该按钮是真实 Android View
-     *     （uiautomator 能解析出 resource-id 即证明是 View 树节点）。
-     *   - 需要 LSPosed 注入 com.miui.home 进程（scope.list 已含，重启手机生效）。
-     */
-    public static final String RECENTS_LAUNCHER_CLASS =
-            "com.miui.home.launcher.Launcher";
-    public static final String RECENTS_CLEAR_BUTTON_ID = "clearAnimView";
 }
