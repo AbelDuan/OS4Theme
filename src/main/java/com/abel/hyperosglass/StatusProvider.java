@@ -52,6 +52,8 @@ public class StatusProvider extends ContentProvider {
                             Constants.PREFS_GLASS_ENABLED, Constants.DEFAULT_GLASS_ENABLED))
                     .putBoolean(Constants.PREFS_SINK_ENABLED, sp.getBoolean(
                             Constants.PREFS_SINK_ENABLED, Constants.DEFAULT_SINK_ENABLED))
+                    .putBoolean(Constants.PREFS_HIDE_LOCK_FOD, sp.getBoolean(
+                            Constants.PREFS_HIDE_LOCK_FOD, Constants.DEFAULT_HIDE_LOCK_FOD))
                     .putBoolean(Constants.PREFS_ENABLE_LOG, sp.getBoolean(
                             Constants.PREFS_ENABLE_LOG, Constants.DEFAULT_ENABLE_LOG))
                     .commit();
@@ -63,6 +65,8 @@ public class StatusProvider extends ContentProvider {
                 sp.getBoolean(Constants.PREFS_GLASS_ENABLED, Constants.DEFAULT_GLASS_ENABLED));
         out.putBoolean(Constants.PREFS_SINK_ENABLED,
                 sp.getBoolean(Constants.PREFS_SINK_ENABLED, Constants.DEFAULT_SINK_ENABLED));
+        out.putBoolean(Constants.PREFS_HIDE_LOCK_FOD,
+                sp.getBoolean(Constants.PREFS_HIDE_LOCK_FOD, Constants.DEFAULT_HIDE_LOCK_FOD));
         out.putBoolean(Constants.PREFS_ENABLE_LOG,
                 sp.getBoolean(Constants.PREFS_ENABLE_LOG, Constants.DEFAULT_ENABLE_LOG));
         out.putBoolean("ok", true);

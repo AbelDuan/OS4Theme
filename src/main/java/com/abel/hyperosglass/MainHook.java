@@ -63,6 +63,12 @@ public class MainHook extends XposedModule {
     private volatile SharedPreferences sPrefs;
     private volatile boolean sSinkEnabled = Constants.DEFAULT_SINK_ENABLED;
     private volatile boolean sGlassEnabled = Constants.DEFAULT_GLASS_ENABLED;
+    private volatile boolean sHideLockFod = Constants.DEFAULT_HIDE_LOCK_FOD;
+    /** 隐藏锁屏指纹开关（AtomicBoolean，供热路径拦截器读取） */
+    private static final java.util.concurrent.atomic.AtomicBoolean sHideLockFodFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HIDE_LOCK_FOD);
+    /** 锁屏指纹隐藏命中计数（前 3 次记日志） */
+    private static int sHideLockFodLogs = 0;
 
     /** flow 诊断计数（前 5 次调用记日志，确认锁屏时是否真的被调用） */
     private static int sFlow1Logs = 0;
@@ -101,10 +107,12 @@ public class MainHook extends XposedModule {
             // 宿主包：通知下沉（flow 类在宿主 loader）+ 玻璃（插件工厂在宿主 loader）
             // + 媒体岛崩溃防御（吞异常版，系统 bug 必要保护）
             // + 展开按钮药丸（v3.0.2 精准命中：仅 2 参构造 + 严格 id 匹配）
+            // + 锁屏指纹图标/动画隐藏（v3.1.0 用户 smali 方案，仅锁屏生效）
             installNotificationSinkHooks(cl);
             installGlassHooks(cl);
             installMediaIslandDefense(cl);
             installExpandButtonColor(cl);
+            installLockFodHooks(cl);
         } catch (Throwable t) {
             LogUtil.logAlways("onPackageLoaded 异常: " + t);
         }
@@ -130,13 +138,17 @@ public class MainHook extends XposedModule {
                     Constants.DEFAULT_SINK_ENABLED);
             boolean newGlass = sPrefs.getBoolean(Constants.PREFS_GLASS_ENABLED,
                     Constants.DEFAULT_GLASS_ENABLED);
+            boolean newHideLockFod = sPrefs.getBoolean(Constants.PREFS_HIDE_LOCK_FOD,
+                    Constants.DEFAULT_HIDE_LOCK_FOD);
             boolean log = sPrefs.getBoolean(Constants.PREFS_ENABLE_LOG,
                     Constants.DEFAULT_ENABLE_LOG);
             sSinkEnabled = newSink;
             sGlassEnabled = newGlass;
+            sHideLockFod = newHideLockFod;
+            sHideLockFodFlag.set(newHideLockFod);
             LogUtil.setEnabled(log);
             LogUtil.logAlways("设置(框架)：sink=" + sSinkEnabled + "，glass=" + sGlassEnabled
-                    + "，日志=" + log);
+                    + "，hideLockFod=" + sHideLockFod + "，日志=" + log);
             // 兜底：框架快照若显示「关闭」（可能因覆盖安装/root 改文件未同步），
             // 后台读一次模块 App 的 CE prefs（设置页写入的）覆盖，保证旧设置生效。
             if (!newSink && newGlass == Constants.DEFAULT_GLASS_ENABLED) {
@@ -177,16 +189,24 @@ public class MainHook extends XposedModule {
                                         Constants.DEFAULT_SINK_ENABLED);
                                 boolean ceGlass = out.getBoolean(Constants.PREFS_GLASS_ENABLED,
                                         Constants.DEFAULT_GLASS_ENABLED);
+                                boolean ceHideLockFod = out.getBoolean(
+                                        Constants.PREFS_HIDE_LOCK_FOD,
+                                        Constants.DEFAULT_HIDE_LOCK_FOD);
                                 boolean ceLog = out.getBoolean(Constants.PREFS_ENABLE_LOG,
                                         Constants.DEFAULT_ENABLE_LOG);
                                 if (ceSink != Constants.DEFAULT_SINK_ENABLED
                                         || ceGlass != Constants.DEFAULT_GLASS_ENABLED
+                                        || ceHideLockFod != Constants.DEFAULT_HIDE_LOCK_FOD
                                         || ceLog != Constants.DEFAULT_ENABLE_LOG) {
                                     sSinkEnabled = ceSink;
                                     sGlassEnabled = ceGlass;
+                                    sHideLockFod = ceHideLockFod;
+                                    sHideLockFodFlag.set(ceHideLockFod);
                                     LogUtil.setEnabled(ceLog);
                                     LogUtil.logAlways("设置(CE 兜底)：sink=" + sSinkEnabled
-                                            + "，glass=" + sGlassEnabled + "，日志=" + ceLog);
+                                            + "，glass=" + sGlassEnabled
+                                            + "，hideLockFod=" + sHideLockFod
+                                            + "，日志=" + ceLog);
                                     return;
                                 }
                             }
@@ -590,6 +610,154 @@ public class MainHook extends XposedModule {
         float r = 14f * res.getDisplayMetrics().density;
         d.setCornerRadius(r);
         return d;
+    }
+
+    // ============================================================
+    // 锁屏指纹图标/动画隐藏（v3.1.0，用户 smali 方案）
+    // ============================================================
+    /**
+     * 精准方案（与用户 smali patch 语义等价，dexdump 确认签名）：
+     *   - getFingerIconResource(Context;)I：
+     *       mKeyguardAuthen==true → 返回隐藏资源 id（0x7f080000，运行时验证
+     *       可解析才使用，避免 ROM 差异崩溃；验证失败走原逻辑）；
+     *   - getRecognizingAnimItem()L.../MiuiGxzwAnimItem;：
+     *       mKeyguardAuthen==true → 返回 mAnimItemMap.get(Integer.valueOf(0))
+     *       （key=0 空动画条目），识别动画不再播放。
+     * 仅锁屏（mKeyguardAuthen=true）生效；支付/应用内指纹（false）放行原逻辑。
+     * 字段 mKeyguardAuthen/mAnimItemMap 均为 PUBLIC（dexdump 确认），反射缓存。
+     */
+    private void installLockFodHooks(ClassLoader cl) {
+        try {
+            final Class<?> mgr = Class.forName(Constants.MIUI_GXZW_ANIM_MANAGER_CLASS, false, cl);
+            // 1) getFingerIconResource(Z)I
+            try {
+                final Method getRes = mgr.getDeclaredMethod(
+                        Constants.FOD_GET_FINGER_ICON_RES_METHOD, boolean.class);
+                hook(getRes)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .setId("lockscreen-fod-icon-hide")
+                        .intercept(new XposedInterface.Hooker() {
+                            @Override
+                            public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                                if (!sHideLockFodFlag.get()) return chain.proceed();
+                                if (!isLockFodAuthen(chain.getThisObject())) return chain.proceed();
+                                // 运行时验证隐藏资源可解析（ROM 兜底）；Context 取 mContext 字段
+                                android.content.Context ctx = lockFodContext(chain.getThisObject());
+                                if (ctx != null && isHideResValid(ctx)) {
+                                    if (sHideLockFodLogs < 3) {
+                                        sHideLockFodLogs++;
+                                        LogUtil.logAlways("[锁屏指纹] getFingerIconResource 命中（mKeyguardAuthen=true）"
+                                                + " → 返回隐藏资源 0x7f080000");
+                                    }
+                                    return Integer.valueOf(Constants.FOD_HIDE_RES_ID);
+                                }
+                                return chain.proceed();
+                            }
+                        });
+                LogUtil.logAlways("[锁屏指纹] 已挂钩 getFingerIconResource(Z)I");
+            } catch (Throwable t) {
+                LogUtil.logAlways("[锁屏指纹] getFingerIconResource 挂钩失败: " + t);
+            }
+            // 2) getRecognizingAnimItem()MiuiGxzwAnimItem
+            try {
+                final Method getAnim = mgr.getDeclaredMethod(
+                        Constants.FOD_GET_RECOGNIZING_ANIM_METHOD);
+                hook(getAnim)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .setId("lockscreen-fod-anim-hide")
+                        .intercept(new XposedInterface.Hooker() {
+                            @Override
+                            public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                                if (!sHideLockFodFlag.get()) return chain.proceed();
+                                if (!isLockFodAuthen(chain.getThisObject())) return chain.proceed();
+                                Object item = lockFodAnimZeroItem(chain.getThisObject());
+                                if (sHideLockFodLogs < 3) {
+                                    sHideLockFodLogs++;
+                                    LogUtil.logAlways("[锁屏指纹] getRecognizingAnimItem 命中（mKeyguardAuthen=true）"
+                                            + " → 返回空动画条目 " + (item == null ? "null" : item.getClass().getName()));
+                                }
+                                return item; // 可能为 null：无动画
+                            }
+                        });
+                LogUtil.logAlways("[锁屏指纹] 已挂钩 getRecognizingAnimItem()");
+            } catch (Throwable t) {
+                LogUtil.logAlways("[锁屏指纹] getRecognizingAnimItem 挂钩失败: " + t);
+            }
+        } catch (Throwable t) {
+            LogUtil.logAlways("[锁屏指纹] 类未找到（MiuiGxzwAnimManager 不存在）: " + t);
+        }
+    }
+
+    /** 反射读 mKeyguardAuthen（PUBLIC 字段，缓存 Field） */
+    private static volatile java.lang.reflect.Field sFodAuthenField = null;
+
+    private static boolean isLockFodAuthen(Object self) {
+        try {
+            if (self == null) return false;
+            java.lang.reflect.Field f = sFodAuthenField;
+            if (f == null) {
+                f = self.getClass().getField(Constants.FOD_KEYGUARD_AUTHEN_FIELD);
+                sFodAuthenField = f;
+            }
+            return (Boolean) f.get(self);
+        } catch (Throwable t) {
+            return false; // 读不到：放行（不影响支付）
+        }
+    }
+
+    /** 反射读 mAnimItemMap.get(Integer.valueOf(0)) */
+    private static volatile java.lang.reflect.Field sFodAnimMapField = null;
+
+    private static Object lockFodAnimZeroItem(Object self) {
+        try {
+            if (self == null) return null;
+            java.lang.reflect.Field f = sFodAnimMapField;
+            if (f == null) {
+                f = self.getClass().getField(Constants.FOD_ANIM_ITEM_MAP_FIELD);
+                sFodAnimMapField = f;
+            }
+            Object map = f.get(self);
+            if (!(map instanceof java.util.Map)) return null;
+            return ((java.util.Map<?, ?>) map).get(Integer.valueOf(0));
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 反射读 mContext（PUBLIC 字段，缓存 Field），用于隐藏资源可解析验证 */
+    private static volatile java.lang.reflect.Field sFodCtxField = null;
+
+    private static android.content.Context lockFodContext(Object self) {
+        try {
+            if (self == null) return null;
+            java.lang.reflect.Field f = sFodCtxField;
+            if (f == null) {
+                f = self.getClass().getField("mContext");
+                sFodCtxField = f;
+            }
+            Object ctx = f.get(self);
+            return ctx instanceof android.content.Context ? (android.content.Context) ctx : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 运行时验证 0x7f080000 可解析（避免 ROM 差异导致 getDrawable 崩溃） */
+    private static volatile Boolean sHideResValid = null;
+
+    private static boolean isHideResValid(android.content.Context ctx) {
+        Boolean ok = sHideResValid;
+        if (ok != null) return ok.booleanValue();
+        try {
+            String name = ctx.getResources().getResourceEntryName(Constants.FOD_HIDE_RES_ID);
+            sHideResValid = Boolean.TRUE;
+            LogUtil.logAlways("[锁屏指纹] 隐藏资源 0x7f080000 可解析（" + name + "）");
+            return true;
+        } catch (Throwable t) {
+            sHideResValid = Boolean.FALSE;
+            LogUtil.logAlways("[锁屏指纹] 隐藏资源 0x7f080000 不可解析，回退原逻辑: " + t);
+            return false;
+        }
     }
 
     // ============================================================

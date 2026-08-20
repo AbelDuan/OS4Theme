@@ -33,7 +33,7 @@ public final class Constants {
     public static final String TARGET_PKG = "com.android.systemui";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.0.10";
+    public static final String VERSION = "3.1.0";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -98,6 +98,12 @@ public final class Constants {
     public static final String PREFS_SINK_ENABLED = "sink_enabled";
     public static final boolean DEFAULT_SINK_ENABLED = true;
 
+    /** 隐藏锁屏指纹图标与动画（v3.1.0，默认启用）：只影响锁屏/解锁场景
+     *  （mKeyguardAuthen=true），支付/应用内指纹（false）完全不受影响；
+     *  目的：配合通知下沉，锁屏指纹图标/动画不再与下沉通知重叠。 */
+    public static final String PREFS_HIDE_LOCK_FOD = "hide_lock_fod";
+    public static final boolean DEFAULT_HIDE_LOCK_FOD = true;
+
     /** 遗留升级迁移：v2.1.8 及更早用 fod_mode(int 三态)，v2.1.9 起改用 sink_enabled(bool) */
     public static final String PREFS_FOD_MODE_LEGACY = "fod_mode";
     public static final int FOD_MODE_OFF_LEGACY = 0;
@@ -125,6 +131,29 @@ public final class Constants {
                     + "$nsslLockYPosition_delegate$lambda$106$$inlined$combine$1$3";
     /** flow 输入数组中「已录入指纹」位的下标 */
     public static final int FOD_FLOW_HAS_ENROLLED_INDEX = 6;
+
+    // ── 锁屏指纹图标/动画隐藏（v3.1.0，参照用户提供的 smali patch 语义）──
+    /**
+     * 目标类：com.miui.keyguard.biometrics.fod.MiuiGxzwAnimManager
+     * （sysui classes3.dex 确认，Superclass=Object）。
+     * 精准方案（用户提供，与 smali patch 等价）：
+     *   - getFingerIconResource(Context;)I：mKeyguardAuthen==true 时返回隐藏用资源
+     *     id（用户 smali 硬编码 0x7f080000；本模块运行时验证该 id 可解析才返回，
+     *     否则放行原逻辑——ROM 差异兜底）；
+     *   - getRecognizingAnimItem()L.../MiuiGxzwAnimItem;：mKeyguardAuthen==true
+     *     时返回 mAnimItemMap.get(Integer.valueOf(0))（key=0 空动画条目），
+     *     动画不再播放。
+     * 字段（PUBLIC，dexdump 确认）：mKeyguardAuthen:Z / mAnimItemMap:Map。
+     * 仅锁屏（mKeyguardAuthen=true）生效；支付/应用内指纹（false）走原逻辑。
+     */
+    public static final String MIUI_GXZW_ANIM_MANAGER_CLASS =
+            "com.miui.keyguard.biometrics.fod.MiuiGxzwAnimManager";
+    public static final String FOD_GET_FINGER_ICON_RES_METHOD = "getFingerIconResource";
+    public static final String FOD_GET_RECOGNIZING_ANIM_METHOD = "getRecognizingAnimItem";
+    public static final String FOD_KEYGUARD_AUTHEN_FIELD = "mKeyguardAuthen";
+    public static final String FOD_ANIM_ITEM_MAP_FIELD = "mAnimItemMap";
+    /** 用户 smali 提供的隐藏资源 id（运行时验证可解析才使用） */
+    public static final int FOD_HIDE_RES_ID = 0x7f080000;
 
     // ── 日志存储（模块私有目录，绕开 /sdcard 权限）──
     public static final String LOG_FILE = "hyperos_glass.log";

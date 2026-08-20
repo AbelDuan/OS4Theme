@@ -90,13 +90,15 @@ public class SettingsActivity extends Activity {
             de.edit()
                     .putBoolean(Constants.PREFS_GLASS_ENABLED, glass)
                     .putBoolean(Constants.PREFS_SINK_ENABLED, sink)
+                    .putBoolean(Constants.PREFS_HIDE_LOCK_FOD, ce.getBoolean(
+                            Constants.PREFS_HIDE_LOCK_FOD, Constants.DEFAULT_HIDE_LOCK_FOD))
                     .putBoolean(Constants.PREFS_ENABLE_LOG, log)
                     .commit();
         } catch (Throwable ignored) {
         }
     }
 
-    /** 把当前 3 个设置 key 原值重写一次（commit），触发框架同步 */
+    /** 把当前设置 key 原值重写一次（commit），触发框架同步 */
     private void forceSyncPrefs() {
         try {
             SharedPreferences sp = sp();
@@ -107,6 +109,9 @@ public class SettingsActivity extends Activity {
                     .putBoolean(Constants.PREFS_SINK_ENABLED,
                             sp.getBoolean(Constants.PREFS_SINK_ENABLED,
                                     Constants.DEFAULT_SINK_ENABLED))
+                    .putBoolean(Constants.PREFS_HIDE_LOCK_FOD,
+                            sp.getBoolean(Constants.PREFS_HIDE_LOCK_FOD,
+                                    Constants.DEFAULT_HIDE_LOCK_FOD))
                     .putBoolean(Constants.PREFS_ENABLE_LOG,
                             sp.getBoolean(Constants.PREFS_ENABLE_LOG,
                                     Constants.DEFAULT_ENABLE_LOG))
@@ -207,6 +212,39 @@ public class SettingsActivity extends Activity {
             }
         });
         card.addView(rgSink, mw());
+
+        // 隐藏锁屏指纹图标与动画：启用/不启用 单选（v3.1.0，仅锁屏生效）
+        TextView fodHead = new TextView(this);
+        fodHead.setText("隐藏锁屏指纹图标与动画");
+        fodHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        fodHead.setTypeface(Typeface.DEFAULT_BOLD);
+        fodHead.setTextColor(Color.parseColor("#222222"));
+        LinearLayout.LayoutParams lpFodHead = mw();
+        lpFodHead.topMargin = dp(10);
+        card.addView(fodHead, lpFodHead);
+
+        final RadioGroup rgFod = new RadioGroup(this);
+        rgFod.setOrientation(RadioGroup.VERTICAL);
+        final RadioButton fodOn = radio("启用");
+        final RadioButton fodOff = radio("不启用");
+        rgFod.addView(fodOn, mw());
+        rgFod.addView(fodOff, mw());
+        if (sp().getBoolean(Constants.PREFS_HIDE_LOCK_FOD, Constants.DEFAULT_HIDE_LOCK_FOD)) {
+            fodOn.setChecked(true);
+        } else {
+            fodOff.setChecked(true);
+        }
+        sInit = false;
+        rgFod.setOnCheckedChangeListener(new RadioGroup.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(RadioGroup group, int checkedId) {
+                if (sInit) return;
+                sp().edit().putBoolean(Constants.PREFS_HIDE_LOCK_FOD,
+                        checkedId == fodOn.getId()).commit();
+                toast("已保存（重启系统界面后生效）");
+            }
+        });
+        card.addView(rgFod, mw());
 
         // 日志记录开关
         final CheckBox cbLog = new CheckBox(this);
