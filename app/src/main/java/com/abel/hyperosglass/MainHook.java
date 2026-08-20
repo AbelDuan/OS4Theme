@@ -183,9 +183,10 @@ public class MainHook extends XposedModule {
     }
 
     /** 后台兜底：从 StatusProvider 读 CE prefs。
-     *  无限重试：开机后 SystemUI 在用户解锁前启动，模块 App 不可达；
-     *  解锁后模块 App 可启动，重试必然成功 → 重启手机后下沉功能
-     *  自动恢复（sSinkEnabled 为 volatile，hook 回调实时生效，无需手动重启）。 */
+     *  有界重试（v3.3.2 功耗控制）：开机后 SystemUI 在用户解锁前启动，模块 App
+     *  不可达；解锁后模块 App 可启动，重试会成功 → 重启手机后下沉功能自动恢复。
+     *  但所有设置为默认值时条件永不满足 → 旧版无限轮询（每 5s 一次 Binder IPC）
+     *  会永久驻留。现加探测上限（40 次 ≈ 6 分钟）后必停，绝不后台常驻。 */
     private static final Object sRetryLock = new Object();
     private static boolean sFallbackStarted = false;
 
@@ -250,14 +251,17 @@ public class MainHook extends XposedModule {
                         }
                     } catch (Throwable ignored) {
                     }
-                    // 低频日志防刷屏：每 20 次（约 2 分钟）记一条
-                    if (n % 20 == 0) {
-                        LogUtil.logAlways("设置(CE 兜底) 等待中（第" + n + "次，模块 App 可能未启动）");
+                    // v3.3.2 功耗控制：最多探测 40 次（≈6 分钟）后强制停止——
+                    // 所有设置为默认值时「任一值≠默认」条件永不成立，旧版会无限
+                    // 轮询（每 5s 一次 Binder IPC），等于后台常驻 + 持续唤醒进程。
+                    if (n >= 40) {
+                        LogUtil.logAlways("设置(CE 兜底) 已探测 40 次未同步，停止轮询（防后台常驻）");
+                        return;
                     }
-                    // 功耗：前 3 次 1s 快速探测（SystemUI 刚启动），之后 5s 低频
-                    // （单次为轻量 Binder IPC，功耗可忽略；成功即停，不会长期空转）
+                    // 功耗：前 3 次 1s 快速探测（SystemUI 刚启动），之后 10s 低频；
+                    // 单次为轻量 Binder IPC，且次数有上限，不会长期空转
                     try {
-                        Thread.sleep(n <= 3 ? 1000L : 5000L);
+                        Thread.sleep(n <= 3 ? 1000L : 10000L);
                     } catch (Throwable ignored) {
                     }
                 }
@@ -801,12 +805,14 @@ public class MainHook extends XposedModule {
     // 隐藏通知「清除通知」按钮（v3.2.0 布局坐标法：位置不变仅隐藏）
     // ============================================================
     /**
-     * 用户方案（layout notification_dismiss_view_container.xml 坐标法）：
-     *   - 容器根 FrameLayout **无 id**（aapt2 确认仅 layout 资源存在）；
-     *     按钮 CircleAndTickAnimView id = notification_dismiss_view（0x7f0b0865）。
-     *   - 命中按钮后对其**父容器**（FrameLayout）设
-     *     translationX(155dp)/translationY(-550dp) 移出屏幕 + alpha(0) 完全透明
-     *     —— 布局占位不变，仅视觉隐藏；
+     * 用户方案（v3.3.2 修正）：隐藏「清除通知」按钮的**图标**，位置不动。
+     *   - 按钮 CircleAndTickAnimView id = notification_dismiss_view（0x7f0b0865）；
+     *   - v3.2.0 旧方案：对按钮父容器（FrameLayout）平移 155dp/-550dp + alpha=0 ——
+     *     容器仍参与触摸分发，落到上部通知区后无声拦截第 1~2 条通知的
+     *     「展开按钮」点击（用户实测：需点更下侧才能展开）。
+     *   - v3.3.2：取消平移，仅对按钮图标本身 setVisibility(INVISIBLE)。
+     *     INVISIBLE 保留布局占位（通知不回流），且触摸分发直接跳过 →
+     *     图标隐藏且不再挡任何点击。
      *   - 时机：hook View.onAttachedToWindow 全局 + 按钮 id 过滤（attach 事件
      *     低频、回调仅 O(1) id 比对、零副作用其他 view，命中后仅执行一次）。
      */
@@ -848,22 +854,20 @@ public class MainHook extends XposedModule {
                             }
                             if (v.getId() == target) {
                                 try {
-                                    // 容器 FrameLayout 无 id：对按钮的父视图设坐标（用户改的是容器）
-                                    View targetV = v;
-                                    android.view.ViewParent p = v.getParent();
-                                    if (p instanceof View) targetV = (View) p;
-                                    float density = targetV.getResources().getDisplayMetrics().density;
-                                    targetV.setTranslationX(Constants.DISMISS_TRANSLATION_X_DP * density);
-                                    targetV.setTranslationY(Constants.DISMISS_TRANSLATION_Y_DP * density);
-                                    targetV.setAlpha(0f);
+                                    // v3.3.2（用户要求）：清除按钮保持**原位置不动**，
+                                    // 只隐藏图标本身——不再对容器做 155dp/-550dp 平移。
+                                    // 原因：容器平移 + alpha=0 虽视觉隐藏，但仍参与触摸
+                                    // 分发，落到上部通知区会无声拦截第 1~2 条通知的
+                                    // 「展开按钮」点击。图标 INVISIBLE 占位不变、
+                                    // 通知不回流，且触摸分发直接跳过，零副作用。
+                                    v.setVisibility(View.INVISIBLE);
                                     sDone = true;
                                     if (sDismissBtnLogs < 3) {
                                         sDismissBtnLogs++;
-                                        LogUtil.logAlways("[清除按钮] 已隐藏容器（translationX="
-                                                + Constants.DISMISS_TRANSLATION_X_DP + "dp, translationY="
-                                                + Constants.DISMISS_TRANSLATION_Y_DP + "dp, alpha=0）"
-                                                + " 容器类=" + targetV.getClass().getName()
-                                                + " 按钮类=" + v.getClass().getName());
+                                        LogUtil.logAlways("[清除按钮] 已隐藏图标（原位置，INVISIBLE）"
+                                                + " 按钮类=" + v.getClass().getName()
+                                                + " 容器类="
+                                                + (v.getParent() != null ? v.getParent().getClass().getName() : "?"));
                                     }
                                 } catch (Throwable ignored) {
                                 }
@@ -871,7 +875,7 @@ public class MainHook extends XposedModule {
                             return chain.proceed();
                         }
                     });
-            LogUtil.logAlways("[清除按钮] 已挂钩 View.onAttachedToWindow（按钮 id 精准过滤 → 父容器设坐标）");
+            LogUtil.logAlways("[清除按钮] 已挂钩 View.onAttachedToWindow（按钮 id 精准过滤 → 图标 INVISIBLE，位置不动）");
         } catch (Throwable t) {
             LogUtil.logAlways("[清除按钮] 挂钩失败: " + t);
         }

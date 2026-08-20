@@ -39,7 +39,7 @@ public final class Constants {
     public static final String TARGET_PKG = "com.android.systemui";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.3.0";
+    public static final String VERSION = "3.3.2";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -110,8 +110,10 @@ public final class Constants {
     public static final String PREFS_HIDE_LOCK_FOD = "hide_lock_fod";
     public static final boolean DEFAULT_HIDE_LOCK_FOD = true;
 
-    /** 隐藏通知栏「清除通知」按钮（v3.2.0，默认启用）：布局坐标法，
-     *  容器 notification_dismiss_view_container 移出屏幕 + 透明（位置占位不变） */
+    /** 隐藏通知栏「清除通知」按钮图标（v3.3.2，默认启用）：按钮保持原位置不动，
+     *  仅对图标本身 setVisibility(INVISIBLE)（占位不变、通知不回流、不拦截触摸）。
+     *  v3.2.0 旧方案（容器平移 155dp/-550dp + alpha=0）会遮挡上部通知的展开按钮，
+     *  已废弃。 */
     public static final String PREFS_HIDE_DISMISS_BTN = "hide_dismiss_btn";
     public static final boolean DEFAULT_HIDE_DISMISS_BTN = true;
 
@@ -120,16 +122,9 @@ public final class Constants {
     public static final String PREFS_FOCUS_GLASS = "focus_glass";
     public static final boolean DEFAULT_FOCUS_GLASS = true;
 
-    // ── 通知清除按钮隐藏（v3.2.0，布局坐标法）──
-    /** 清除按钮容器布局名（layout/notification_dismiss_view_container.xml；
-     *  根 FrameLayout 无 id，仅 layout 资源存在） */
-    public static final String NOTIF_DISMISS_CONTAINER_ID_NAME = "notification_dismiss_view_container";
-    /** 按钮 View 的 id 资源名（aapt2 确认 0x7f0b0865；容器无 id，
-     *  用按钮 id 定位其父容器 FrameLayout 设坐标） */
+    // ── 通知清除按钮图标隐藏（v3.3.2：原位置不动，仅图标 INVISIBLE）──
+    /** 按钮 View 的 id 资源名（aapt2 确认 0x7f0b0865；CircleAndTickAnimView） */
     public static final String NOTIF_DISMISS_VIEW_ID_NAME = "notification_dismiss_view";
-    /** 用户真机调试坐标（dp）：容器右移 155dp、上移 550dp 出屏幕；位置占位不变 */
-    public static final float DISMISS_TRANSLATION_X_DP = 155f;
-    public static final float DISMISS_TRANSLATION_Y_DP = -550f;
 
     // ── 液态玻璃焦点通知（v3.2.0，用户 smali 方案：Focus→NotificationRow）──
     /** 4 个焦点通知玻璃效果类（sysui classes2.dex 确认） */

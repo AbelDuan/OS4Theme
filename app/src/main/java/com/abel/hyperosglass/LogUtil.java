@@ -7,6 +7,7 @@ import android.util.Log;
 
 import java.lang.reflect.Method;
 import java.text.SimpleDateFormat;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
@@ -30,7 +31,10 @@ import io.github.libxposed.api.XposedModule;
  *     （框架类，与 Xposed API 无关，LibXposed 环境同样可用）；
  *   - 热路径（ThemeUtils 判定回调）严禁调用本类任何方法。
  *
- * 日志开关：log() 默认关（由设置项控制）；logAlways() 常开（排障用，仅低频点调用）。
+ * 日志开关：log() 默认关（由设置项控制）；logAlways() 常开（Xposed 日志始终记录）。
+ * v3.3.2 功耗控制：跨进程落盘推送（append_log）仅在「日志记录」开启时进行——
+ * 关闭时只写 Xposed 日志，避免开机阶段每行日志唤醒模块 App 进程。
+ * 推送由单 worker 串行执行（队列清空即退出，无后台常驻线程）。
  * 所有操作都包在 try/catch 中。
  */
 public final class LogUtil {
@@ -46,6 +50,10 @@ public final class LogUtil {
     /** 推送失败时的内存缓冲 */
     private static final List<String> sPending = new ArrayList<String>();
     private static final int MAX_PENDING = 200;
+    /** 推送单 worker 队列（v3.3.2 功耗控制：串行推送，避免每条日志新建线程） */
+    private static final Object sQLock = new Object();
+    private static final ArrayDeque<String> sQueue = new ArrayDeque<String>();
+    private static volatile Thread sWorker;
 
     public static void attach(XposedModule module) {
         sLogger = module;
@@ -72,7 +80,7 @@ public final class LogUtil {
 
     private static void write(String msg) {
         final String line = ts() + " " + Constants.LOG_TAG + " " + msg;
-        // 1) Xposed 日志（LSPosed Manager 里能看）
+        // 1) Xposed 日志（LSPosed Manager 里能看，始终记录）
         XposedModule m = sLogger;
         if (m != null) {
             try {
@@ -80,15 +88,41 @@ public final class LogUtil {
             } catch (Throwable ignored) {
             }
         }
-        // 2) 后台线程推送到模块私有目录（不阻塞主线程）
-        Thread t = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                pushToApp(line + "\n");
-            }
-        });
-        t.setDaemon(true);
-        t.start();
+        // 2) 单 worker 后台推送（串行队列，不阻塞主线程；队列清空即退出，
+        //    不留下任何后台常驻线程——v3.3.2 功耗控制）
+        //    v3.3.2 功耗控制：跨进程落盘推送仅在「日志记录」开启时进行——
+        //    关闭时只写 Xposed 日志，避免开机阶段每行日志唤醒模块 App 进程。
+        if (!sEnabled) return;
+        enqueue(line + "\n");
+    }
+
+    /** 入队并确保有 worker 在跑；队列清空后 worker 自动退出（不留后台线程） */
+    private static void enqueue(final String line) {
+        synchronized (sQLock) {
+            sQueue.add(line);
+            if (sWorker != null && sWorker.isAlive()) return;
+            sWorker = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    for (; ; ) {
+                        String l;
+                        synchronized (sQLock) {
+                            if (sQueue.isEmpty()) {
+                                sWorker = null;
+                                return;
+                            }
+                            l = sQueue.poll();
+                        }
+                        try {
+                            pushToApp(l);
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+            }, "HyperOSGlass-Log");
+            sWorker.setDaemon(true);
+            sWorker.start();
+        }
     }
 
     private static void pushToApp(String line) {
