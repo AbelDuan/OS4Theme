@@ -92,6 +92,10 @@ public class SettingsActivity extends Activity {
                     .putBoolean(Constants.PREFS_SINK_ENABLED, sink)
                     .putBoolean(Constants.PREFS_HIDE_LOCK_FOD, ce.getBoolean(
                             Constants.PREFS_HIDE_LOCK_FOD, Constants.DEFAULT_HIDE_LOCK_FOD))
+                    .putBoolean(Constants.PREFS_HIDE_DISMISS_BTN, ce.getBoolean(
+                            Constants.PREFS_HIDE_DISMISS_BTN, Constants.DEFAULT_HIDE_DISMISS_BTN))
+                    .putBoolean(Constants.PREFS_FOCUS_GLASS, ce.getBoolean(
+                            Constants.PREFS_FOCUS_GLASS, Constants.DEFAULT_FOCUS_GLASS))
                     .putBoolean(Constants.PREFS_ENABLE_LOG, log)
                     .commit();
         } catch (Throwable ignored) {
@@ -112,6 +116,12 @@ public class SettingsActivity extends Activity {
                     .putBoolean(Constants.PREFS_HIDE_LOCK_FOD,
                             sp.getBoolean(Constants.PREFS_HIDE_LOCK_FOD,
                                     Constants.DEFAULT_HIDE_LOCK_FOD))
+                    .putBoolean(Constants.PREFS_HIDE_DISMISS_BTN,
+                            sp.getBoolean(Constants.PREFS_HIDE_DISMISS_BTN,
+                                    Constants.DEFAULT_HIDE_DISMISS_BTN))
+                    .putBoolean(Constants.PREFS_FOCUS_GLASS,
+                            sp.getBoolean(Constants.PREFS_FOCUS_GLASS,
+                                    Constants.DEFAULT_FOCUS_GLASS))
                     .putBoolean(Constants.PREFS_ENABLE_LOG,
                             sp.getBoolean(Constants.PREFS_ENABLE_LOG,
                                     Constants.DEFAULT_ENABLE_LOG))
@@ -245,6 +255,74 @@ public class SettingsActivity extends Activity {
             }
         });
         card.addView(rgFod, mw());
+
+        // 隐藏通知清除按钮：启用/不启用 单选（v3.2.0，位置不变仅隐藏）
+        TextView dismissHead = new TextView(this);
+        dismissHead.setText("隐藏通知清除按钮");
+        dismissHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        dismissHead.setTypeface(Typeface.DEFAULT_BOLD);
+        dismissHead.setTextColor(Color.parseColor("#222222"));
+        LinearLayout.LayoutParams lpDismissHead = mw();
+        lpDismissHead.topMargin = dp(10);
+        card.addView(dismissHead, lpDismissHead);
+
+        final RadioGroup rgDismiss = new RadioGroup(this);
+        rgDismiss.setOrientation(RadioGroup.VERTICAL);
+        final RadioButton dismissOn = radio("启用");
+        final RadioButton dismissOff = radio("不启用");
+        rgDismiss.addView(dismissOn, mw());
+        rgDismiss.addView(dismissOff, mw());
+        if (sp().getBoolean(Constants.PREFS_HIDE_DISMISS_BTN,
+                Constants.DEFAULT_HIDE_DISMISS_BTN)) {
+            dismissOn.setChecked(true);
+        } else {
+            dismissOff.setChecked(true);
+        }
+        sInit = false;
+        rgDismiss.setOnCheckedChangeListener(new RadioGroup.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(RadioGroup group, int checkedId) {
+                if (sInit) return;
+                sp().edit().putBoolean(Constants.PREFS_HIDE_DISMISS_BTN,
+                        checkedId == dismissOn.getId()).commit();
+                toast("已保存（重启系统界面后生效）");
+            }
+        });
+        card.addView(rgDismiss, mw());
+
+        // 液态玻璃焦点通知：启用/不启用 单选（v3.2.0）
+        TextView focusHead = new TextView(this);
+        focusHead.setText("液态玻璃焦点通知");
+        focusHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        focusHead.setTypeface(Typeface.DEFAULT_BOLD);
+        focusHead.setTextColor(Color.parseColor("#222222"));
+        LinearLayout.LayoutParams lpFocusHead = mw();
+        lpFocusHead.topMargin = dp(10);
+        card.addView(focusHead, lpFocusHead);
+
+        final RadioGroup rgFocus = new RadioGroup(this);
+        rgFocus.setOrientation(RadioGroup.VERTICAL);
+        final RadioButton focusOn = radio("启用");
+        final RadioButton focusOff = radio("不启用");
+        rgFocus.addView(focusOn, mw());
+        rgFocus.addView(focusOff, mw());
+        if (sp().getBoolean(Constants.PREFS_FOCUS_GLASS,
+                Constants.DEFAULT_FOCUS_GLASS)) {
+            focusOn.setChecked(true);
+        } else {
+            focusOff.setChecked(true);
+        }
+        sInit = false;
+        rgFocus.setOnCheckedChangeListener(new RadioGroup.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(RadioGroup group, int checkedId) {
+                if (sInit) return;
+                sp().edit().putBoolean(Constants.PREFS_FOCUS_GLASS,
+                        checkedId == focusOn.getId()).commit();
+                toast("已保存（重启系统界面后生效）");
+            }
+        });
+        card.addView(rgFocus, mw());
 
         // 日志记录开关
         final CheckBox cbLog = new CheckBox(this);

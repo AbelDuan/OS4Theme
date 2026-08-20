@@ -33,7 +33,7 @@ public final class Constants {
     public static final String TARGET_PKG = "com.android.systemui";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.1.0";
+    public static final String VERSION = "3.2.0";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -103,6 +103,46 @@ public final class Constants {
      *  目的：配合通知下沉，锁屏指纹图标/动画不再与下沉通知重叠。 */
     public static final String PREFS_HIDE_LOCK_FOD = "hide_lock_fod";
     public static final boolean DEFAULT_HIDE_LOCK_FOD = true;
+
+    /** 隐藏通知栏「清除通知」按钮（v3.2.0，默认启用）：布局坐标法，
+     *  容器 notification_dismiss_view_container 移出屏幕 + 透明（位置占位不变） */
+    public static final String PREFS_HIDE_DISMISS_BTN = "hide_dismiss_btn";
+    public static final boolean DEFAULT_HIDE_DISMISS_BTN = true;
+
+    /** 液态玻璃焦点通知（v3.2.0，默认启用）：焦点通知玻璃效果改用普通通知
+     *  的 blur（NotificationRowBlurEffect）与玻璃参数（notification_glass_params_normal） */
+    public static final String PREFS_FOCUS_GLASS = "focus_glass";
+    public static final boolean DEFAULT_FOCUS_GLASS = true;
+
+    // ── 通知清除按钮隐藏（v3.2.0，布局坐标法）──
+    /** 清除按钮容器布局名（layout/notification_dismiss_view_container.xml；
+     *  根 FrameLayout 无 id，仅 layout 资源存在） */
+    public static final String NOTIF_DISMISS_CONTAINER_ID_NAME = "notification_dismiss_view_container";
+    /** 按钮 View 的 id 资源名（aapt2 确认 0x7f0b0865；容器无 id，
+     *  用按钮 id 定位其父容器 FrameLayout 设坐标） */
+    public static final String NOTIF_DISMISS_VIEW_ID_NAME = "notification_dismiss_view";
+    /** 用户真机调试坐标（dp）：容器右移 155dp、上移 550dp 出屏幕；位置占位不变 */
+    public static final float DISMISS_TRANSLATION_X_DP = 155f;
+    public static final float DISMISS_TRANSLATION_Y_DP = -550f;
+
+    // ── 液态玻璃焦点通知（v3.2.0，用户 smali 方案：Focus→NotificationRow）──
+    /** 4 个焦点通知玻璃效果类（sysui classes2.dex 确认） */
+    public static final String[] FOCUS_GLASS_CLASSES = {
+            "com.android.systemui.statusbar.notification.style.vieweffect.FocusNotificationGlassEffect",
+            "com.android.systemui.statusbar.notification.style.vieweffect.FocusNotificationGlassFullAodEffect",
+            "com.android.systemui.statusbar.notification.style.vieweffect.FocusNotificationGlassOnKeyguardEffect",
+            "com.android.systemui.statusbar.notification.style.vieweffect.FocusNotificationGlassOnKeyguardLightWallPaperEffect",
+    };
+    /** 被替换的焦点模糊效果类（用户 smali：改引用为 NotificationRowBlurEffect） */
+    public static final String FOCUS_BLUR_CLASS =
+            "com.android.systemui.statusbar.notification.style.vieweffect.FocusNotificationBlurEffect";
+    /** 普通通知行模糊效果类（4 个 Focus 类结构一致，dexdump 确认 INSTANCE + apply 签名） */
+    public static final String ROW_BLUR_CLASS =
+            "com.android.systemui.statusbar.notification.style.vieweffect.NotificationRowBlurEffect";
+    /** 焦点玻璃参数 array（0x7f0300a8，用户 smali 换掉） */
+    public static final String FOCUS_GLASS_PARAMS_RES = "focus_notification_glass_params_normal";
+    /** 普通通知玻璃参数 array（0x7f0300ce，用户 smali 换用）；运行时 getIdentifier 解析 */
+    public static final String NORMAL_GLASS_PARAMS_RES = "notification_glass_params_normal";
 
     /** 遗留升级迁移：v2.1.8 及更早用 fod_mode(int 三态)，v2.1.9 起改用 sink_enabled(bool) */
     public static final String PREFS_FOD_MODE_LEGACY = "fod_mode";

@@ -64,11 +64,21 @@ public class MainHook extends XposedModule {
     private volatile boolean sSinkEnabled = Constants.DEFAULT_SINK_ENABLED;
     private volatile boolean sGlassEnabled = Constants.DEFAULT_GLASS_ENABLED;
     private volatile boolean sHideLockFod = Constants.DEFAULT_HIDE_LOCK_FOD;
+    private volatile boolean sHideDismissBtn = Constants.DEFAULT_HIDE_DISMISS_BTN;
+    private volatile boolean sFocusGlass = Constants.DEFAULT_FOCUS_GLASS;
     /** 隐藏锁屏指纹开关（AtomicBoolean，供热路径拦截器读取） */
     private static final java.util.concurrent.atomic.AtomicBoolean sHideLockFodFlag =
             new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HIDE_LOCK_FOD);
+    /** 隐藏通知清除按钮开关（AtomicBoolean） */
+    private static final java.util.concurrent.atomic.AtomicBoolean sHideDismissFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HIDE_DISMISS_BTN);
+    /** 液态玻璃焦点通知开关（AtomicBoolean） */
+    private static final java.util.concurrent.atomic.AtomicBoolean sFocusGlassFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_FOCUS_GLASS);
     /** 锁屏指纹隐藏命中计数（前 3 次记日志） */
     private static int sHideLockFodLogs = 0;
+    /** 通知清除按钮命中计数（前 3 次记日志） */
+    private static int sDismissBtnLogs = 0;
 
     /** flow 诊断计数（前 5 次调用记日志，确认锁屏时是否真的被调用） */
     private static int sFlow1Logs = 0;
@@ -113,6 +123,8 @@ public class MainHook extends XposedModule {
             installMediaIslandDefense(cl);
             installExpandButtonColor(cl);
             installLockFodHooks(cl);
+            installHideDismissButtonHook(cl);
+            installFocusGlassHooks(cl);
         } catch (Throwable t) {
             LogUtil.logAlways("onPackageLoaded 异常: " + t);
         }
@@ -140,15 +152,24 @@ public class MainHook extends XposedModule {
                     Constants.DEFAULT_GLASS_ENABLED);
             boolean newHideLockFod = sPrefs.getBoolean(Constants.PREFS_HIDE_LOCK_FOD,
                     Constants.DEFAULT_HIDE_LOCK_FOD);
+            boolean newHideDismiss = sPrefs.getBoolean(Constants.PREFS_HIDE_DISMISS_BTN,
+                    Constants.DEFAULT_HIDE_DISMISS_BTN);
+            boolean newFocusGlass = sPrefs.getBoolean(Constants.PREFS_FOCUS_GLASS,
+                    Constants.DEFAULT_FOCUS_GLASS);
             boolean log = sPrefs.getBoolean(Constants.PREFS_ENABLE_LOG,
                     Constants.DEFAULT_ENABLE_LOG);
             sSinkEnabled = newSink;
             sGlassEnabled = newGlass;
             sHideLockFod = newHideLockFod;
             sHideLockFodFlag.set(newHideLockFod);
+            sHideDismissBtn = newHideDismiss;
+            sHideDismissFlag.set(newHideDismiss);
+            sFocusGlass = newFocusGlass;
+            sFocusGlassFlag.set(newFocusGlass);
             LogUtil.setEnabled(log);
             LogUtil.logAlways("设置(框架)：sink=" + sSinkEnabled + "，glass=" + sGlassEnabled
-                    + "，hideLockFod=" + sHideLockFod + "，日志=" + log);
+                    + "，hideLockFod=" + sHideLockFod + "，hideDismiss=" + sHideDismissBtn
+                    + "，focusGlass=" + sFocusGlass + "，日志=" + log);
             // 兜底：框架快照若显示「关闭」（可能因覆盖安装/root 改文件未同步），
             // 后台读一次模块 App 的 CE prefs（设置页写入的）覆盖，保证旧设置生效。
             if (!newSink && newGlass == Constants.DEFAULT_GLASS_ENABLED) {
@@ -192,20 +213,34 @@ public class MainHook extends XposedModule {
                                 boolean ceHideLockFod = out.getBoolean(
                                         Constants.PREFS_HIDE_LOCK_FOD,
                                         Constants.DEFAULT_HIDE_LOCK_FOD);
+                                boolean ceHideDismiss = out.getBoolean(
+                                        Constants.PREFS_HIDE_DISMISS_BTN,
+                                        Constants.DEFAULT_HIDE_DISMISS_BTN);
+                                boolean ceFocusGlass = out.getBoolean(
+                                        Constants.PREFS_FOCUS_GLASS,
+                                        Constants.DEFAULT_FOCUS_GLASS);
                                 boolean ceLog = out.getBoolean(Constants.PREFS_ENABLE_LOG,
                                         Constants.DEFAULT_ENABLE_LOG);
                                 if (ceSink != Constants.DEFAULT_SINK_ENABLED
                                         || ceGlass != Constants.DEFAULT_GLASS_ENABLED
                                         || ceHideLockFod != Constants.DEFAULT_HIDE_LOCK_FOD
+                                        || ceHideDismiss != Constants.DEFAULT_HIDE_DISMISS_BTN
+                                        || ceFocusGlass != Constants.DEFAULT_FOCUS_GLASS
                                         || ceLog != Constants.DEFAULT_ENABLE_LOG) {
                                     sSinkEnabled = ceSink;
                                     sGlassEnabled = ceGlass;
                                     sHideLockFod = ceHideLockFod;
                                     sHideLockFodFlag.set(ceHideLockFod);
+                                    sHideDismissBtn = ceHideDismiss;
+                                    sHideDismissFlag.set(ceHideDismiss);
+                                    sFocusGlass = ceFocusGlass;
+                                    sFocusGlassFlag.set(ceFocusGlass);
                                     LogUtil.setEnabled(ceLog);
                                     LogUtil.logAlways("设置(CE 兜底)：sink=" + sSinkEnabled
                                             + "，glass=" + sGlassEnabled
                                             + "，hideLockFod=" + sHideLockFod
+                                            + "，hideDismiss=" + sHideDismissBtn
+                                            + "，focusGlass=" + sFocusGlass
                                             + "，日志=" + ceLog);
                                     return;
                                 }
@@ -758,6 +793,215 @@ public class MainHook extends XposedModule {
             LogUtil.logAlways("[锁屏指纹] 隐藏资源 0x7f080000 不可解析，回退原逻辑: " + t);
             return false;
         }
+    }
+
+    // ============================================================
+    // 隐藏通知「清除通知」按钮（v3.2.0 布局坐标法：位置不变仅隐藏）
+    // ============================================================
+    /**
+     * 用户方案（layout notification_dismiss_view_container.xml 坐标法）：
+     *   - 容器根 FrameLayout **无 id**（aapt2 确认仅 layout 资源存在）；
+     *     按钮 CircleAndTickAnimView id = notification_dismiss_view（0x7f0b0865）。
+     *   - 命中按钮后对其**父容器**（FrameLayout）设
+     *     translationX(155dp)/translationY(-550dp) 移出屏幕 + alpha(0) 完全透明
+     *     —— 布局占位不变，仅视觉隐藏；
+     *   - 时机：hook View.onAttachedToWindow 全局 + 按钮 id 过滤（attach 事件
+     *     低频、回调仅 O(1) id 比对、零副作用其他 view，命中后仅执行一次）。
+     */
+    private void installHideDismissButtonHook(ClassLoader cl) {
+        try {
+            // onAttachedToWindow 是 protected 方法，必须 getDeclaredMethod + setAccessible
+            final Method oat = View.class.getDeclaredMethod("onAttachedToWindow");
+            oat.setAccessible(true);
+            hook(oat)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("notif-dismiss-btn-hide")
+                    .intercept(new XposedInterface.Hooker() {
+                        private volatile int sId;      // 0=未解析
+                        private boolean sDone;
+
+                        @Override
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            if (!sHideDismissFlag.get()) return chain.proceed();
+                            Object self = chain.getThisObject();
+                            if (!(self instanceof View)) return chain.proceed();
+                            View v = (View) self;
+                            if (sDone) return chain.proceed();
+                            int target = sId;
+                            if (target == 0) {
+                                try {
+                                    android.content.Context ctx = v.getContext();
+                                    if (ctx == null) return chain.proceed();
+                                    target = ctx.getResources().getIdentifier(
+                                            Constants.NOTIF_DISMISS_VIEW_ID_NAME,
+                                            "id", Constants.TARGET_PKG);
+                                    if (target == 0) return chain.proceed();
+                                    sId = target;
+                                    LogUtil.logAlways("[清除按钮] 按钮 id 解析: "
+                                            + Constants.NOTIF_DISMISS_VIEW_ID_NAME
+                                            + " = " + target);
+                                } catch (Throwable t) {
+                                    return chain.proceed();
+                                }
+                            }
+                            if (v.getId() == target) {
+                                try {
+                                    // 容器 FrameLayout 无 id：对按钮的父视图设坐标（用户改的是容器）
+                                    View targetV = v;
+                                    android.view.ViewParent p = v.getParent();
+                                    if (p instanceof View) targetV = (View) p;
+                                    float density = targetV.getResources().getDisplayMetrics().density;
+                                    targetV.setTranslationX(Constants.DISMISS_TRANSLATION_X_DP * density);
+                                    targetV.setTranslationY(Constants.DISMISS_TRANSLATION_Y_DP * density);
+                                    targetV.setAlpha(0f);
+                                    sDone = true;
+                                    if (sDismissBtnLogs < 3) {
+                                        sDismissBtnLogs++;
+                                        LogUtil.logAlways("[清除按钮] 已隐藏容器（translationX="
+                                                + Constants.DISMISS_TRANSLATION_X_DP + "dp, translationY="
+                                                + Constants.DISMISS_TRANSLATION_Y_DP + "dp, alpha=0）"
+                                                + " 容器类=" + targetV.getClass().getName()
+                                                + " 按钮类=" + v.getClass().getName());
+                                    }
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                            return chain.proceed();
+                        }
+                    });
+            LogUtil.logAlways("[清除按钮] 已挂钩 View.onAttachedToWindow（按钮 id 精准过滤 → 父容器设坐标）");
+        } catch (Throwable t) {
+            LogUtil.logAlways("[清除按钮] 挂钩失败: " + t);
+        }
+    }
+
+    // ============================================================
+    // 液态玻璃焦点通知（v3.2.0 用户 smali 方案：Focus→NotificationRow）
+    // ============================================================
+    /**
+     * 用户 smali patch 语义（dexdump 确认 classes2.dex）：
+     *   - 4 个 FocusNotificationGlass*Effect.apply 内部引用
+     *     FocusNotificationBlurEffect.INSTANCE.apply(row, ctx) 做模糊，
+     *     且 glassParamsArray 首次为 null 时从 0x7f0300a8
+     *     (focus_notification_glass_params_normal) 解析玻璃参数；
+     *   - 用户 patch：FocusNotificationBlurEffect → NotificationRowBlurEffect、
+     *     0x7f0300a8 → 0x7f0300ce (notification_glass_params_normal)。
+     * 模块实现（等价、更稳）：
+     *   1) hook FocusNotificationBlurEffect.apply(row, ctx) 短路，
+     *      改调 NotificationRowBlurEffect.INSTANCE.apply(row, ctx)（两结构一致）；
+     *   2) 预填 4 个 Focus 类的 PUBLIC STATIC glassParamsArray 为
+     *      notification_glass_params_normal（getIdentifier 运行时解析，防 RRO/ROM 差异）。
+     */
+    private void installFocusGlassHooks(ClassLoader cl) {
+        // 1) blur 替换
+        try {
+            final Class<?> fb = Class.forName(Constants.FOCUS_BLUR_CLASS, false, cl);
+            final Class<?> rowCls = Class.forName(
+                    "com.android.systemui.statusbar.notification.row.ExpandableNotificationRow",
+                    false, cl);
+            final Method fapply = fb.getDeclaredMethod("apply", rowCls, android.content.Context.class);
+            hook(fapply)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("focus-glass-blur-swap")
+                    .intercept(new XposedInterface.Hooker() {
+                        @Override
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            if (!sFocusGlassFlag.get()) return chain.proceed();
+                            Object row = chain.getArg(0);
+                            Object ctx = chain.getArg(1);
+                            try {
+                                Class<?> nrb = Class.forName(Constants.ROW_BLUR_CLASS, false, cl);
+                                Object inst = nrb.getField("INSTANCE").get(null);
+                                nrb.getMethod("apply", rowCls, android.content.Context.class)
+                                        .invoke(inst, row, ctx);
+                                return null; // 短路 focus blur
+                            } catch (Throwable t) {
+                                return chain.proceed(); // 失败退回原逻辑
+                            }
+                        }
+                    });
+            LogUtil.logAlways("[焦点玻璃] 已挂钩 FocusNotificationBlurEffect.apply → NotificationRowBlurEffect");
+        } catch (Throwable t) {
+            LogUtil.logAlways("[焦点玻璃] blur 替换挂钩失败: " + t);
+        }
+        // 2) 预填 glassParamsArray（普通通知玻璃参数）。
+        //    onPackageLoaded 时尽力预填一次；同时 hook 4 个 Focus 类 apply
+        //    懒填充兜底（用 apply 的 Context 参数，避免 application context 时机问题）。
+        try {
+            final android.content.Context app = currentAppContext();
+            if (app != null) {
+                fillFocusGlassParams(app, cl);
+            }
+            for (final String clsName : Constants.FOCUS_GLASS_CLASSES) {
+                try {
+                    final Class<?> c = Class.forName(clsName, false, cl);
+                    final Method apply = c.getDeclaredMethod("apply",
+                            Object.class, android.content.Context.class);
+                    apply.setAccessible(true);
+                    hook(apply)
+                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .setId("focus-glass-params-lazy")
+                            .intercept(new XposedInterface.Hooker() {
+                                private boolean sFilled;
+
+                                @Override
+                                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                                    if (!sFilled && sFocusGlassFlag.get()) {
+                                        sFilled = true;
+                                        Object ctx0 = chain.getArg(1);
+                                        if (ctx0 instanceof android.content.Context) {
+                                            fillFocusGlassParams((android.content.Context) ctx0, cl);
+                                        }
+                                    }
+                                    return chain.proceed();
+                                }
+                            });
+                } catch (Throwable ignored) {
+                }
+            }
+            LogUtil.logAlways("[焦点玻璃] 已挂钩 4 个 Focus 类 apply（懒填充兜底）");
+        } catch (Throwable t) {
+            LogUtil.logAlways("[焦点玻璃] glassParamsArray 处理失败: " + t);
+        }
+    }
+
+    /** 用 Context 解析 notification_glass_params_normal 并预填 4 个 Focus 类 glassParamsArray */
+    private static void fillFocusGlassParams(android.content.Context ctx, ClassLoader cl) {
+        try {
+            final int rid = ctx.getResources().getIdentifier(
+                    Constants.NORMAL_GLASS_PARAMS_RES, "array", Constants.TARGET_PKG);
+            if (rid == 0) return;
+            String[] ss = ctx.getResources().getStringArray(rid);
+            final float[] fa = new float[ss.length];
+            for (int i = 0; i < ss.length; i++) {
+                try {
+                    fa[i] = Float.parseFloat(ss[i]);
+                } catch (Throwable ignored) {
+                    fa[i] = 0f;
+                }
+            }
+            for (String clsName : Constants.FOCUS_GLASS_CLASSES) {
+                try {
+                    Class<?> c = Class.forName(clsName, false, cl);
+                    java.lang.reflect.Field f = c.getField("glassParamsArray");
+                    f.set(null, fa);
+                } catch (Throwable ignored) {
+                }
+            }
+            LogUtil.logAlways("[焦点玻璃] 已填充 glassParamsArray（"
+                    + Constants.NORMAL_GLASS_PARAMS_RES + " len=" + fa.length + "）");
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 纯反射拿当前进程 Application Context（ActivityThread 为 hide） */
+    private static android.content.Context currentAppContext() {
+        try {
+            Object app = currentApplication();
+            if (app instanceof android.content.Context) return (android.content.Context) app;
+        } catch (Throwable ignored) {
+        }
+        return null;
     }
 
     // ============================================================
