@@ -12,12 +12,10 @@ import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
-import android.widget.CheckBox;
 import android.widget.CompoundButton;
 import android.widget.LinearLayout;
-import android.widget.RadioButton;
-import android.widget.RadioGroup;
 import android.widget.ScrollView;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -25,23 +23,28 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.text.SimpleDateFormat;
 import java.util.Date;
-import java.util.List;
 import java.util.Locale;
 
 /**
- * 模块设置界面（参照 WechatLive 风格，纯代码构建，无 AndroidX）。
+ * 模块设置界面（纯代码构建，无 AndroidX，参照 WechatLive 风格）。
  *
  * 【铁律】本类不得 import / 引用任何 de.robv.android.xposed.* 或 MainHook。
  * 模块 App 自己的进程里没有 XposedBridge，一旦引用就会 NoClassDefFoundError 闪退。
  *
- * 功能：
- *  - 通知下沉：启用 / 不启用（二选一）
- *  - 日志记录开关（默认关；经 StatusProvider 写入模块私有目录）
- *  - 重启系统界面（root）、导出日志（content:// 分享）
+ * v3.3.0 界面重构（用户要求）：
+ *   - 功能分两大类展示，整体可滚动（ScrollView），任何机型都不遮挡；
+ *     1) 功能启用：三方主题液态玻璃 / 焦点通知液态玻璃 / 通知下沉；
+ *     2) 功能隐藏：锁屏指纹图标 / 通知清除按钮；
+ *     3) 应用工具：日志记录 / 重启系统界面 / 清空日志 / 分享日志。
+ *   - 控件由 RadioGroup 改为 Switch（开=启用/隐藏，关=停用），一行一个，布局清爽。
+ *
+ * 其余能力保留：
+ *  - 首次运行迁移 CE prefs → DE（设备保护）存储（开机 Direct Boot 即生效）；
+ *  - 打开设置页强制重写全部 key，触发 LSPosed 框架把最新设置同步给 SystemUI；
+ *  - 日志记录开关（默认关；经 StatusProvider 写入模块私有目录）；
+ *  - 重启系统界面（root）、导出日志（content:// 分享）。
  */
 public class SettingsActivity extends Activity {
-
-    private boolean sInit = true;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -90,13 +93,19 @@ public class SettingsActivity extends Activity {
             de.edit()
                     .putBoolean(Constants.PREFS_GLASS_ENABLED, glass)
                     .putBoolean(Constants.PREFS_SINK_ENABLED, sink)
+                    .putBoolean(Constants.PREFS_HIDE_LOCK_FOD, ce.getBoolean(
+                            Constants.PREFS_HIDE_LOCK_FOD, Constants.DEFAULT_HIDE_LOCK_FOD))
+                    .putBoolean(Constants.PREFS_HIDE_DISMISS_BTN, ce.getBoolean(
+                            Constants.PREFS_HIDE_DISMISS_BTN, Constants.DEFAULT_HIDE_DISMISS_BTN))
+                    .putBoolean(Constants.PREFS_FOCUS_GLASS, ce.getBoolean(
+                            Constants.PREFS_FOCUS_GLASS, Constants.DEFAULT_FOCUS_GLASS))
                     .putBoolean(Constants.PREFS_ENABLE_LOG, log)
                     .commit();
         } catch (Throwable ignored) {
         }
     }
 
-    /** 把当前 3 个设置 key 原值重写一次（commit），触发框架同步 */
+    /** 把当前设置 key 原值重写一次（commit），触发框架同步 */
     private void forceSyncPrefs() {
         try {
             SharedPreferences sp = sp();
@@ -107,6 +116,15 @@ public class SettingsActivity extends Activity {
                     .putBoolean(Constants.PREFS_SINK_ENABLED,
                             sp.getBoolean(Constants.PREFS_SINK_ENABLED,
                                     Constants.DEFAULT_SINK_ENABLED))
+                    .putBoolean(Constants.PREFS_HIDE_LOCK_FOD,
+                            sp.getBoolean(Constants.PREFS_HIDE_LOCK_FOD,
+                                    Constants.DEFAULT_HIDE_LOCK_FOD))
+                    .putBoolean(Constants.PREFS_HIDE_DISMISS_BTN,
+                            sp.getBoolean(Constants.PREFS_HIDE_DISMISS_BTN,
+                                    Constants.DEFAULT_HIDE_DISMISS_BTN))
+                    .putBoolean(Constants.PREFS_FOCUS_GLASS,
+                            sp.getBoolean(Constants.PREFS_FOCUS_GLASS,
+                                    Constants.DEFAULT_FOCUS_GLASS))
                     .putBoolean(Constants.PREFS_ENABLE_LOG,
                             sp.getBoolean(Constants.PREFS_ENABLE_LOG,
                                     Constants.DEFAULT_ENABLE_LOG))
@@ -120,14 +138,23 @@ public class SettingsActivity extends Activity {
         return createDeviceProtectedStorageContext().getSharedPreferences(Constants.PREFS, MODE_PRIVATE);
     }
 
+    // ────────────────────────────── UI 构建 ──────────────────────────────
+
     private void buildUi() {
+        // 整体可滚动：功能多、小屏/分屏不遮挡
+        ScrollView scroll = new ScrollView(this);
+        scroll.setBackgroundColor(Color.parseColor("#F5F6F8"));
+        scroll.setFillViewport(true);
+
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Color.parseColor("#F5F6F8"));
         int p = dp(20);
         root.setPadding(p, dp(28), p, dp(20));
+        scroll.addView(root, new ScrollView.LayoutParams(
+                ScrollView.LayoutParams.MATCH_PARENT,
+                ScrollView.LayoutParams.WRAP_CONTENT));
 
-        // 标题（仅保留「HyperOS 4 主题增强」，删去 OS4 Themer）
+        // 标题
         TextView title = new TextView(this);
         title.setText("HyperOS 4 主题增强");
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
@@ -137,95 +164,32 @@ public class SettingsActivity extends Activity {
         title.setPadding(0, 0, 0, dp(18));
         root.addView(title, mw());
 
-        // ── 功能卡片 ──
-        LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setBackgroundColor(Color.WHITE);
-        card.setPadding(dp(14), dp(14), dp(14), dp(14));
+        // ── 功能启用 ──
+        LinearLayout cardEnable = newCard();
+        addSectionTitle(cardEnable, "功能启用", "开启以下增强效果");
+        addSwitch(cardEnable, "三方主题液态玻璃", Constants.PREFS_GLASS_ENABLED,
+                Constants.DEFAULT_GLASS_ENABLED);
+        addSwitch(cardEnable, "焦点通知液态玻璃", Constants.PREFS_FOCUS_GLASS,
+                Constants.DEFAULT_FOCUS_GLASS);
+        addSwitch(cardEnable, "通知下沉", Constants.PREFS_SINK_ENABLED,
+                Constants.DEFAULT_SINK_ENABLED);
+        root.addView(cardEnable, cardLp());
 
-        // 液态玻璃：启用/不启用 单选
-        TextView glassHead = new TextView(this);
-        glassHead.setText("液态玻璃");
-        glassHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        glassHead.setTypeface(Typeface.DEFAULT_BOLD);
-        glassHead.setTextColor(Color.parseColor("#222222"));
-        glassHead.setPadding(0, 0, 0, dp(2));
-        card.addView(glassHead, mw());
+        // ── 功能隐藏 ──
+        LinearLayout cardHide = newCard();
+        addSectionTitle(cardHide, "功能隐藏", "开启后隐藏以下元素");
+        addSwitch(cardHide, "锁屏指纹图标", Constants.PREFS_HIDE_LOCK_FOD,
+                Constants.DEFAULT_HIDE_LOCK_FOD);
+        addSwitch(cardHide, "通知清除按钮", Constants.PREFS_HIDE_DISMISS_BTN,
+                Constants.DEFAULT_HIDE_DISMISS_BTN);
+        root.addView(cardHide, cardLp());
 
-        final RadioGroup rgGlass = new RadioGroup(this);
-        rgGlass.setOrientation(RadioGroup.VERTICAL);
-        final RadioButton glassOn = radio("启用");
-        final RadioButton glassOff = radio("不启用");
-        rgGlass.addView(glassOn, mw());
-        rgGlass.addView(glassOff, mw());
-        if (sp().getBoolean(Constants.PREFS_GLASS_ENABLED, Constants.DEFAULT_GLASS_ENABLED)) {
-            glassOn.setChecked(true);
-        } else {
-            glassOff.setChecked(true);
-        }
-        sInit = false;
-        rgGlass.setOnCheckedChangeListener(new RadioGroup.OnCheckedChangeListener() {
-            @Override
-            public void onCheckedChanged(RadioGroup group, int checkedId) {
-                if (sInit) return;
-                sp().edit().putBoolean(Constants.PREFS_GLASS_ENABLED,
-                        checkedId == glassOn.getId()).commit();
-                toast("已保存（重启系统界面后生效）");
-            }
-        });
-        card.addView(rgGlass, mw());
+        // ── 应用工具 ──
+        LinearLayout cardTool = newCard();
+        addSectionTitle(cardTool, "应用工具", null);
+        addSwitch(cardTool, "日志记录", Constants.PREFS_ENABLE_LOG,
+                Constants.DEFAULT_ENABLE_LOG);
 
-        // 通知下沉：启用/不启用 单选（与液态玻璃一致）
-        TextView sinkHead = new TextView(this);
-        sinkHead.setText("通知下沉");
-        sinkHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        sinkHead.setTypeface(Typeface.DEFAULT_BOLD);
-        sinkHead.setTextColor(Color.parseColor("#222222"));
-        LinearLayout.LayoutParams lpSinkHead = mw();
-        lpSinkHead.topMargin = dp(10);
-        card.addView(sinkHead, lpSinkHead);
-
-        final RadioGroup rgSink = new RadioGroup(this);
-        rgSink.setOrientation(RadioGroup.VERTICAL);
-        final RadioButton sinkOn = radio("启用");
-        final RadioButton sinkOff = radio("不启用");
-        rgSink.addView(sinkOn, mw());
-        rgSink.addView(sinkOff, mw());
-        if (sp().getBoolean(Constants.PREFS_SINK_ENABLED, Constants.DEFAULT_SINK_ENABLED)) {
-            sinkOn.setChecked(true);
-        } else {
-            sinkOff.setChecked(true);
-        }
-        sInit = false;
-        rgSink.setOnCheckedChangeListener(new RadioGroup.OnCheckedChangeListener() {
-            @Override
-            public void onCheckedChanged(RadioGroup group, int checkedId) {
-                if (sInit) return;
-                sp().edit().putBoolean(Constants.PREFS_SINK_ENABLED,
-                        checkedId == sinkOn.getId()).commit();
-                toast("已保存（重启系统界面后生效）");
-            }
-        });
-        card.addView(rgSink, mw());
-
-        // 日志记录开关
-        final CheckBox cbLog = new CheckBox(this);
-        cbLog.setText("日志记录");
-        cbLog.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        cbLog.setTextColor(Color.parseColor("#222222"));
-        cbLog.setChecked(sp().getBoolean(Constants.PREFS_ENABLE_LOG, Constants.DEFAULT_ENABLE_LOG));
-        cbLog.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
-            @Override
-            public void onCheckedChanged(CompoundButton b, boolean checked) {
-                sp().edit().putBoolean(Constants.PREFS_ENABLE_LOG, checked).commit();
-                toast(checked ? "已开启（重启系统界面后生效）" : "已关闭（重启系统界面后生效）");
-            }
-        });
-        LinearLayout.LayoutParams lpLog = mw();
-        lpLog.topMargin = dp(4);
-        card.addView(cbLog, lpLog);
-
-        // 重启系统界面
         Button btnRestart = makeButton("重启系统界面 (SystemUI)");
         btnRestart.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -235,9 +199,9 @@ public class SettingsActivity extends Activity {
         });
         LinearLayout.LayoutParams lpRestart = mw();
         lpRestart.topMargin = dp(10);
-        card.addView(btnRestart, lpRestart);
+        cardTool.addView(btnRestart, lpRestart);
 
-        // 日志：分享 + 清空（同一行，参照 WechatLive）
+        // 日志：分享 + 清空（同一行）
         LinearLayout logRow = new LinearLayout(this);
         logRow.setOrientation(LinearLayout.HORIZONTAL);
 
@@ -266,19 +230,74 @@ public class SettingsActivity extends Activity {
 
         LinearLayout.LayoutParams lpLogRow = mw();
         lpLogRow.topMargin = dp(10);
-        card.addView(logRow, lpLogRow);
+        cardTool.addView(logRow, lpLogRow);
 
-        root.addView(card, mw());
+        root.addView(cardTool, cardLp());
 
-        setContentView(root);
+        setContentView(scroll);
     }
 
-    private RadioButton radio(String text) {
-        RadioButton rb = new RadioButton(this);
-        rb.setText(text);
-        rb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        rb.setTextColor(Color.parseColor("#222222"));
-        return rb;
+    /** 白底圆角卡片容器 */
+    private LinearLayout newCard() {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackgroundColor(Color.WHITE);
+        card.setPadding(dp(14), dp(14), dp(14), dp(14));
+        return card;
+    }
+
+    /** 卡片间上间距 */
+    private LinearLayout.LayoutParams cardLp() {
+        LinearLayout.LayoutParams lp = mw();
+        lp.topMargin = dp(10);
+        return lp;
+    }
+
+    /** 分区标题 + 可选灰色副标题 */
+    private void addSectionTitle(LinearLayout card, String text, String hint) {
+        TextView tv = new TextView(this);
+        tv.setText(text);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        tv.setTypeface(Typeface.DEFAULT_BOLD);
+        tv.setTextColor(Color.parseColor("#222222"));
+        tv.setPadding(0, 0, 0, dp(2));
+        card.addView(tv, mw());
+        if (hint != null) {
+            TextView h = new TextView(this);
+            h.setText(hint);
+            h.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            h.setTextColor(Color.parseColor("#888888"));
+            h.setPadding(0, 0, 0, dp(6));
+            card.addView(h, mw());
+        }
+    }
+
+    /** 一行开关：左标题 + 右 Switch（开=启用/隐藏，关=停用） */
+    private void addSwitch(final LinearLayout card, String label,
+                           final String prefKey, final boolean defVal) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(6), 0, dp(6));
+
+        TextView tv = new TextView(this);
+        tv.setText(label);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        tv.setTextColor(Color.parseColor("#222222"));
+        row.addView(tv, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        final Switch sw = new Switch(this);
+        sw.setChecked(sp().getBoolean(prefKey, defVal));
+        sw.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(CompoundButton b, boolean checked) {
+                sp().edit().putBoolean(prefKey, checked).commit();
+                toast(checked ? "已开启（重启系统界面后生效）" : "已关闭（重启系统界面后生效）");
+            }
+        });
+        row.addView(sw);
+        card.addView(row, mw());
     }
 
     private Button makeButton(String text) {

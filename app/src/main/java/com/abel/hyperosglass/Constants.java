@@ -15,6 +15,12 @@ package com.abel.hyperosglass;
  *   已移除：指纹图标隐藏/显示、展开按钮药丸修复、媒体岛 attach 防御
  *   （后两者曾导致音乐通知卡片圆角变方、音乐胶囊弹窗只剩进度条）。
  *
+ * v3.3.0（当前）：
+ *   - 放弃「隐藏桌面多任务清理任务按钮」（v3.2.1）：Rust 启动器（hyos_spawner）
+ *     进程无 ART/JVM、clearAnimView 非 Android View 节点，该方案不可行，整体移除；
+ *   - 设置界面重构为两大类：功能启用（三方主题液态玻璃 / 焦点通知液态玻璃 /
+ *     通知下沉）、功能隐藏（锁屏指纹图标 / 通知清除按钮），全界面可滚动。
+ *
  * 关键修复（v3.0）：ThemeUtils 位于插件 APK（MIUISystemUIPlugin）的独立
  *   PathClassLoader 中，宿主 onPackageLoaded 的 Class.forName 必然失败
  *   （v2.1.x 移除 loadClass 拦截后玻璃 hook 从未挂上 → 三方主题液态通知失效）。
@@ -33,7 +39,7 @@ public final class Constants {
     public static final String TARGET_PKG = "com.android.systemui";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.0.9";
+    public static final String VERSION = "3.3.0";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -98,6 +104,52 @@ public final class Constants {
     public static final String PREFS_SINK_ENABLED = "sink_enabled";
     public static final boolean DEFAULT_SINK_ENABLED = true;
 
+    /** 隐藏锁屏指纹图标与动画（v3.1.0，默认启用）：只影响锁屏/解锁场景
+     *  （mKeyguardAuthen=true），支付/应用内指纹（false）完全不受影响；
+     *  目的：配合通知下沉，锁屏指纹图标/动画不再与下沉通知重叠。 */
+    public static final String PREFS_HIDE_LOCK_FOD = "hide_lock_fod";
+    public static final boolean DEFAULT_HIDE_LOCK_FOD = true;
+
+    /** 隐藏通知栏「清除通知」按钮（v3.2.0，默认启用）：布局坐标法，
+     *  容器 notification_dismiss_view_container 移出屏幕 + 透明（位置占位不变） */
+    public static final String PREFS_HIDE_DISMISS_BTN = "hide_dismiss_btn";
+    public static final boolean DEFAULT_HIDE_DISMISS_BTN = true;
+
+    /** 液态玻璃焦点通知（v3.2.0，默认启用）：焦点通知玻璃效果改用普通通知
+     *  的 blur（NotificationRowBlurEffect）与玻璃参数（notification_glass_params_normal） */
+    public static final String PREFS_FOCUS_GLASS = "focus_glass";
+    public static final boolean DEFAULT_FOCUS_GLASS = true;
+
+    // ── 通知清除按钮隐藏（v3.2.0，布局坐标法）──
+    /** 清除按钮容器布局名（layout/notification_dismiss_view_container.xml；
+     *  根 FrameLayout 无 id，仅 layout 资源存在） */
+    public static final String NOTIF_DISMISS_CONTAINER_ID_NAME = "notification_dismiss_view_container";
+    /** 按钮 View 的 id 资源名（aapt2 确认 0x7f0b0865；容器无 id，
+     *  用按钮 id 定位其父容器 FrameLayout 设坐标） */
+    public static final String NOTIF_DISMISS_VIEW_ID_NAME = "notification_dismiss_view";
+    /** 用户真机调试坐标（dp）：容器右移 155dp、上移 550dp 出屏幕；位置占位不变 */
+    public static final float DISMISS_TRANSLATION_X_DP = 155f;
+    public static final float DISMISS_TRANSLATION_Y_DP = -550f;
+
+    // ── 液态玻璃焦点通知（v3.2.0，用户 smali 方案：Focus→NotificationRow）──
+    /** 4 个焦点通知玻璃效果类（sysui classes2.dex 确认） */
+    public static final String[] FOCUS_GLASS_CLASSES = {
+            "com.android.systemui.statusbar.notification.style.vieweffect.FocusNotificationGlassEffect",
+            "com.android.systemui.statusbar.notification.style.vieweffect.FocusNotificationGlassFullAodEffect",
+            "com.android.systemui.statusbar.notification.style.vieweffect.FocusNotificationGlassOnKeyguardEffect",
+            "com.android.systemui.statusbar.notification.style.vieweffect.FocusNotificationGlassOnKeyguardLightWallPaperEffect",
+    };
+    /** 被替换的焦点模糊效果类（用户 smali：改引用为 NotificationRowBlurEffect） */
+    public static final String FOCUS_BLUR_CLASS =
+            "com.android.systemui.statusbar.notification.style.vieweffect.FocusNotificationBlurEffect";
+    /** 普通通知行模糊效果类（4 个 Focus 类结构一致，dexdump 确认 INSTANCE + apply 签名） */
+    public static final String ROW_BLUR_CLASS =
+            "com.android.systemui.statusbar.notification.style.vieweffect.NotificationRowBlurEffect";
+    /** 焦点玻璃参数 array（0x7f0300a8，用户 smali 换掉） */
+    public static final String FOCUS_GLASS_PARAMS_RES = "focus_notification_glass_params_normal";
+    /** 普通通知玻璃参数 array（0x7f0300ce，用户 smali 换用）；运行时 getIdentifier 解析 */
+    public static final String NORMAL_GLASS_PARAMS_RES = "notification_glass_params_normal";
+
     /** 遗留升级迁移：v2.1.8 及更早用 fod_mode(int 三态)，v2.1.9 起改用 sink_enabled(bool) */
     public static final String PREFS_FOD_MODE_LEGACY = "fod_mode";
     public static final int FOD_MODE_OFF_LEGACY = 0;
@@ -125,6 +177,29 @@ public final class Constants {
                     + "$nsslLockYPosition_delegate$lambda$106$$inlined$combine$1$3";
     /** flow 输入数组中「已录入指纹」位的下标 */
     public static final int FOD_FLOW_HAS_ENROLLED_INDEX = 6;
+
+    // ── 锁屏指纹图标/动画隐藏（v3.1.0，参照用户提供的 smali patch 语义）──
+    /**
+     * 目标类：com.miui.keyguard.biometrics.fod.MiuiGxzwAnimManager
+     * （sysui classes3.dex 确认，Superclass=Object）。
+     * 精准方案（用户提供，与 smali patch 等价）：
+     *   - getFingerIconResource(Context;)I：mKeyguardAuthen==true 时返回隐藏用资源
+     *     id（用户 smali 硬编码 0x7f080000；本模块运行时验证该 id 可解析才返回，
+     *     否则放行原逻辑——ROM 差异兜底）；
+     *   - getRecognizingAnimItem()L.../MiuiGxzwAnimItem;：mKeyguardAuthen==true
+     *     时返回 mAnimItemMap.get(Integer.valueOf(0))（key=0 空动画条目），
+     *     动画不再播放。
+     * 字段（PUBLIC，dexdump 确认）：mKeyguardAuthen:Z / mAnimItemMap:Map。
+     * 仅锁屏（mKeyguardAuthen=true）生效；支付/应用内指纹（false）走原逻辑。
+     */
+    public static final String MIUI_GXZW_ANIM_MANAGER_CLASS =
+            "com.miui.keyguard.biometrics.fod.MiuiGxzwAnimManager";
+    public static final String FOD_GET_FINGER_ICON_RES_METHOD = "getFingerIconResource";
+    public static final String FOD_GET_RECOGNIZING_ANIM_METHOD = "getRecognizingAnimItem";
+    public static final String FOD_KEYGUARD_AUTHEN_FIELD = "mKeyguardAuthen";
+    public static final String FOD_ANIM_ITEM_MAP_FIELD = "mAnimItemMap";
+    /** 用户 smali 提供的隐藏资源 id（运行时验证可解析才使用） */
+    public static final int FOD_HIDE_RES_ID = 0x7f080000;
 
     // ── 日志存储（模块私有目录，绕开 /sdcard 权限）──
     public static final String LOG_FILE = "hyperos_glass.log";

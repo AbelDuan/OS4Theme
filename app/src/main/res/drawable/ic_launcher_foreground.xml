@@ -1,21 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- 玻璃面板主体 -->
+
+    <!-- 玻璃卡片主体：半透白圆角方块（safe area 居中） -->
     <path
-        android:pathData="M28,32 h52 a10,10 0 0 1 10,10 v28 a10,10 0 0 1 -10,10 h-52 a10,10 0 0 1 -10,-10 v-28 a10,10 0 0 1 10,-10 z"
+        android:pathData="M30,34 h48 a8,8 0 0 1 8,8 v32 a8,8 0 0 1 -8,8 h-48 a8,8 0 0 1 -8,-8 v-32 a8,8 0 0 1 8,-8 z"
+        android:fillAlpha="0.22">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="30" android:startY="34"
+                android:endX="86" android:endY="82"
+                android:startColor="#FFFFFF"
+                android:endColor="#BFE6FF" />
+        </aapt:attr>
+    </path>
+
+    <!-- 玻璃边框：细高光线（白色描边感） -->
+    <path
+        android:pathData="M30,34 h48 a8,8 0 0 1 8,8 v32 a8,8 0 0 1 -8,8 h-48 a8,8 0 0 1 -8,-8 v-32 a8,8 0 0 1 8,-8 z"
+        android:strokeColor="#FFFFFF"
+        android:strokeAlpha="0.55"
+        android:strokeWidth="1.2"
+        android:fillColor="#00000000" />
+
+    <!-- 顶部对角高光：液态玻璃标志性反光 -->
+    <path
+        android:pathData="M30,34 L86,34 L86,42 L42,82 L30,82 L30,74 Z"
+        android:fillAlpha="0.35">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="30" android:startY="34"
+                android:endX="86" android:endY="82"
+                android:startColor="#FFFFFF"
+                android:endColor="#003D8FE0" />
+        </aapt:attr>
+    </path>
+
+    <!-- 小光点：玻璃质感点缀 -->
+    <path
+        android:pathData="M76,44 m-5,0 a5,5 0 1 0 10,0 a5,5 0 1 0 -10,0"
         android:fillColor="#FFFFFF"
-        android:fillAlpha="0.95" />
-    <!-- 斜向高光 -->
-    <path
-        android:pathData="M38,38 L60,38 L44,82 L26,82 Z"
-        android:fillColor="#BFE6FF"
         android:fillAlpha="0.85" />
-    <!-- 小气泡 -->
-    <path
-        android:pathData="M76,42 m-9,0 a9,9 0 1 0 18,0 a9,9 0 1 0 -18,0"
-        android:fillColor="#E3F4FF"
-        android:fillAlpha="0.9" />
+
 </vector>

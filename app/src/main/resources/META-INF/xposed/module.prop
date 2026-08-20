@@ -4,5 +4,5 @@ author=AbelDuan
 description=HyperOS 4 主题增强：三方主题液态玻璃通知 / 锁屏通知下沉
 minApiVersion=100
 targetApiVersion=102
-version=3.0.9
-versionCode=39
+version=3.3.0
+versionCode=50
