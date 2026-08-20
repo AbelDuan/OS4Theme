@@ -96,6 +96,9 @@ public class MainHook extends XposedModule {
             sPrefs = getRemotePreferences(Constants.PREFS);
             LogUtil.attach(this);
             reloadPrefs();
+            // v3.3.4：无条件同步真实设置值（getRemotePreferences 对 DE 写入不同步，
+            // 只读默认上下文 CE；设置页写 DE → SystemUI 永远读默认值 → 开关全失效）
+            startPrefsSync();
             LogUtil.logAlways("==== 模块已加载 v" + Constants.VERSION
                     + "（LibXposed API " + getApiVersion() + "，进程="
                     + param.getProcessName() + "）====");
@@ -172,25 +175,21 @@ public class MainHook extends XposedModule {
             LogUtil.logAlways("设置(框架)：sink=" + sSinkEnabled + "，glass=" + sGlassEnabled
                     + "，hideLockFod=" + sHideLockFod + "，hideDismiss=" + sHideDismissBtn
                     + "，focusGlass=" + sFocusGlass + "，日志=" + log);
-            // 兜底：框架快照若显示「关闭」（可能因覆盖安装/root 改文件未同步），
-            // 后台读一次模块 App 的 CE prefs（设置页写入的）覆盖，保证旧设置生效。
-            if (!newSink && newGlass == Constants.DEFAULT_GLASS_ENABLED) {
-                startPrefsFallback();
-            }
         } catch (Throwable t) {
             LogUtil.logAlways("读取设置失败: " + t);
         }
     }
 
-    /** 后台兜底：从 StatusProvider 读 CE prefs。
-     *  有界重试（v3.3.2 功耗控制）：开机后 SystemUI 在用户解锁前启动，模块 App
-     *  不可达；解锁后模块 App 可启动，重试会成功 → 重启手机后下沉功能自动恢复。
-     *  但所有设置为默认值时条件永不满足 → 旧版无限轮询（每 5s 一次 Binder IPC）
-     *  会永久驻留。现加探测上限（40 次 ≈ 6 分钟）后必停，绝不后台常驻。 */
+    /** 后台同步真实设置（v3.3.4 修复「所有开关失效」）。
+     *  根因：getRemotePreferences 只镜像模块 App 默认上下文（CE）的写入，而设置页
+     *  写的是 DE（device-protected）存储 → SystemUI 永远读到默认值，开关全失效。
+     *  本方法经 StatusProvider（模块 App uid 直接读 DE 文件）拿真实值并应用：
+     *   - 模块加载即尝试（模块 App 通常已在运行）；失败重试，最多 10 次 × 1s；
+     *   - 成功读取一次即返回（无论是否与默认相同），绝不长期驻留。 */
     private static final Object sRetryLock = new Object();
     private static boolean sFallbackStarted = false;
 
-    private void startPrefsFallback() {
+    private void startPrefsSync() {
         synchronized (sRetryLock) {
             if (sFallbackStarted) return;
             sFallbackStarted = true;
@@ -198,9 +197,7 @@ public class MainHook extends XposedModule {
         Thread t = new Thread(new Runnable() {
             @Override
             public void run() {
-                int n = 0;
-                for (; ; ) {
-                    n++;
+                for (int n = 0; n < 10; n++) {
                     try {
                         Object app = currentApplication();
                         if (app instanceof android.content.Context) {
@@ -209,66 +206,54 @@ public class MainHook extends XposedModule {
                                             android.net.Uri.parse(Constants.STATUS_URI),
                                             Constants.METHOD_GET_PREFS, null, null);
                             if (out != null) {
-                                boolean ceSink = out.getBoolean(Constants.PREFS_SINK_ENABLED,
-                                        Constants.DEFAULT_SINK_ENABLED);
-                                boolean ceGlass = out.getBoolean(Constants.PREFS_GLASS_ENABLED,
-                                        Constants.DEFAULT_GLASS_ENABLED);
-                                boolean ceHideLockFod = out.getBoolean(
-                                        Constants.PREFS_HIDE_LOCK_FOD,
-                                        Constants.DEFAULT_HIDE_LOCK_FOD);
-                                boolean ceHideDismiss = out.getBoolean(
-                                        Constants.PREFS_HIDE_DISMISS_BTN,
-                                        Constants.DEFAULT_HIDE_DISMISS_BTN);
-                                boolean ceFocusGlass = out.getBoolean(
-                                        Constants.PREFS_FOCUS_GLASS,
-                                        Constants.DEFAULT_FOCUS_GLASS);
-                                boolean ceLog = out.getBoolean(Constants.PREFS_ENABLE_LOG,
-                                        Constants.DEFAULT_ENABLE_LOG);
-                                if (ceSink != Constants.DEFAULT_SINK_ENABLED
-                                        || ceGlass != Constants.DEFAULT_GLASS_ENABLED
-                                        || ceHideLockFod != Constants.DEFAULT_HIDE_LOCK_FOD
-                                        || ceHideDismiss != Constants.DEFAULT_HIDE_DISMISS_BTN
-                                        || ceFocusGlass != Constants.DEFAULT_FOCUS_GLASS
-                                        || ceLog != Constants.DEFAULT_ENABLE_LOG) {
-                                    sSinkEnabled = ceSink;
-                                    sGlassEnabled = ceGlass;
-                                    sHideLockFod = ceHideLockFod;
-                                    sHideLockFodFlag.set(ceHideLockFod);
-                                    sHideDismissBtn = ceHideDismiss;
-                                    sHideDismissFlag.set(ceHideDismiss);
-                                    sFocusGlass = ceFocusGlass;
-                                    sFocusGlassFlag.set(ceFocusGlass);
-                                    LogUtil.setEnabled(ceLog);
-                                    LogUtil.logAlways("设置(CE 兜底)：sink=" + sSinkEnabled
-                                            + "，glass=" + sGlassEnabled
-                                            + "，hideLockFod=" + sHideLockFod
-                                            + "，hideDismiss=" + sHideDismissBtn
-                                            + "，focusGlass=" + sFocusGlass
-                                            + "，日志=" + ceLog);
-                                    return;
-                                }
+                                applyRealPrefs(out);
+                                return;
                             }
                         }
                     } catch (Throwable ignored) {
                     }
-                    // v3.3.2 功耗控制：最多探测 40 次（≈6 分钟）后强制停止——
-                    // 所有设置为默认值时「任一值≠默认」条件永不成立，旧版会无限
-                    // 轮询（每 5s 一次 Binder IPC），等于后台常驻 + 持续唤醒进程。
-                    if (n >= 40) {
-                        LogUtil.logAlways("设置(CE 兜底) 已探测 40 次未同步，停止轮询（防后台常驻）");
-                        return;
-                    }
-                    // 功耗：前 3 次 1s 快速探测（SystemUI 刚启动），之后 10s 低频；
-                    // 单次为轻量 Binder IPC，且次数有上限，不会长期空转
                     try {
-                        Thread.sleep(n <= 3 ? 1000L : 10000L);
+                        Thread.sleep(1000L);
                     } catch (Throwable ignored) {
                     }
                 }
+                LogUtil.logAlways("设置(真实值同步) 模块 App 不可达，放弃（最多 10 次，防后台常驻）");
             }
         });
         t.setDaemon(true);
         t.start();
+    }
+
+    /** 应用 StatusProvider 返回的真实设置值（成功一次即停） */
+    private void applyRealPrefs(android.os.Bundle out) {
+        try {
+            boolean sink = out.getBoolean(Constants.PREFS_SINK_ENABLED,
+                    Constants.DEFAULT_SINK_ENABLED);
+            boolean glass = out.getBoolean(Constants.PREFS_GLASS_ENABLED,
+                    Constants.DEFAULT_GLASS_ENABLED);
+            boolean fod = out.getBoolean(Constants.PREFS_HIDE_LOCK_FOD,
+                    Constants.DEFAULT_HIDE_LOCK_FOD);
+            boolean dismiss = out.getBoolean(Constants.PREFS_HIDE_DISMISS_BTN,
+                    Constants.DEFAULT_HIDE_DISMISS_BTN);
+            boolean focus = out.getBoolean(Constants.PREFS_FOCUS_GLASS,
+                    Constants.DEFAULT_FOCUS_GLASS);
+            boolean log = out.getBoolean(Constants.PREFS_ENABLE_LOG,
+                    Constants.DEFAULT_ENABLE_LOG);
+            sSinkEnabled = sink;
+            sGlassEnabled = glass;
+            sHideLockFod = fod;
+            sHideLockFodFlag.set(fod);
+            sHideDismissBtn = dismiss;
+            sHideDismissFlag.set(dismiss);
+            sFocusGlass = focus;
+            sFocusGlassFlag.set(focus);
+            LogUtil.setEnabled(log);
+            LogUtil.logAlways("设置(真实值同步)：sink=" + sink + "，glass=" + glass
+                    + "，hideLockFod=" + fod + "，hideDismiss=" + dismiss
+                    + "，focusGlass=" + focus + "，日志=" + log);
+        } catch (Throwable t) {
+            LogUtil.logAlways("设置(真实值同步) 应用失败: " + t);
+        }
     }
 
     /** 纯反射拿当前进程 Application（android.app.ActivityThread 为 hide） */

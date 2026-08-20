@@ -62,23 +62,26 @@ public class SettingsActivity extends Activity {
         }
     }
 
-    /** 首次运行：把 CE prefs 迁移到 DE（设备保护）存储。
-     *  DE 存储在用户解锁前也可读写 → SystemUI 在开机 Direct Boot 阶段即可经
-     *  StatusProvider（directBootAware）读到设置 → 重启后通知下沉零空窗。
-     *  v3.0.9：sink 默认启用。仅当存在 legacy fod_mode 时才迁移旧值；
-     *  全新安装（CE/DE 均无 legacy）保持默认 true，不得覆盖成 false。 */
+    /** 首次运行/每次打开：把设置归一化到 DE + CE 双写。
+     *  源取值优先级：DE（现行存储）→ CE（v2.x 旧存储）→ 默认。
+     *  v3.3.4 关键修复：**必须双写 CE**——LSPosed 的 getRemotePreferences 只镜像
+     *  模块 App 默认上下文（CE）的写入；此前只写 DE → SystemUI 永远读默认值 →
+     *  所有开关失效。DE 供直启/StatusProvider 读取，CE 供框架同步。
+     *  v3.0.9：sink 默认启用。仅当存在 legacy fod_mode 时才迁移旧值。 */
     private void migratePrefsToDe() {
         try {
-            SharedPreferences de = createDeviceProtectedStorageContext()
-                    .getSharedPreferences(Constants.PREFS, MODE_PRIVATE);
-            SharedPreferences ce = getSharedPreferences(Constants.PREFS, MODE_PRIVATE);
-            // 1) 玻璃/日志：无旧值则用默认
-            boolean glass = ce.getBoolean(Constants.PREFS_GLASS_ENABLED,
-                    Constants.DEFAULT_GLASS_ENABLED);
-            boolean log = ce.getBoolean(Constants.PREFS_ENABLE_LOG,
-                    Constants.DEFAULT_ENABLE_LOG);
-            // 2) 下沉：默认启用；仅当存在 legacy fod_mode 时才迁移旧值
-            boolean sink = Constants.DEFAULT_SINK_ENABLED;
+            SharedPreferences de = sp();
+            SharedPreferences ce = ceSp();
+            boolean glass = de.contains(Constants.PREFS_GLASS_ENABLED)
+                    ? de.getBoolean(Constants.PREFS_GLASS_ENABLED, Constants.DEFAULT_GLASS_ENABLED)
+                    : ce.getBoolean(Constants.PREFS_GLASS_ENABLED, Constants.DEFAULT_GLASS_ENABLED);
+            boolean log = de.contains(Constants.PREFS_ENABLE_LOG)
+                    ? de.getBoolean(Constants.PREFS_ENABLE_LOG, Constants.DEFAULT_ENABLE_LOG)
+                    : ce.getBoolean(Constants.PREFS_ENABLE_LOG, Constants.DEFAULT_ENABLE_LOG);
+            boolean sink = de.contains(Constants.PREFS_SINK_ENABLED)
+                    ? de.getBoolean(Constants.PREFS_SINK_ENABLED, Constants.DEFAULT_SINK_ENABLED)
+                    : ce.getBoolean(Constants.PREFS_SINK_ENABLED, Constants.DEFAULT_SINK_ENABLED);
+            // legacy fod_mode 迁移（仅存在于旧版本）
             if (ce.contains(Constants.PREFS_FOD_MODE_LEGACY)) {
                 sink = ce.getInt(Constants.PREFS_FOD_MODE_LEGACY,
                         Constants.FOD_MODE_OFF_LEGACY) != Constants.FOD_MODE_OFF_LEGACY;
@@ -90,52 +93,76 @@ public class SettingsActivity extends Activity {
                 if (old != Constants.FOD_MODE_OFF_LEGACY) sink = true;
                 de.edit().remove(Constants.PREFS_FOD_MODE_LEGACY).commit();
             }
-            de.edit()
+            boolean fod = de.contains(Constants.PREFS_HIDE_LOCK_FOD)
+                    ? de.getBoolean(Constants.PREFS_HIDE_LOCK_FOD, Constants.DEFAULT_HIDE_LOCK_FOD)
+                    : ce.getBoolean(Constants.PREFS_HIDE_LOCK_FOD, Constants.DEFAULT_HIDE_LOCK_FOD);
+            boolean dismiss = de.contains(Constants.PREFS_HIDE_DISMISS_BTN)
+                    ? de.getBoolean(Constants.PREFS_HIDE_DISMISS_BTN, Constants.DEFAULT_HIDE_DISMISS_BTN)
+                    : ce.getBoolean(Constants.PREFS_HIDE_DISMISS_BTN, Constants.DEFAULT_HIDE_DISMISS_BTN);
+            boolean focus = de.contains(Constants.PREFS_FOCUS_GLASS)
+                    ? de.getBoolean(Constants.PREFS_FOCUS_GLASS, Constants.DEFAULT_FOCUS_GLASS)
+                    : ce.getBoolean(Constants.PREFS_FOCUS_GLASS, Constants.DEFAULT_FOCUS_GLASS);
+            writeAllPrefs(glass, sink, fod, dismiss, focus, log);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 把当前设置 key 原值重写一次（DE+CE 双写），触发框架同步 */
+    private void forceSyncPrefs() {
+        try {
+            SharedPreferences sp = sp();
+            writeAllPrefs(
+                    sp.getBoolean(Constants.PREFS_GLASS_ENABLED, Constants.DEFAULT_GLASS_ENABLED),
+                    sp.getBoolean(Constants.PREFS_SINK_ENABLED, Constants.DEFAULT_SINK_ENABLED),
+                    sp.getBoolean(Constants.PREFS_HIDE_LOCK_FOD, Constants.DEFAULT_HIDE_LOCK_FOD),
+                    sp.getBoolean(Constants.PREFS_HIDE_DISMISS_BTN, Constants.DEFAULT_HIDE_DISMISS_BTN),
+                    sp.getBoolean(Constants.PREFS_FOCUS_GLASS, Constants.DEFAULT_FOCUS_GLASS),
+                    sp.getBoolean(Constants.PREFS_ENABLE_LOG, Constants.DEFAULT_ENABLE_LOG));
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** DE（设备保护）存储：解锁前也可读写，保证 SystemUI 开机即读到设置 */
+    private SharedPreferences sp() {
+        return createDeviceProtectedStorageContext().getSharedPreferences(Constants.PREFS, MODE_PRIVATE);
+    }
+
+    /** CE（默认上下文）存储：LSPosed getRemotePreferences 只镜像此存储的写入 */
+    private SharedPreferences ceSp() {
+        return getSharedPreferences(Constants.PREFS, MODE_PRIVATE);
+    }
+
+    /** 双写 6 个开关到 DE + CE（v3.3.4：CE 让框架同步路径生效，DE 供直启读取） */
+    private void writeAllPrefs(boolean glass, boolean sink, boolean fod,
+                               boolean dismiss, boolean focus, boolean log) {
+        try {
+            sp().edit()
                     .putBoolean(Constants.PREFS_GLASS_ENABLED, glass)
                     .putBoolean(Constants.PREFS_SINK_ENABLED, sink)
-                    .putBoolean(Constants.PREFS_HIDE_LOCK_FOD, ce.getBoolean(
-                            Constants.PREFS_HIDE_LOCK_FOD, Constants.DEFAULT_HIDE_LOCK_FOD))
-                    .putBoolean(Constants.PREFS_HIDE_DISMISS_BTN, ce.getBoolean(
-                            Constants.PREFS_HIDE_DISMISS_BTN, Constants.DEFAULT_HIDE_DISMISS_BTN))
-                    .putBoolean(Constants.PREFS_FOCUS_GLASS, ce.getBoolean(
-                            Constants.PREFS_FOCUS_GLASS, Constants.DEFAULT_FOCUS_GLASS))
+                    .putBoolean(Constants.PREFS_HIDE_LOCK_FOD, fod)
+                    .putBoolean(Constants.PREFS_HIDE_DISMISS_BTN, dismiss)
+                    .putBoolean(Constants.PREFS_FOCUS_GLASS, focus)
+                    .putBoolean(Constants.PREFS_ENABLE_LOG, log)
+                    .commit();
+            ceSp().edit()
+                    .putBoolean(Constants.PREFS_GLASS_ENABLED, glass)
+                    .putBoolean(Constants.PREFS_SINK_ENABLED, sink)
+                    .putBoolean(Constants.PREFS_HIDE_LOCK_FOD, fod)
+                    .putBoolean(Constants.PREFS_HIDE_DISMISS_BTN, dismiss)
+                    .putBoolean(Constants.PREFS_FOCUS_GLASS, focus)
                     .putBoolean(Constants.PREFS_ENABLE_LOG, log)
                     .commit();
         } catch (Throwable ignored) {
         }
     }
 
-    /** 把当前设置 key 原值重写一次（commit），触发框架同步 */
-    private void forceSyncPrefs() {
+    /** 单个开关双写（DE + CE） */
+    private void writeBoth(String key, boolean val) {
         try {
-            SharedPreferences sp = sp();
-            sp.edit()
-                    .putBoolean(Constants.PREFS_GLASS_ENABLED,
-                            sp.getBoolean(Constants.PREFS_GLASS_ENABLED,
-                                    Constants.DEFAULT_GLASS_ENABLED))
-                    .putBoolean(Constants.PREFS_SINK_ENABLED,
-                            sp.getBoolean(Constants.PREFS_SINK_ENABLED,
-                                    Constants.DEFAULT_SINK_ENABLED))
-                    .putBoolean(Constants.PREFS_HIDE_LOCK_FOD,
-                            sp.getBoolean(Constants.PREFS_HIDE_LOCK_FOD,
-                                    Constants.DEFAULT_HIDE_LOCK_FOD))
-                    .putBoolean(Constants.PREFS_HIDE_DISMISS_BTN,
-                            sp.getBoolean(Constants.PREFS_HIDE_DISMISS_BTN,
-                                    Constants.DEFAULT_HIDE_DISMISS_BTN))
-                    .putBoolean(Constants.PREFS_FOCUS_GLASS,
-                            sp.getBoolean(Constants.PREFS_FOCUS_GLASS,
-                                    Constants.DEFAULT_FOCUS_GLASS))
-                    .putBoolean(Constants.PREFS_ENABLE_LOG,
-                            sp.getBoolean(Constants.PREFS_ENABLE_LOG,
-                                    Constants.DEFAULT_ENABLE_LOG))
-                    .commit();
+            sp().edit().putBoolean(key, val).commit();
+            ceSp().edit().putBoolean(key, val).commit();
         } catch (Throwable ignored) {
         }
-    }
-
-    private SharedPreferences sp() {
-        // DE（设备保护）存储：解锁前也可读写，保证 SystemUI 开机即读到设置
-        return createDeviceProtectedStorageContext().getSharedPreferences(Constants.PREFS, MODE_PRIVATE);
     }
 
     // ────────────────────────────── UI 构建 ──────────────────────────────
@@ -292,7 +319,7 @@ public class SettingsActivity extends Activity {
         sw.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
             @Override
             public void onCheckedChanged(CompoundButton b, boolean checked) {
-                sp().edit().putBoolean(prefKey, checked).commit();
+                writeBoth(prefKey, checked);
                 toast(checked ? "已开启（重启系统界面后生效）" : "已关闭（重启系统界面后生效）");
             }
         });
