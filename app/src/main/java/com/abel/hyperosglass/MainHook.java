@@ -802,19 +802,21 @@ public class MainHook extends XposedModule {
     }
 
     // ============================================================
-    // 隐藏通知「清除通知」按钮（v3.2.0 布局坐标法：位置不变仅隐藏）
+    // 隐藏通知「清除通知」按钮（v3.3.3：图标 INVISIBLE + 容器下移屏底外）
     // ============================================================
     /**
-     * 用户方案（v3.3.2 修正）：隐藏「清除通知」按钮的**图标**，位置不动。
+     * 隐藏「清除通知」按钮（双保险，每次 attach 都执行）。
      *   - 按钮 CircleAndTickAnimView id = notification_dismiss_view（0x7f0b0865）；
-     *   - v3.2.0 旧方案：对按钮父容器（FrameLayout）平移 155dp/-550dp + alpha=0 ——
-     *     容器仍参与触摸分发，落到上部通知区后无声拦截第 1~2 条通知的
-     *     「展开按钮」点击（用户实测：需点更下侧才能展开）。
-     *   - v3.3.2：取消平移，仅对按钮图标本身 setVisibility(INVISIBLE)。
-     *     INVISIBLE 保留布局占位（通知不回流），且触摸分发直接跳过 →
-     *     图标隐藏且不再挡任何点击。
-     *   - 时机：hook View.onAttachedToWindow 全局 + 按钮 id 过滤（attach 事件
-     *     低频、回调仅 O(1) id 比对、零副作用其他 view，命中后仅执行一次）。
+     *   - v3.2.0 旧方案：父容器平移 155dp/-550dp + alpha=0 —— 透明容器仍参与触摸
+     *     分发，落到上部通知区后无声拦截第 1~2 条通知的「展开按钮」点击（已弃）；
+     *   - v3.3.2 方案：仅图标 INVISIBLE —— 但一次性 sDone 守卫导致通知栏刷新
+     *     重建按钮行后新实例不再隐藏（用户实测按钮「又回来了」）；
+     *   - v3.3.3 加固：去掉 sDone，**每次 attach 都执行**：
+     *       1) 图标本身 INVISIBLE（占位不变、触摸分发跳过、通知不回流）；
+     *       2) 父容器整体下移到屏幕底部之外（translationY=+屏高，向下不遮任何
+     *          通知）——即使 MIUI 之后显式 setVisibility(VISIBLE) 也在屏外不可见。
+     *   - 时机：hook View.onAttachedToWindow 全局 + 按钮 id 过滤（attach 事件低频、
+     *     回调仅 O(1) id 比对、零副作用其他 view）。
      */
     private void installHideDismissButtonHook(ClassLoader cl) {
         try {
@@ -826,7 +828,6 @@ public class MainHook extends XposedModule {
                     .setId("notif-dismiss-btn-hide")
                     .intercept(new XposedInterface.Hooker() {
                         private volatile int sId;      // 0=未解析
-                        private boolean sDone;
 
                         @Override
                         public Object intercept(XposedInterface.Chain chain) throws Throwable {
@@ -834,7 +835,6 @@ public class MainHook extends XposedModule {
                             Object self = chain.getThisObject();
                             if (!(self instanceof View)) return chain.proceed();
                             View v = (View) self;
-                            if (sDone) return chain.proceed();
                             int target = sId;
                             if (target == 0) {
                                 try {
@@ -854,20 +854,27 @@ public class MainHook extends XposedModule {
                             }
                             if (v.getId() == target) {
                                 try {
-                                    // v3.3.2（用户要求）：清除按钮保持**原位置不动**，
-                                    // 只隐藏图标本身——不再对容器做 155dp/-550dp 平移。
-                                    // 原因：容器平移 + alpha=0 虽视觉隐藏，但仍参与触摸
-                                    // 分发，落到上部通知区会无声拦截第 1~2 条通知的
-                                    // 「展开按钮」点击。图标 INVISIBLE 占位不变、
-                                    // 通知不回流，且触摸分发直接跳过，零副作用。
+                                    // v3.3.3 加固：清除按钮行会被通知栏刷新重建（新实例重新
+                                    // attach），v3.3.2 的一次性 sDone 只隐藏首个实例 → 按钮
+                                    // 「又回来了」。现改为**每次 attach 都执行**（attach 低频
+                                    // + O(1) id 比对，零副作用），双保险：
+                                    //   1) 图标本身 INVISIBLE（占位不变、触摸分发跳过）；
+                                    //   2) 父容器整体下移到屏幕底部之外（translationY=+屏高，
+                                    //      向下移动不遮任何通知）——即使 MIUI 之后显式
+                                    //      setVisibility(VISIBLE) 也依然在屏外不可见。
+                                    View targetV = v;
+                                    android.view.ViewParent p = v.getParent();
+                                    if (p instanceof View) targetV = (View) p;
+                                    float density = targetV.getResources().getDisplayMetrics().density;
+                                    int screenH = targetV.getResources().getDisplayMetrics().heightPixels;
+                                    targetV.setTranslationX(0f);
+                                    targetV.setTranslationY(screenH + 20f * density);
                                     v.setVisibility(View.INVISIBLE);
-                                    sDone = true;
                                     if (sDismissBtnLogs < 3) {
                                         sDismissBtnLogs++;
-                                        LogUtil.logAlways("[清除按钮] 已隐藏图标（原位置，INVISIBLE）"
-                                                + " 按钮类=" + v.getClass().getName()
-                                                + " 容器类="
-                                                + (v.getParent() != null ? v.getParent().getClass().getName() : "?"));
+                                        LogUtil.logAlways("[清除按钮] 已隐藏：图标 INVISIBLE + 容器下移到屏底之外（+"
+                                                + screenH + "px）按钮类=" + v.getClass().getName()
+                                                + " 容器类=" + targetV.getClass().getName());
                                     }
                                 } catch (Throwable ignored) {
                                 }
@@ -875,7 +882,7 @@ public class MainHook extends XposedModule {
                             return chain.proceed();
                         }
                     });
-            LogUtil.logAlways("[清除按钮] 已挂钩 View.onAttachedToWindow（按钮 id 精准过滤 → 图标 INVISIBLE，位置不动）");
+            LogUtil.logAlways("[清除按钮] 已挂钩 View.onAttachedToWindow（id 精准过滤，每次 attach 隐藏）");
         } catch (Throwable t) {
             LogUtil.logAlways("[清除按钮] 挂钩失败: " + t);
         }
