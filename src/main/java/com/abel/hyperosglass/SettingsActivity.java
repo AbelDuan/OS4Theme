@@ -94,6 +94,8 @@ public class SettingsActivity extends Activity {
                             Constants.PREFS_HIDE_LOCK_FOD, Constants.DEFAULT_HIDE_LOCK_FOD))
                     .putBoolean(Constants.PREFS_HIDE_DISMISS_BTN, ce.getBoolean(
                             Constants.PREFS_HIDE_DISMISS_BTN, Constants.DEFAULT_HIDE_DISMISS_BTN))
+                    .putBoolean(Constants.PREFS_HIDE_RECENTS_CLEAR, ce.getBoolean(
+                            Constants.PREFS_HIDE_RECENTS_CLEAR, Constants.DEFAULT_HIDE_RECENTS_CLEAR))
                     .putBoolean(Constants.PREFS_FOCUS_GLASS, ce.getBoolean(
                             Constants.PREFS_FOCUS_GLASS, Constants.DEFAULT_FOCUS_GLASS))
                     .putBoolean(Constants.PREFS_ENABLE_LOG, log)
@@ -119,6 +121,9 @@ public class SettingsActivity extends Activity {
                     .putBoolean(Constants.PREFS_HIDE_DISMISS_BTN,
                             sp.getBoolean(Constants.PREFS_HIDE_DISMISS_BTN,
                                     Constants.DEFAULT_HIDE_DISMISS_BTN))
+                    .putBoolean(Constants.PREFS_HIDE_RECENTS_CLEAR,
+                            sp.getBoolean(Constants.PREFS_HIDE_RECENTS_CLEAR,
+                                    Constants.DEFAULT_HIDE_RECENTS_CLEAR))
                     .putBoolean(Constants.PREFS_FOCUS_GLASS,
                             sp.getBoolean(Constants.PREFS_FOCUS_GLASS,
                                     Constants.DEFAULT_FOCUS_GLASS))
@@ -289,6 +294,40 @@ public class SettingsActivity extends Activity {
             }
         });
         card.addView(rgDismiss, mw());
+
+        // 隐藏多任务清理任务按钮：启用/不启用 单选（v3.2.1，位置不变仅隐藏）
+        TextView recentsHead = new TextView(this);
+        recentsHead.setText("隐藏多任务清理任务按钮");
+        recentsHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        recentsHead.setTypeface(Typeface.DEFAULT_BOLD);
+        recentsHead.setTextColor(Color.parseColor("#222222"));
+        LinearLayout.LayoutParams lpRecentsHead = mw();
+        lpRecentsHead.topMargin = dp(10);
+        card.addView(recentsHead, lpRecentsHead);
+
+        final RadioGroup rgRecents = new RadioGroup(this);
+        rgRecents.setOrientation(RadioGroup.VERTICAL);
+        final RadioButton recentsOn = radio("启用");
+        final RadioButton recentsOff = radio("不启用");
+        rgRecents.addView(recentsOn, mw());
+        rgRecents.addView(recentsOff, mw());
+        if (sp().getBoolean(Constants.PREFS_HIDE_RECENTS_CLEAR,
+                Constants.DEFAULT_HIDE_RECENTS_CLEAR)) {
+            recentsOn.setChecked(true);
+        } else {
+            recentsOff.setChecked(true);
+        }
+        sInit = false;
+        rgRecents.setOnCheckedChangeListener(new RadioGroup.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(RadioGroup group, int checkedId) {
+                if (sInit) return;
+                sp().edit().putBoolean(Constants.PREFS_HIDE_RECENTS_CLEAR,
+                        checkedId == recentsOn.getId()).commit();
+                toast("已保存（重启桌面后生效）");
+            }
+        });
+        card.addView(rgRecents, mw());
 
         // 液态玻璃焦点通知：启用/不启用 单选（v3.2.0）
         TextView focusHead = new TextView(this);

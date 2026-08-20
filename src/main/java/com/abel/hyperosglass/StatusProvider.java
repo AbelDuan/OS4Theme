@@ -56,6 +56,8 @@ public class StatusProvider extends ContentProvider {
                             Constants.PREFS_HIDE_LOCK_FOD, Constants.DEFAULT_HIDE_LOCK_FOD))
                     .putBoolean(Constants.PREFS_HIDE_DISMISS_BTN, sp.getBoolean(
                             Constants.PREFS_HIDE_DISMISS_BTN, Constants.DEFAULT_HIDE_DISMISS_BTN))
+                    .putBoolean(Constants.PREFS_HIDE_RECENTS_CLEAR, sp.getBoolean(
+                            Constants.PREFS_HIDE_RECENTS_CLEAR, Constants.DEFAULT_HIDE_RECENTS_CLEAR))
                     .putBoolean(Constants.PREFS_FOCUS_GLASS, sp.getBoolean(
                             Constants.PREFS_FOCUS_GLASS, Constants.DEFAULT_FOCUS_GLASS))
                     .putBoolean(Constants.PREFS_ENABLE_LOG, sp.getBoolean(
@@ -73,6 +75,8 @@ public class StatusProvider extends ContentProvider {
                 sp.getBoolean(Constants.PREFS_HIDE_LOCK_FOD, Constants.DEFAULT_HIDE_LOCK_FOD));
         out.putBoolean(Constants.PREFS_HIDE_DISMISS_BTN,
                 sp.getBoolean(Constants.PREFS_HIDE_DISMISS_BTN, Constants.DEFAULT_HIDE_DISMISS_BTN));
+        out.putBoolean(Constants.PREFS_HIDE_RECENTS_CLEAR,
+                sp.getBoolean(Constants.PREFS_HIDE_RECENTS_CLEAR, Constants.DEFAULT_HIDE_RECENTS_CLEAR));
         out.putBoolean(Constants.PREFS_FOCUS_GLASS,
                 sp.getBoolean(Constants.PREFS_FOCUS_GLASS, Constants.DEFAULT_FOCUS_GLASS));
         out.putBoolean(Constants.PREFS_ENABLE_LOG,

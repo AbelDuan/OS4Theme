@@ -33,7 +33,7 @@ public final class Constants {
     public static final String TARGET_PKG = "com.android.systemui";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.2.0";
+    public static final String VERSION = "3.2.1";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -109,6 +109,13 @@ public final class Constants {
     public static final String PREFS_HIDE_DISMISS_BTN = "hide_dismiss_btn";
     public static final boolean DEFAULT_HIDE_DISMISS_BTN = true;
 
+    /** 隐藏桌面多任务「清理任务」按钮（v3.2.1，默认启用）：参照通知清除按钮
+     *  方案——hook View.onAttachedToWindow + clearAnimView id 过滤 → 按钮移出
+     *  屏幕 + 透明（位置占位不变）。作用于 com.miui.home 进程（Rust 桌面宿主，
+     *  clearAnimView 仍是 Android View 树原生节点，uiautomator 实测确认）。 */
+    public static final String PREFS_HIDE_RECENTS_CLEAR = "hide_recents_clear";
+    public static final boolean DEFAULT_HIDE_RECENTS_CLEAR = true;
+
     /** 液态玻璃焦点通知（v3.2.0，默认启用）：焦点通知玻璃效果改用普通通知
      *  的 blur（NotificationRowBlurEffect）与玻璃参数（notification_glass_params_normal） */
     public static final String PREFS_FOCUS_GLASS = "focus_glass";
@@ -124,6 +131,18 @@ public final class Constants {
     /** 用户真机调试坐标（dp）：容器右移 155dp、上移 550dp 出屏幕；位置占位不变 */
     public static final float DISMISS_TRANSLATION_X_DP = 155f;
     public static final float DISMISS_TRANSLATION_Y_DP = -550f;
+
+    // ── 桌面多任务「清理任务」按钮隐藏（v3.2.1，参照通知清除按钮坐标法）──
+    /** 桌面 Launcher 包（Rust 桌面宿主进程） */
+    public static final String RECENTS_PKG = "com.miui.home";
+    /** 多任务清除按钮 id 资源名（uiautomator dump 实测确认：
+     *  resource-id=com.miui.home:id/clearAnimView，class=android.view.View，
+     *  content-desc="清理任务"，bounds 底部居中） */
+    public static final String RECENTS_CLEAR_ID_NAME = "clearAnimView";
+    /** 坐标（dp）：与通知清除按钮同风格——右移 155dp、上移 550dp + alpha=0，
+     *  位置占位不变仅视觉隐藏 */
+    public static final float RECENTS_TRANSLATION_X_DP = 155f;
+    public static final float RECENTS_TRANSLATION_Y_DP = -550f;
 
     // ── 液态玻璃焦点通知（v3.2.0，用户 smali 方案：Focus→NotificationRow）──
     /** 4 个焦点通知玻璃效果类（sysui classes2.dex 确认） */

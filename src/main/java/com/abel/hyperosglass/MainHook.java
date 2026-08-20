@@ -65,6 +65,7 @@ public class MainHook extends XposedModule {
     private volatile boolean sGlassEnabled = Constants.DEFAULT_GLASS_ENABLED;
     private volatile boolean sHideLockFod = Constants.DEFAULT_HIDE_LOCK_FOD;
     private volatile boolean sHideDismissBtn = Constants.DEFAULT_HIDE_DISMISS_BTN;
+    private volatile boolean sHideRecentsClear = Constants.DEFAULT_HIDE_RECENTS_CLEAR;
     private volatile boolean sFocusGlass = Constants.DEFAULT_FOCUS_GLASS;
     /** 隐藏锁屏指纹开关（AtomicBoolean，供热路径拦截器读取） */
     private static final java.util.concurrent.atomic.AtomicBoolean sHideLockFodFlag =
@@ -72,6 +73,9 @@ public class MainHook extends XposedModule {
     /** 隐藏通知清除按钮开关（AtomicBoolean） */
     private static final java.util.concurrent.atomic.AtomicBoolean sHideDismissFlag =
             new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HIDE_DISMISS_BTN);
+    /** 隐藏多任务清理任务按钮开关（AtomicBoolean） */
+    private static final java.util.concurrent.atomic.AtomicBoolean sHideRecentsFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HIDE_RECENTS_CLEAR);
     /** 液态玻璃焦点通知开关（AtomicBoolean） */
     private static final java.util.concurrent.atomic.AtomicBoolean sFocusGlassFlag =
             new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_FOCUS_GLASS);
@@ -79,6 +83,8 @@ public class MainHook extends XposedModule {
     private static int sHideLockFodLogs = 0;
     /** 通知清除按钮命中计数（前 3 次记日志） */
     private static int sDismissBtnLogs = 0;
+    /** 多任务清理任务按钮命中计数（前 3 次记日志） */
+    private static int sRecentsBtnLogs = 0;
 
     /** flow 诊断计数（前 5 次调用记日志，确认锁屏时是否真的被调用） */
     private static int sFlow1Logs = 0;
@@ -108,11 +114,18 @@ public class MainHook extends XposedModule {
     public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam param) {
         try {
             String pkg = param.getPackageName();
-            if (!Constants.TARGET_PKG.equals(pkg)) return;
             ClassLoader cl = param.getDefaultClassLoader();
             LogUtil.logAlways("onPackageLoaded: " + pkg);
 
             reloadPrefs();
+
+            // ── com.miui.home（桌面 Launcher，Rust 宿主）：多任务清理任务按钮 ──
+            if (Constants.RECENTS_PKG.equals(pkg)) {
+                installRecentsClearButtonHook(cl);
+                return;
+            }
+            // ── com.android.systemui：其余全部功能 ──
+            if (!Constants.TARGET_PKG.equals(pkg)) return;
 
             // 宿主包：通知下沉（flow 类在宿主 loader）+ 玻璃（插件工厂在宿主 loader）
             // + 媒体岛崩溃防御（吞异常版，系统 bug 必要保护）
@@ -154,6 +167,8 @@ public class MainHook extends XposedModule {
                     Constants.DEFAULT_HIDE_LOCK_FOD);
             boolean newHideDismiss = sPrefs.getBoolean(Constants.PREFS_HIDE_DISMISS_BTN,
                     Constants.DEFAULT_HIDE_DISMISS_BTN);
+            boolean newHideRecents = sPrefs.getBoolean(Constants.PREFS_HIDE_RECENTS_CLEAR,
+                    Constants.DEFAULT_HIDE_RECENTS_CLEAR);
             boolean newFocusGlass = sPrefs.getBoolean(Constants.PREFS_FOCUS_GLASS,
                     Constants.DEFAULT_FOCUS_GLASS);
             boolean log = sPrefs.getBoolean(Constants.PREFS_ENABLE_LOG,
@@ -164,12 +179,15 @@ public class MainHook extends XposedModule {
             sHideLockFodFlag.set(newHideLockFod);
             sHideDismissBtn = newHideDismiss;
             sHideDismissFlag.set(newHideDismiss);
+            sHideRecentsClear = newHideRecents;
+            sHideRecentsFlag.set(newHideRecents);
             sFocusGlass = newFocusGlass;
             sFocusGlassFlag.set(newFocusGlass);
             LogUtil.setEnabled(log);
             LogUtil.logAlways("设置(框架)：sink=" + sSinkEnabled + "，glass=" + sGlassEnabled
                     + "，hideLockFod=" + sHideLockFod + "，hideDismiss=" + sHideDismissBtn
-                    + "，focusGlass=" + sFocusGlass + "，日志=" + log);
+                    + "，hideRecents=" + sHideRecentsClear + "，focusGlass=" + sFocusGlass
+                    + "，日志=" + log);
             // 兜底：框架快照若显示「关闭」（可能因覆盖安装/root 改文件未同步），
             // 后台读一次模块 App 的 CE prefs（设置页写入的）覆盖，保证旧设置生效。
             if (!newSink && newGlass == Constants.DEFAULT_GLASS_ENABLED) {
@@ -216,6 +234,9 @@ public class MainHook extends XposedModule {
                                 boolean ceHideDismiss = out.getBoolean(
                                         Constants.PREFS_HIDE_DISMISS_BTN,
                                         Constants.DEFAULT_HIDE_DISMISS_BTN);
+                                boolean ceHideRecents = out.getBoolean(
+                                        Constants.PREFS_HIDE_RECENTS_CLEAR,
+                                        Constants.DEFAULT_HIDE_RECENTS_CLEAR);
                                 boolean ceFocusGlass = out.getBoolean(
                                         Constants.PREFS_FOCUS_GLASS,
                                         Constants.DEFAULT_FOCUS_GLASS);
@@ -225,6 +246,7 @@ public class MainHook extends XposedModule {
                                         || ceGlass != Constants.DEFAULT_GLASS_ENABLED
                                         || ceHideLockFod != Constants.DEFAULT_HIDE_LOCK_FOD
                                         || ceHideDismiss != Constants.DEFAULT_HIDE_DISMISS_BTN
+                                        || ceHideRecents != Constants.DEFAULT_HIDE_RECENTS_CLEAR
                                         || ceFocusGlass != Constants.DEFAULT_FOCUS_GLASS
                                         || ceLog != Constants.DEFAULT_ENABLE_LOG) {
                                     sSinkEnabled = ceSink;
@@ -233,6 +255,8 @@ public class MainHook extends XposedModule {
                                     sHideLockFodFlag.set(ceHideLockFod);
                                     sHideDismissBtn = ceHideDismiss;
                                     sHideDismissFlag.set(ceHideDismiss);
+                                    sHideRecentsClear = ceHideRecents;
+                                    sHideRecentsFlag.set(ceHideRecents);
                                     sFocusGlass = ceFocusGlass;
                                     sFocusGlassFlag.set(ceFocusGlass);
                                     LogUtil.setEnabled(ceLog);
@@ -240,6 +264,7 @@ public class MainHook extends XposedModule {
                                             + "，glass=" + sGlassEnabled
                                             + "，hideLockFod=" + sHideLockFod
                                             + "，hideDismiss=" + sHideDismissBtn
+                                            + "，hideRecents=" + sHideRecentsClear
                                             + "，focusGlass=" + sFocusGlass
                                             + "，日志=" + ceLog);
                                     return;
@@ -872,6 +897,82 @@ public class MainHook extends XposedModule {
             LogUtil.logAlways("[清除按钮] 已挂钩 View.onAttachedToWindow（按钮 id 精准过滤 → 父容器设坐标）");
         } catch (Throwable t) {
             LogUtil.logAlways("[清除按钮] 挂钩失败: " + t);
+        }
+    }
+
+    // ============================================================
+    // 隐藏桌面多任务「清理任务」按钮（v3.2.1，参照通知清除按钮坐标法）
+    // ============================================================
+    /**
+     * 目标：com.miui.home 进程（Rust 桌面宿主）多任务界面底部的「清理任务」按钮。
+     *   - uiautomator 实测确认：resource-id=com.miui.home:id/clearAnimView，
+     *     class=android.view.View，content-desc="清理任务"，bounds 底部居中，
+     *     是 Android View 树中的原生节点（Rust 宿主经 android-activity 承载）。
+     *   - 方案与通知清除按钮完全一致：hook View.onAttachedToWindow（protected，
+     *     getDeclaredMethod+setAccessible）全局 + clearAnimView id 过滤 → 命中后
+     *     对按钮自身设 translationX(155dp)/translationY(-550dp) + alpha(0)，
+     *     布局占位不变、仅视觉隐藏；命中一次后缓存，零副作用其他 view。
+     *   - 前置条件：scope.list 必须包含 com.miui.home，LSPosed 才会把模块注入
+     *     Launcher 进程（onPackageLoaded 分进程分支调用本方法）。
+     */
+    private void installRecentsClearButtonHook(ClassLoader cl) {
+        try {
+            final Method oat = View.class.getDeclaredMethod("onAttachedToWindow");
+            oat.setAccessible(true);
+            hook(oat)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("recents-clear-btn-hide")
+                    .intercept(new XposedInterface.Hooker() {
+                        private volatile int sId;      // 0=未解析
+                        private boolean sDone;
+
+                        @Override
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            if (!sHideRecentsFlag.get()) return chain.proceed();
+                            Object self = chain.getThisObject();
+                            if (!(self instanceof View)) return chain.proceed();
+                            View v = (View) self;
+                            if (sDone) return chain.proceed();
+                            int target = sId;
+                            if (target == 0) {
+                                try {
+                                    android.content.Context ctx = v.getContext();
+                                    if (ctx == null) return chain.proceed();
+                                    target = ctx.getResources().getIdentifier(
+                                            Constants.RECENTS_CLEAR_ID_NAME,
+                                            "id", Constants.RECENTS_PKG);
+                                    if (target == 0) return chain.proceed();
+                                    sId = target;
+                                    LogUtil.logAlways("[多任务清除按钮] 按钮 id 解析: "
+                                            + Constants.RECENTS_CLEAR_ID_NAME
+                                            + " = " + target);
+                                } catch (Throwable t) {
+                                    return chain.proceed();
+                                }
+                            }
+                            if (v.getId() == target) {
+                                try {
+                                    float density = v.getResources().getDisplayMetrics().density;
+                                    v.setTranslationX(Constants.RECENTS_TRANSLATION_X_DP * density);
+                                    v.setTranslationY(Constants.RECENTS_TRANSLATION_Y_DP * density);
+                                    v.setAlpha(0f);
+                                    sDone = true;
+                                    if (sRecentsBtnLogs < 3) {
+                                        sRecentsBtnLogs++;
+                                        LogUtil.logAlways("[多任务清除按钮] 已隐藏按钮（translationX="
+                                                + Constants.RECENTS_TRANSLATION_X_DP + "dp, translationY="
+                                                + Constants.RECENTS_TRANSLATION_Y_DP + "dp, alpha=0）"
+                                                + " 类=" + v.getClass().getName());
+                                    }
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                            return chain.proceed();
+                        }
+                    });
+            LogUtil.logAlways("[多任务清除按钮] 已挂钩 View.onAttachedToWindow（clearAnimView id 精准过滤）");
+        } catch (Throwable t) {
+            LogUtil.logAlways("[多任务清除按钮] 挂钩失败: " + t);
         }
     }
 
