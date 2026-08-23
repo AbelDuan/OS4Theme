@@ -1213,35 +1213,37 @@ public class MainHook extends XposedModule {
 
     /**
      * 从模块 APK（ZIP）提取 assets/heads_up_glass.dex 到目标文件。
-     * 模块 APK 路径取自 MainHook 类的 ProtectionDomain.getCodeSource；
-     * URL 解码处理空格/中文路径。失败返回 false（不抛异常）。
+     * 模块 APK 路径获取策略（多级兜底，LSPosed 环境下 ProtectionDomain
+     * 通常为 null，必须用别的方式定位）：
+     *   1) 遍历当前 ClassLoader 链的 DexPathList.dexElements，找含
+     *      "OS4Themer" 或 "hyperosglass" 的 zip 路径（LSPosed 加载模块
+     *      时模块 APK 会出现在自己 classloader 的 dexElements 里）；
+     *   2) 扫描 /data/app 下含模块包名的目录的 base.apk；
+     *   3) 兜底用 ProtectionDomain.getCodeSource（部分 ROM 仍可用）。
+     * 找到 APK 后用 ZipFile 读 assets/heads_up_glass.dex 写入 dst。
+     * 失败返回 false（不抛异常）。
      */
     private static boolean extractDexFromModuleApk(java.io.File dst) {
         java.util.zip.ZipFile zip = null;
         java.io.InputStream is = null;
         java.io.OutputStream os = null;
         try {
-            // 模块 APK 路径：MainHook 类的 codeSource
-            java.security.CodeSource cs = MainHook.class.getProtectionDomain()
-                    .getCodeSource();
-            if (cs == null || cs.getLocation() == null) {
-                LogUtil.logAlways("[悬浮柔光] 拿不到模块 APK codeSource");
+            String apkPath = locateModuleApkPath();
+            if (apkPath == null) {
+                LogUtil.logAlways("[悬浮柔光] 拿不到模块 APK 路径（三种方式都失败）");
                 return false;
             }
-            String apkPath = cs.getLocation().getPath();
-            apkPath = java.net.URLDecoder.decode(apkPath, "UTF-8");
             java.io.File apkFile = new java.io.File(apkPath);
             if (!apkFile.exists()) {
                 LogUtil.logAlways("[悬浮柔光] 模块 APK 不存在: " + apkPath);
                 return false;
             }
-            // APK 内资产路径前缀 "assets/"
             zip = new java.util.zip.ZipFile(apkFile);
             java.util.zip.ZipEntry entry = zip.getEntry(
                     "assets/" + Constants.HEADS_UP_GLASS_DEX_ASSET);
             if (entry == null) {
                 LogUtil.logAlways("[悬浮柔光] 模块 APK 内未找到资产 "
-                        + Constants.HEADS_UP_GLASS_DEX_ASSET);
+                        + Constants.HEADS_UP_GLASS_DEX_ASSET + " (apk=" + apkPath + ")");
                 return false;
             }
             is = zip.getInputStream(entry);
@@ -1249,6 +1251,7 @@ public class MainHook extends XposedModule {
             byte[] buf = new byte[8192];
             int n;
             while ((n = is.read(buf)) > 0) os.write(buf, 0, n);
+            LogUtil.logAlways("[悬浮柔光] dex 已从 " + apkPath + " 提取到 " + dst);
             return true;
         } catch (Throwable t) {
             LogUtil.logAlways("[悬浮柔光] 从模块 APK 提取 dex 失败: " + t);
@@ -1257,6 +1260,172 @@ public class MainHook extends XposedModule {
             try { if (os != null) os.close(); } catch (Throwable ignored) {}
             try { if (is != null) is.close(); } catch (Throwable ignored) {}
             try { if (zip != null) zip.close(); } catch (Throwable ignored) {}
+        }
+    }
+
+    /**
+     * 定位模块 APK 路径。三种策略依次尝试：
+     * 1) 遍历 ClassLoader 链的 dexElements，找含模块特征的 zip 路径；
+     * 2) 扫描 /data/app 下含模块包名的目录的 base.apk；
+     * 3) ProtectionDomain.getCodeSource 兜底。
+     * 返回任一找到的路径，全失败返回 null。
+     */
+    private static String locateModuleApkPath() {
+        // 策略 1：遍历 ClassLoader 链的 dexElements
+        try {
+            String s = findModuleApkInClassLoaders();
+            if (s != null) return s;
+        } catch (Throwable ignored) {
+        }
+        // 策略 2：扫描 /data/app
+        try {
+            String s = findModuleApkInDataApp();
+            if (s != null) return s;
+        } catch (Throwable ignored) {
+        }
+        // 策略 3：ProtectionDomain 兜底
+        try {
+            java.security.CodeSource cs = MainHook.class.getProtectionDomain()
+                    .getCodeSource();
+            if (cs != null && cs.getLocation() != null) {
+                String p = cs.getLocation().getPath();
+                if (p != null) {
+                    p = java.net.URLDecoder.decode(p, "UTF-8");
+                    if (new java.io.File(p).exists()) return p;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    /**
+     * 遍历当前线程 ClassLoader 及其 parent 链，反射读 pathList.dexElements，
+     * 找含 "OS4Themer" 或 "hyperosglass" 或模块包名的 zip 路径。
+     * LSPosed 加载模块时模块 APK 在模块自身 classloader 的 dexElements 里。
+     */
+    private static String findModuleApkInClassLoaders() {
+        ClassLoader cl = Thread.currentThread().getContextClassLoader();
+        ClassLoader cur = cl;
+        java.util.List<String> allPaths = new java.util.ArrayList<String>();
+        while (cur != null) {
+            try {
+                Object pathList = getPathList(cur);
+                if (pathList != null) {
+                    Object[] elements = (Object[]) getDeclaredField(pathList, "dexElements");
+                    if (elements != null) {
+                        for (Object el : elements) {
+                            String p = getElementPath(el);
+                            if (p != null && p.toLowerCase().endsWith(".apk")) {
+                                allPaths.add(p);
+                                String lower = p.toLowerCase();
+                                if (lower.contains("os4themer")
+                                        || lower.contains("hyperosglass")
+                                        || lower.contains(Constants.MODULE_PKG)) {
+                                    return p;
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            cur = cur.getParent();
+        }
+        // 没匹配特征，但可能有 APK 文件——记日志供诊断
+        if (!allPaths.isEmpty()) {
+            LogUtil.logAlways("[悬浮柔光] classloader 未匹配模块特征，"
+                    + "已知 apk 路径: " + allPaths);
+        }
+        return null;
+    }
+
+    /**
+     * 扫描 /data/app 及其子目录，找含模块包名的目录下的 base.apk。
+     * 标准 Android 安装路径：/data/app/~~xxx/com.abel.hyperosglass-yyy/base.apk
+     */
+    private static String findModuleApkInDataApp() {
+        java.io.File dataApp = new java.io.File("/data/app");
+        if (!dataApp.exists() || !dataApp.isDirectory()) return null;
+        java.io.File[] top = dataApp.listFiles();
+        if (top == null) return null;
+        for (java.io.File dir : top) {
+            if (!dir.isDirectory()) continue;
+            String name = dir.getName().toLowerCase();
+            // 直接匹配：目录名含模块包名
+            if (name.contains(Constants.MODULE_PKG)) {
+                java.io.File base = new java.io.File(dir, "base.apk");
+                if (base.exists()) return base.getAbsolutePath();
+                // 也可能是包名-随机后缀形式，进一层找
+                java.io.File[] subs = dir.listFiles();
+                if (subs != null) {
+                    for (java.io.File sub : subs) {
+                        java.io.File b = new java.io.File(sub, "base.apk");
+                        if (b.exists()) return b.getAbsolutePath();
+                    }
+                }
+            }
+            // 二级：/data/app/~~xxx/com.abel.hyperosglass-yyy/base.apk
+            java.io.File[] subs = dir.listFiles();
+            if (subs == null) continue;
+            for (java.io.File sub : subs) {
+                if (!sub.isDirectory()) continue;
+                if (sub.getName().toLowerCase().contains(Constants.MODULE_PKG)) {
+                    java.io.File base = new java.io.File(sub, "base.apk");
+                    if (base.exists()) return base.getAbsolutePath();
+                }
+            }
+        }
+        return null;
+    }
+
+    // ── 反射工具方法（DexPathList / Element 取路径） ──
+
+    private static Object getPathList(ClassLoader cl) throws Throwable {
+        if (cl == null) return null;
+        // BaseDexClassLoader.pathList
+        Class<?> baseDexCl = cl.getClass();
+        // 兼容 BootClassLoader / TwoJarClassLoader 等：沿父类链找 pathList
+        while (baseDexCl != null) {
+            try {
+                java.lang.reflect.Field f = baseDexCl.getDeclaredField("pathList");
+                f.setAccessible(true);
+                return f.get(cl);
+            } catch (NoSuchFieldException nsf) {
+                baseDexCl = baseDexCl.getSuperclass();
+            }
+        }
+        return null;
+    }
+
+    private static Object getDeclaredField(Object obj, String name) throws Throwable {
+        Class<?> c = obj.getClass();
+        while (c != null) {
+            try {
+                java.lang.reflect.Field f = c.getDeclaredField(name);
+                f.setAccessible(true);
+                return f.get(obj);
+            } catch (NoSuchFieldException nsf) {
+                c = c.getSuperclass();
+            }
+        }
+        return null;
+    }
+
+    private static String getElementPath(Object element) throws Throwable {
+        // DexPathList.Element.path 是 java.io.File（或 String，老版本）
+        if (element == null) return null;
+        try {
+            Object path = getDeclaredField(element, "path");
+            if (path == null) {
+                // 老 API 用 pathAsString
+                path = getDeclaredField(element, "pathAsString");
+            }
+            if (path == null) return null;
+            if (path instanceof java.io.File) return ((java.io.File) path).getAbsolutePath();
+            return path.toString();
+        } catch (Throwable t) {
+            return null;
         }
     }
 
