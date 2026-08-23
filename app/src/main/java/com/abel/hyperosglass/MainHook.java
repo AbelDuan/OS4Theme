@@ -1048,6 +1048,48 @@ public class MainHook extends XposedModule {
         fillHeadsUpGlassParams(cl);
         // 3) hook 文字颜色资源（开关关时回调直接放行原逻辑）
         installHeadsUpTextColorHooks(cl);
+        // 4) 诊断：记录 NotificationRowBlurEffect.apply 被调用（看 heads-up
+        //    通知触发哪个 effect，确认 SystemUI 是否主动用新注入的类）
+        installEffectCallDiag(cl);
+    }
+
+    /**
+     * 诊断 hook：记录 NotificationRowBlurEffect.apply 被调用（前 5 次）。
+     * 目的：heads-up 通知触发时，看 SystemUI 调用哪个 effect 的 apply。
+     *   - 若调用 NotificationRowBlurEffect.apply → heads-up 用普通通知 blur，
+     *     需要改 hook 让它改调 HeadsUpNotificationGlassEffect（但会递归，需另寻入口）；
+     *   - 若调用别的 effect → 需要找到那个 effect 类名再 hook。
+     * 只记录不改行为，安全叠加在现有 hook 之上。
+     */
+    private void installEffectCallDiag(ClassLoader cl) {
+        try {
+            final Class<?> rowBlur = Class.forName(Constants.ROW_BLUR_CLASS, false, cl);
+            final Class<?> rowCls = Class.forName(
+                    "com.android.systemui.statusbar.notification.row.ExpandableNotificationRow",
+                    false, cl);
+            final Method apply = rowBlur.getDeclaredMethod("apply",
+                    rowCls, android.content.Context.class);
+            hook(apply)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("heads-up-diag-rowblur")
+                    .intercept(new XposedInterface.Hooker() {
+                        @Override
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            if (sEffectCallLogs < 5) {
+                                sEffectCallLogs++;
+                                Object row = chain.getArg(0);
+                                Object ctx = chain.getArg(1);
+                                LogUtil.logAlways("[悬浮柔光诊断] NotificationRowBlurEffect.apply 被调用 #"
+                                        + sEffectCallLogs + " row="
+                                        + (row == null ? "null" : row.getClass().getName()));
+                            }
+                            return chain.proceed();
+                        }
+                    });
+            LogUtil.logAlways("[悬浮柔光诊断] 已挂钩 NotificationRowBlurEffect.apply（记录调用）");
+        } catch (Throwable t) {
+            LogUtil.logAlways("[悬浮柔光诊断] rowblur 诊断 hook 失败: " + t);
+        }
     }
 
     /** dex 是否已注入宿主 classloader（幂等：注入一次后不再重复） */
@@ -1070,8 +1112,9 @@ public class MainHook extends XposedModule {
         try {
             android.content.Context ctx = currentAppContext();
             if (ctx == null) {
-                LogUtil.logAlways("[悬浮柔光] 拿不到宿主 Context，跳过 dex 注入");
-                sDexInjected = Boolean.FALSE;
+                // onPackageLoaded 时机可能早于 Application 初始化：不缓存失败，
+                // 起重试线程（最多 10 次 × 1s），拿到 ctx 后注入。
+                startDexInjectRetry(hostCl);
                 return false;
             }
             // 1) 提取 dex 资产到宿主 codeCacheDir（已存在则跳过拷贝）
@@ -1110,6 +1153,62 @@ public class MainHook extends XposedModule {
             LogUtil.logAlways("[悬浮柔光] dex 注入失败: " + t);
             return false;
         }
+    }
+
+    /** ctx 暂不可用时延迟重试 dex 注入（防 onPackageLoaded 时机过早） */
+    private static final Object sDexRetryLock = new Object();
+    private static boolean sDexRetryStarted = false;
+
+    private void startDexInjectRetry(final ClassLoader hostCl) {
+        synchronized (sDexRetryLock) {
+            if (sDexRetryStarted) return;
+            sDexRetryStarted = true;
+        }
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                for (int n = 0; n < 10 && sDexInjected == null; n++) {
+                    try {
+                        Thread.sleep(1000L);
+                    } catch (Throwable ignored) {
+                    }
+                    if (sDexInjected != null) return;
+                    android.content.Context ctx = currentAppContext();
+                    if (ctx == null) continue;
+                    try {
+                        java.io.File dexFile = new java.io.File(ctx.getCodeCacheDir(),
+                                Constants.HEADS_UP_GLASS_DEX_FILE);
+                        if (!dexFile.exists() || dexFile.length() == 0) {
+                            if (!extractDexFromModuleApk(dexFile)) {
+                                sDexInjected = Boolean.FALSE;
+                                return;
+                            }
+                        }
+                        ClassLoader dexCl = new dalvik.system.DexClassLoader(
+                                dexFile.getAbsolutePath(),
+                                ctx.getCodeCacheDir().getAbsolutePath(), null, hostCl);
+                        injectDexElements(hostCl, dexCl);
+                        sDexInjected = Boolean.TRUE;
+                        try {
+                            Class.forName(Constants.HEADS_UP_GLASS_CLASS, false, hostCl);
+                            Class.forName(Constants.HEADS_UP_GLASS_DARK_CLASS, false, hostCl);
+                            LogUtil.logAlways("[悬浮柔光] dex 延迟注入成功（重试第 "
+                                    + (n + 1) + " 次）");
+                        } catch (Throwable e) {
+                            LogUtil.logAlways("[悬浮柔光] dex 延迟注入后类仍不可见: " + e);
+                        }
+                        return;
+                    } catch (Throwable e) {
+                        sDexInjected = Boolean.FALSE;
+                        LogUtil.logAlways("[悬浮柔光] dex 延迟注入失败: " + e);
+                        return;
+                    }
+                }
+                LogUtil.logAlways("[悬浮柔光] dex 延迟注入放弃（10 次拿不到 ctx）");
+            }
+        });
+        t.setDaemon(true);
+        t.start();
     }
 
     /**
@@ -1342,6 +1441,10 @@ public class MainHook extends XposedModule {
 
     /** 已解析的目标资源 ID 集合（首次命中时解析 + 缓存，O(1) 命中） */
     private static volatile java.util.Set<Integer> sHeadsUpColorIds = null;
+    /** 颜色 hook 命中计数（前 5 次记日志，用于诊断 hook 是否被调用） */
+    private static volatile int sHeadsUpColorHits = 0;
+    /** effect 调用诊断计数（前 5 次记日志，看 heads-up 通知触发哪个 effect） */
+    private static volatile int sEffectCallLogs = 0;
 
     /**
      * 判断资源 ID 是否为 5 个目标颜色资源之一。
@@ -1353,13 +1456,23 @@ public class MainHook extends XposedModule {
         try {
             if (id == 0) return false;
             java.util.Set<Integer> ids = sHeadsUpColorIds;
-            if (ids != null) return ids.contains(id);
-            synchronized (HeadsUpColorInitLock) {
-                if (sHeadsUpColorIds == null) {
-                    sHeadsUpColorIds = resolveHeadsUpColorIds(chain);
+            if (ids == null) {
+                synchronized (HeadsUpColorInitLock) {
+                    if (sHeadsUpColorIds == null) {
+                        sHeadsUpColorIds = resolveHeadsUpColorIds(chain);
+                    }
+                }
+                ids = sHeadsUpColorIds;
+            }
+            boolean hit = ids.contains(id);
+            if (hit) {
+                int n = ++sHeadsUpColorHits;
+                if (n <= 5) {
+                    LogUtil.logAlways("[悬浮柔光] 颜色 hook 命中 #" + n
+                            + " id=0x" + Integer.toHexString(id));
                 }
             }
-            return sHeadsUpColorIds.contains(id);
+            return hit;
         } catch (Throwable t) {
             return false;
         }
