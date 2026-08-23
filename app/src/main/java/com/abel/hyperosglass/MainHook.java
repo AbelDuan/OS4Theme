@@ -1054,12 +1054,21 @@ public class MainHook extends XposedModule {
     }
 
     /**
-     * 诊断 hook：记录 NotificationRowBlurEffect.apply 被调用（前 5 次）。
-     * 目的：heads-up 通知触发时，看 SystemUI 调用哪个 effect 的 apply。
-     *   - 若调用 NotificationRowBlurEffect.apply → heads-up 用普通通知 blur，
-     *     需要改 hook 让它改调 HeadsUpNotificationGlassEffect（但会递归，需另寻入口）；
-     *   - 若调用别的 effect → 需要找到那个 effect 类名再 hook。
-     * 只记录不改行为，安全叠加在现有 hook 之上。
+     * Effect 替换 hook：hook NotificationRowBlurEffect.apply，heads-up 通知
+     * 改调 HeadsUpNotificationGlassEffect.INSTANCE.apply，普通通知保持原 blur。
+     *
+     * 诊断日志（v3.4.0）确认：heads-up 通知触发时 SystemUI 调用的就是
+     * NotificationRowBlurEffect.apply（不是我们注入的 HeadsUp 类）。
+     * dex 里的 HeadsUp 类只是定义，SystemUI 不主动调用——必须在此 hook
+     * 改路由：row.isHeadsUp() 为 true 时改调 HeadsUpNotificationGlassEffect。
+     *
+     * 等价用户手动方案：用户 dex 内的 HeadsUpNotificationGlassEffect.apply
+     * 内部会调 NotificationRowBlurEffect.apply + MiGlassCompat.setMiGlassCompat
+     * 等（自包含），所以直接转发即可，不会递归（HeadsUp.apply 调的是 row blur
+     * 的内部实现，不会再触发我们的 hook——因为我们 hook 的是 NotificationRowBlurEffect.apply）。
+     *
+     * 注意：HeadsUp.apply 签名是 (Object, Context)（dexdump 确认），
+     * 与 NotificationRowBlurEffect.apply(ExpandableNotificationRow, Context) 兼容。
      */
     private void installEffectCallDiag(ClassLoader cl) {
         try {
@@ -1069,26 +1078,75 @@ public class MainHook extends XposedModule {
                     false, cl);
             final Method apply = rowBlur.getDeclaredMethod("apply",
                     rowCls, android.content.Context.class);
+            // 预解析 HeadsUp 类（dex 注入后才存在；失败则 hook 不改行为）
+            Class<?> headsUpCls = null;
+            Method headsUpApply = null;
+            try {
+                headsUpCls = Class.forName(Constants.HEADS_UP_GLASS_CLASS, false, cl);
+                // apply(Object, Context)
+                headsUpApply = headsUpCls.getDeclaredMethod("apply",
+                        Object.class, android.content.Context.class);
+            } catch (Throwable t) {
+                LogUtil.logAlways("[悬浮柔光] HeadsUp 类未找到，effect 替换 hook 降级为诊断: " + t);
+            }
+            final Class<?> headsUpClsF = headsUpCls;
+            final Method headsUpApplyF = headsUpApply;
             hook(apply)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("heads-up-diag-rowblur")
+                    .setId("heads-up-effect-swap")
                     .intercept(new XposedInterface.Hooker() {
                         @Override
                         public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            Object row = chain.getArg(0);
+                            Object ctx = chain.getArg(1);
+                            // 开关关 / HeadsUp 类未注入 → 放行原逻辑
+                            if (!sHeadsUpGlassFlag.get() || headsUpClsF == null) {
+                                return chain.proceed();
+                            }
+                            // 递归守卫：HeadsUp.apply 内部会调 NotificationRowBlurEffect.apply，
+                            // 二次进入直接放行原逻辑，避免无限递归
+                            if (sInHeadsUpSwap.get()) {
+                                return chain.proceed();
+                            }
+                            // 判断 row 是否为 heads-up 状态
+                            boolean isHeadsUp = false;
+                            try {
+                                if (row != null) {
+                                    Method isHu = row.getClass().getMethod("isHeadsUp");
+                                    Object r = isHu.invoke(row);
+                                    isHeadsUp = Boolean.TRUE.equals(r);
+                                }
+                            } catch (Throwable ignored) {
+                            }
                             if (sEffectCallLogs < 5) {
                                 sEffectCallLogs++;
-                                Object row = chain.getArg(0);
-                                Object ctx = chain.getArg(1);
-                                LogUtil.logAlways("[悬浮柔光诊断] NotificationRowBlurEffect.apply 被调用 #"
-                                        + sEffectCallLogs + " row="
-                                        + (row == null ? "null" : row.getClass().getName()));
+                                LogUtil.logAlways("[悬浮柔光诊断] NotificationRowBlurEffect.apply #"
+                                        + sEffectCallLogs + " isHeadsUp=" + isHeadsUp
+                                        + " row=" + (row == null ? "null" : row.getClass().getName()));
                             }
-                            return chain.proceed();
+                            if (!isHeadsUp) {
+                                return chain.proceed(); // 普通通知：原 blur
+                            }
+                            // heads-up 通知：改调 HeadsUpNotificationGlassEffect
+                            sInHeadsUpSwap.set(Boolean.TRUE);
+                            try {
+                                Object inst = headsUpClsF.getField("INSTANCE").get(null);
+                                headsUpApplyF.invoke(inst, row, ctx);
+                                if (sEffectCallLogs < 5) {
+                                    LogUtil.logAlways("[悬浮柔光] 已改调 HeadsUpNotificationGlassEffect.apply");
+                                }
+                                return null; // 短路原 NotificationRowBlurEffect.apply
+                            } catch (Throwable t) {
+                                LogUtil.logAlways("[悬浮柔光] 改调 HeadsUp 失败，退回原 blur: " + t);
+                                return chain.proceed();
+                            } finally {
+                                sInHeadsUpSwap.set(Boolean.FALSE);
+                            }
                         }
                     });
-            LogUtil.logAlways("[悬浮柔光诊断] 已挂钩 NotificationRowBlurEffect.apply（记录调用）");
+            LogUtil.logAlways("[悬浮柔光] 已挂钩 NotificationRowBlurEffect.apply（heads-up 改调 Glass）");
         } catch (Throwable t) {
-            LogUtil.logAlways("[悬浮柔光诊断] rowblur 诊断 hook 失败: " + t);
+            LogUtil.logAlways("[悬浮柔光] effect 替换 hook 失败: " + t);
         }
     }
 
@@ -1666,6 +1724,8 @@ public class MainHook extends XposedModule {
     private static volatile int sHeadsUpColorHits = 0;
     /** effect 调用诊断计数（前 5 次记日志，看 heads-up 通知触发哪个 effect） */
     private static volatile int sEffectCallLogs = 0;
+    /** 递归守卫：HeadsUp.apply 内部会调 NotificationRowBlurEffect.apply，二次进入放行原逻辑 */
+    private static final ThreadLocal<Boolean> sInHeadsUpSwap = new ThreadLocal<Boolean>();
 
     /**
      * 判断资源 ID 是否为 5 个目标颜色资源之一。
