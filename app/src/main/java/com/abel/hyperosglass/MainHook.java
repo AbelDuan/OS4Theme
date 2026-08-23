@@ -1042,11 +1042,19 @@ public class MainHook extends XposedModule {
      * 查找并选用 HeadsUpNotificationGlassEffect（与用户 dex 方案完全等价）。
      */
     private void installHeadsUpGlassHooks(ClassLoader cl) {
-        // 1) 读取玻璃参数（notification_glass_params_normal），缓存到 sHeadsUpGlassParams
+        // 0) dex 注入：将 heads_up_glass.dex 注入宿主 classloader
+        boolean injected = injectHeadsUpDex(cl);
+        if (!injected) {
+            // 立即注入失败 → 启动后台重试（等 ctx 就绪后再试）
+            startDexInjectRetry(cl);
+        }
+        // 1) 填充玻璃参数到 dex 内的两个 Effect 类
+        fillHeadsUpGlassParams(cl);
+        // 2) 读取玻璃参数（notification_glass_params_normal），缓存到 sHeadsUpGlassParams
         loadHeadsUpGlassParams(cl);
-        // 2) hook 文字颜色资源（开关关时回调直接放行原逻辑）
+        // 3) hook 文字颜色资源（开关关时回调直接放行原逻辑）
         installHeadsUpTextColorHooks(cl);
-        // 3) hook NotificationRowBlurEffect.apply：heads-up 通知临时设置 glassParamsArray
+        // 4) hook NotificationRowBlurEffect.apply：heads-up 通知临时设置 glassParamsArray
         installHeadsUpGlassSwap(cl);
     }
 
@@ -1242,12 +1250,12 @@ public class MainHook extends XposedModule {
         Thread t = new Thread(new Runnable() {
             @Override
             public void run() {
-                for (int n = 0; n < 10 && sDexInjected == null; n++) {
+                for (int n = 0; n < 10 && sDexInjected != Boolean.TRUE; n++) {
                     try {
                         Thread.sleep(1000L);
                     } catch (Throwable ignored) {
                     }
-                    if (sDexInjected != null) return;
+                    if (sDexInjected == Boolean.TRUE) return;
                     android.content.Context ctx = currentAppContext();
                     if (ctx == null) continue;
                     try {
