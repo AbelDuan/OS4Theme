@@ -39,7 +39,7 @@ public final class Constants {
     public static final String TARGET_PKG = "com.android.systemui";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.3.4";
+    public static final String VERSION = "3.4.0";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -223,4 +223,46 @@ public final class Constants {
      */
     public static final int EXPAND_PILL_BG_LIGHT = 0x1FFFFFFF;
     public static final int EXPAND_PILL_BG_DARK = 0x26FFFFFF;
+
+    // ── 悬浮通知柔光玻璃（v3.4.0：用户 dex 注入 + 资源改色方案）──
+    /**
+     * 用户方案（#MIUI系统界面组件# #HyperOS4#）：
+     *   1) 下载 dex → 界面 dex 导入类（使 HeadsUpNotificationGlassEffect /
+     *      HeadsUpNotificationGlassDarkEffect 对 SystemUI 可见）；
+     *   2) resources.arsc 改色：5 个通知文字颜色资源统一改为 #e6ffffff（白色 90% 透明）；
+     *   3) 挂载。
+     * Xposed 等价实现：
+     *   - 运行时将内置 heads_up_glass.dex 注入宿主 PathClassLoader 的 pathList，
+     *     等价于「界面 dex 导入类」；
+     *   - hook Resources.getColor / getColorStateList，5 个目标资源 ID 命中时
+     *     返回 0xE6FFFFFF，等价于「resources.arsc 改色」。
+     */
+    public static final String PREFS_HEADS_UP_GLASS = "heads_up_glass";
+    public static final boolean DEFAULT_HEADS_UP_GLASS = true;
+
+    /** 模块 APK 内的 dex 资产名（运行时从模块 APK 提取 → 注入宿主 loader） */
+    public static final String HEADS_UP_GLASS_DEX_ASSET = "heads_up_glass.dex";
+    /** 提取后落地文件名（写入宿主 getCodeCacheDir） */
+    public static final String HEADS_UP_GLASS_DEX_FILE = "heads_up_glass.dex";
+
+    /** dex 提供的两个悬浮通知玻璃效果类（Kotlin object：INSTANCE 单例 + apply/clear） */
+    public static final String HEADS_UP_GLASS_CLASS =
+            "com.android.systemui.statusbar.notification.style.vieweffect.HeadsUpNotificationGlassEffect";
+    public static final String HEADS_UP_GLASS_DARK_CLASS =
+            "com.android.systemui.statusbar.notification.style.vieweffect.HeadsUpNotificationGlassDarkEffect";
+    /** 玻璃参数 array（dex 内 <clinit>/apply 兜底用；与现有焦点玻璃一致用普通通知玻璃参数） */
+    // 复用 NORMAL_GLASS_PARAMS_RES = "notification_glass_params_normal"
+
+    /** 柔光玻璃统一文字颜色：#e6ffffff（白色，alpha=0xE6≈90%） */
+    public static final int HEADS_UP_TEXT_COLOR = 0xE6FFFFFF;
+
+    /** 需要统一为 #e6ffffff 的通知文字颜色资源名（resources.arsc 搜索改名清单）。
+     *  hook 时按名解析资源 ID（getIdentifier），命中即返回 HEADS_UP_TEXT_COLOR。 */
+    public static final String[] HEADS_UP_TEXT_COLOR_RES = {
+            "notification_time_color",
+            "optimized_heads_up_notification_text",
+            "notification_primary_text_color_light",
+            "notification_secondary_text_color_light",
+            "optimized_heads_up_notification_action_text",
+    };
 }
