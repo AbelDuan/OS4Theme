@@ -1098,10 +1098,13 @@ public class MainHook extends XposedModule {
     private static int sDexInjectLogs = 0;
 
     /**
-     * 从模块 APK 提取 assets/heads_up_glass.dex → 宿主 getCodeCacheDir →
-     * DexClassLoader 装载（parent = 宿主 loader，使 dex 内引用的
-     * NotificationRowBlurEffect / MiGlassCompat 等可从宿主解析）→ 反射把
-     * dexCl 的 dexElements 追加到宿主 PathClassLoader.pathList。
+     * 从模块 APK 读 assets/heads_up_glass.dex 字节流 → InMemoryDexClassLoader
+     * 装载（parent = 宿主 loader，使 dex 内引用的 NotificationRowBlurEffect /
+     * MiGlassCompat 等可从宿主解析）→ 反射把 dexCl 的 dexElements 追加到宿主
+     * PathClassLoader.pathList。
+     * 用内存加载（不落盘）：Android 13+ 禁止 DexClassLoader 从可写目录加载
+     * dex（SecurityException: Writable dex file not allowed）。InMemoryDexClassLoader
+     * 用 ByteBuffer 直接喂给 ART，不落盘，不受此限制。
      * 幂等：已注入直接返回 true；失败缓存 false 不重试（防每次 onPackageLoaded
      * 都尝试 → 日志刷屏；下次 SystemUI 重启自然重试）。
      */
@@ -1110,28 +1113,21 @@ public class MainHook extends XposedModule {
         Boolean done = sDexInjected;
         if (done != null) return done.booleanValue();
         try {
-            android.content.Context ctx = currentAppContext();
-            if (ctx == null) {
-                // onPackageLoaded 时机可能早于 Application 初始化：不缓存失败，
-                // 起重试线程（最多 10 次 × 1s），拿到 ctx 后注入。
-                startDexInjectRetry(hostCl);
+            // 1) 读 dex 字节流（不落盘）
+            byte[] dexBytes = readDexBytesFromModule();
+            if (dexBytes == null || dexBytes.length == 0) {
+                sDexInjected = Boolean.FALSE;
                 return false;
             }
-            // 1) 提取 dex 资产到宿主 codeCacheDir（已存在则跳过拷贝）
-            java.io.File dexFile = new java.io.File(ctx.getCodeCacheDir(),
-                    Constants.HEADS_UP_GLASS_DEX_FILE);
-            if (!dexFile.exists() || dexFile.length() == 0) {
-                if (!extractDexFromModuleApk(dexFile)) {
-                    sDexInjected = Boolean.FALSE;
-                    return false;
-                }
-                LogUtil.logAlways("[悬浮柔光] dex 已提取到 " + dexFile);
-            }
-            // 2) DexClassLoader 装载（parent = 宿主 loader）
-            java.io.File odexDir = ctx.getCodeCacheDir();
-            ClassLoader dexCl = new dalvik.system.DexClassLoader(
-                    dexFile.getAbsolutePath(), odexDir.getAbsolutePath(),
-                    null, hostCl);
+            LogUtil.logAlways("[悬浮柔光] dex 字节流读取成功，长度=" + dexBytes.length);
+            // 2) InMemoryDexClassLoader 装载（parent = 宿主 loader）
+            java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocateDirect(dexBytes.length);
+            buf.put(dexBytes);
+            buf.flip();
+            Class<?> inMemCl = Class.forName("dalvik.system.InMemoryDexClassLoader");
+            java.lang.reflect.Constructor<?> ctor = inMemCl.getConstructor(
+                    java.nio.ByteBuffer.class, ClassLoader.class);
+            ClassLoader dexCl = (ClassLoader) ctor.newInstance(buf, hostCl);
             // 3) 反射合并 dexElements：dexCl 的追加到宿主 pathList 末尾
             injectDexElements(hostCl, dexCl);
             sDexInjected = Boolean.TRUE;
@@ -1176,17 +1172,18 @@ public class MainHook extends XposedModule {
                     android.content.Context ctx = currentAppContext();
                     if (ctx == null) continue;
                     try {
-                        java.io.File dexFile = new java.io.File(ctx.getCodeCacheDir(),
-                                Constants.HEADS_UP_GLASS_DEX_FILE);
-                        if (!dexFile.exists() || dexFile.length() == 0) {
-                            if (!extractDexFromModuleApk(dexFile)) {
-                                sDexInjected = Boolean.FALSE;
-                                return;
-                            }
+                        byte[] dexBytes = readDexBytesFromModule();
+                        if (dexBytes == null || dexBytes.length == 0) {
+                            sDexInjected = Boolean.FALSE;
+                            return;
                         }
-                        ClassLoader dexCl = new dalvik.system.DexClassLoader(
-                                dexFile.getAbsolutePath(),
-                                ctx.getCodeCacheDir().getAbsolutePath(), null, hostCl);
+                        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocateDirect(dexBytes.length);
+                        buf.put(dexBytes);
+                        buf.flip();
+                        Class<?> inMemCl = Class.forName("dalvik.system.InMemoryDexClassLoader");
+                        java.lang.reflect.Constructor<?> ctor = inMemCl.getConstructor(
+                                java.nio.ByteBuffer.class, ClassLoader.class);
+                        ClassLoader dexCl = (ClassLoader) ctor.newInstance(buf, hostCl);
                         injectDexElements(hostCl, dexCl);
                         sDexInjected = Boolean.TRUE;
                         try {
@@ -1212,105 +1209,110 @@ public class MainHook extends XposedModule {
     }
 
     /**
-     * 从模块 APK 提取 assets/heads_up_glass.dex 到目标文件。
-     * 优先用 LSPosed 官方 API openRemoteFile（专为 hook 进程读模块
-     * APK 内文件设计，不依赖文件系统权限）；失败再 fallback：
-     *   1) locateModuleApkPath() 三策略（classloader 链 / /data/app 扫描
-     *      / ProtectionDomain）定位 APK 后用 ZipFile 读 assets；
-     *   2) AssetManager.open（拿模块 Resources 后）。
+     * 从模块 APK 读 assets/heads_up_glass.dex 字节流（不落盘）。
+     * 三级策略：
+     *   1) AssetManager + addAssetPath（实测可用，前次日志已验证）；
+     *   2) openRemoteFile（LSPosed 官方 API，部分 ROM 可用）；
+     *   3) locateModuleApkPath 三策略 + ZipFile（兜底）。
+     * 不落盘的原因：Android 13+ ART 禁止从可写目录加载 dex
+     * （SecurityException: Writable dex file not allowed），
+     * 改用 InMemoryDexClassLoader 直接喂字节流。
      */
-    private boolean extractDexFromModuleApk(java.io.File dst) {
+    private byte[] readDexBytesFromModule() {
+        byte[] bytes;
+        // 策略 1：AssetManager + addAssetPath（前次日志确认可用）
+        bytes = readDexViaAssetManager();
+        if (bytes != null) return bytes;
+        // 策略 2：openRemoteFile（LSPosed 官方 API）
+        bytes = readDexViaRemoteFile();
+        if (bytes != null) return bytes;
+        // 策略 3：定位 APK + ZipFile
+        bytes = readDexViaZipFile();
+        if (bytes != null) return bytes;
+        LogUtil.logAlways("[悬浮柔光] 所有 dex 字节读取策略均失败");
+        return null;
+    }
+
+    /** 策略 1：getModuleApplicationInfo + AssetManager.open（不落盘） */
+    private byte[] readDexViaAssetManager() {
         java.io.InputStream is = null;
-        java.io.OutputStream os = null;
-        // 主路径：openRemoteFile（LSPosed 官方，跨进程读模块 APK 内文件）
+        try {
+            android.content.pm.ApplicationInfo ai = getModuleApplicationInfo();
+            if (ai == null || ai.sourceDir == null) return null;
+            android.content.res.AssetManager am = android.content.res.AssetManager
+                    .class.getDeclaredConstructor().newInstance();
+            java.lang.reflect.Method m = android.content.res.AssetManager.class
+                    .getDeclaredMethod("addAssetPath", String.class);
+            m.setAccessible(true);
+            m.invoke(am, ai.sourceDir);
+            is = am.open(Constants.HEADS_UP_GLASS_DEX_ASSET);
+            byte[] out = readAllBytes(is);
+            LogUtil.logAlways("[悬浮柔光] dex 字节通过 AssetManager 读取成功，长度=" + out.length);
+            return out;
+        } catch (Throwable t) {
+            LogUtil.logAlways("[悬浮柔光] AssetManager 读取失败: " + t);
+            return null;
+        } finally {
+            try { if (is != null) is.close(); } catch (Throwable ignored) {}
+        }
+    }
+
+    /** 策略 2：openRemoteFile（LSPosed 官方 API，不落盘） */
+    private byte[] readDexViaRemoteFile() {
         try {
             String name = "assets/" + Constants.HEADS_UP_GLASS_DEX_ASSET;
             android.os.ParcelFileDescriptor pfd = openRemoteFile(name);
-            if (pfd != null) {
-                is = new java.io.FileInputStream(pfd.getFileDescriptor());
-                os = new java.io.FileOutputStream(dst);
-                byte[] buf = new byte[8192];
-                int n;
-                while ((n = is.read(buf)) > 0) os.write(buf, 0, n);
-                LogUtil.logAlways("[悬浮柔光] dex 已通过 openRemoteFile 提取到 " + dst);
-                return true;
-            } else {
-                LogUtil.logAlways("[悬浮柔光] openRemoteFile 返回 null（API 不可用），转 fallback");
+            if (pfd == null) {
+                LogUtil.logAlways("[悬浮柔光] openRemoteFile 返回 null（API 不可用）");
+                return null;
+            }
+            java.io.FileInputStream is = new java.io.FileInputStream(pfd.getFileDescriptor());
+            try {
+                byte[] out = readAllBytes(is);
+                LogUtil.logAlways("[悬浮柔光] dex 字节通过 openRemoteFile 读取成功，长度=" + out.length);
+                return out;
+            } finally {
+                try { is.close(); } catch (Throwable ignored) {}
             }
         } catch (Throwable t) {
-            LogUtil.logAlways("[悬浮柔光] openRemoteFile 失败: " + t);
-        } finally {
-            try { if (os != null) os.close(); } catch (Throwable ignored) {}
-            try { if (is != null) is.close(); } catch (Throwable ignored) {}
-            os = null; is = null;
+            LogUtil.logAlways("[悬浮柔光] openRemoteFile 读取失败: " + t);
+            return null;
         }
-        // fallback 1：定位 APK 后 ZipFile 读 assets
-        if (extractDexViaZipFile(dst)) return true;
-        // fallback 2：getModuleApplicationInfo + AssetManager
-        if (extractDexViaAssetManager(dst)) return true;
-        LogUtil.logAlways("[悬浮柔光] 所有 dex 提取策略均失败");
-        return false;
     }
 
-    /** fallback 1：locateModuleApkPath 定位 APK 后用 ZipFile 读 assets */
-    private boolean extractDexViaZipFile(java.io.File dst) {
+    /** 策略 3：locateModuleApkPath 定位 APK 后 ZipFile 读 assets（不落盘） */
+    private byte[] readDexViaZipFile() {
         java.util.zip.ZipFile zip = null;
         java.io.InputStream is = null;
-        java.io.OutputStream os = null;
         try {
             String apkPath = locateModuleApkPath();
-            if (apkPath == null) return false;
+            if (apkPath == null) return null;
             java.io.File apkFile = new java.io.File(apkPath);
-            if (!apkFile.exists()) return false;
+            if (!apkFile.exists()) return null;
             zip = new java.util.zip.ZipFile(apkFile);
             java.util.zip.ZipEntry entry = zip.getEntry(
                     "assets/" + Constants.HEADS_UP_GLASS_DEX_ASSET);
-            if (entry == null) return false;
+            if (entry == null) return null;
             is = zip.getInputStream(entry);
-            os = new java.io.FileOutputStream(dst);
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = is.read(buf)) > 0) os.write(buf, 0, n);
-            LogUtil.logAlways("[悬浮柔光] dex 已从 " + apkPath + " 提取到 " + dst);
-            return true;
+            byte[] out = readAllBytes(is);
+            LogUtil.logAlways("[悬浮柔光] dex 字节通过 ZipFile 读取成功（apk=" + apkPath
+                    + "，长度=" + out.length + "）");
+            return out;
         } catch (Throwable t) {
-            return false;
+            return null;
         } finally {
-            try { if (os != null) os.close(); } catch (Throwable ignored) {}
             try { if (is != null) is.close(); } catch (Throwable ignored) {}
             try { if (zip != null) zip.close(); } catch (Throwable ignored) {}
         }
     }
 
-    /** fallback 2：getModuleApplicationInfo 拿模块 APK 路径 + AssetManager.open */
-    private boolean extractDexViaAssetManager(java.io.File dst) {
-        java.io.InputStream is = null;
-        java.io.OutputStream os = null;
-        try {
-            android.content.pm.ApplicationInfo ai = getModuleApplicationInfo();
-            if (ai == null || ai.sourceDir == null) return false;
-            android.content.res.AssetManager am = android.content.res.AssetManager
-                    .class.getDeclaredConstructor().newInstance();
-            // 反射 addAssetPath(String) 把模块 APK 加进 AssetManager
-            java.lang.reflect.Method m = android.content.res.AssetManager.class
-                    .getDeclaredMethod("addAssetPath", String.class);
-            m.setAccessible(true);
-            m.invoke(am, ai.sourceDir);
-            // assets 路径不带 "assets/" 前缀
-            is = am.open(Constants.HEADS_UP_GLASS_DEX_ASSET);
-            os = new java.io.FileOutputStream(dst);
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = is.read(buf)) > 0) os.write(buf, 0, n);
-            LogUtil.logAlways("[悬浮柔光] dex 已通过 AssetManager 提取到 " + dst);
-            return true;
-        } catch (Throwable t) {
-            LogUtil.logAlways("[悬浮柔光] AssetManager 提取失败: " + t);
-            return false;
-        } finally {
-            try { if (os != null) os.close(); } catch (Throwable ignored) {}
-            try { if (is != null) is.close(); } catch (Throwable ignored) {}
-        }
+    /** 把 InputStream 全量读到 byte[]（Android 9 没有 InputStream.readAllBytes） */
+    private static byte[] readAllBytes(java.io.InputStream is) throws java.io.IOException {
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = is.read(buf)) > 0) bos.write(buf, 0, n);
+        return bos.toByteArray();
     }
 
     /**
