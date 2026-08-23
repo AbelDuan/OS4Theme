@@ -1212,40 +1212,60 @@ public class MainHook extends XposedModule {
     }
 
     /**
-     * 从模块 APK（ZIP）提取 assets/heads_up_glass.dex 到目标文件。
-     * 模块 APK 路径获取策略（多级兜底，LSPosed 环境下 ProtectionDomain
-     * 通常为 null，必须用别的方式定位）：
-     *   1) 遍历当前 ClassLoader 链的 DexPathList.dexElements，找含
-     *      "OS4Themer" 或 "hyperosglass" 的 zip 路径（LSPosed 加载模块
-     *      时模块 APK 会出现在自己 classloader 的 dexElements 里）；
-     *   2) 扫描 /data/app 下含模块包名的目录的 base.apk；
-     *   3) 兜底用 ProtectionDomain.getCodeSource（部分 ROM 仍可用）。
-     * 找到 APK 后用 ZipFile 读 assets/heads_up_glass.dex 写入 dst。
-     * 失败返回 false（不抛异常）。
+     * 从模块 APK 提取 assets/heads_up_glass.dex 到目标文件。
+     * 优先用 LSPosed 官方 API openRemoteFile（专为 hook 进程读模块
+     * APK 内文件设计，不依赖文件系统权限）；失败再 fallback：
+     *   1) locateModuleApkPath() 三策略（classloader 链 / /data/app 扫描
+     *      / ProtectionDomain）定位 APK 后用 ZipFile 读 assets；
+     *   2) AssetManager.open（拿模块 Resources 后）。
      */
-    private static boolean extractDexFromModuleApk(java.io.File dst) {
+    private boolean extractDexFromModuleApk(java.io.File dst) {
+        java.io.InputStream is = null;
+        java.io.OutputStream os = null;
+        // 主路径：openRemoteFile（LSPosed 官方，跨进程读模块 APK 内文件）
+        try {
+            String name = "assets/" + Constants.HEADS_UP_GLASS_DEX_ASSET;
+            android.os.ParcelFileDescriptor pfd = openRemoteFile(name);
+            if (pfd != null) {
+                is = new java.io.FileInputStream(pfd.getFileDescriptor());
+                os = new java.io.FileOutputStream(dst);
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = is.read(buf)) > 0) os.write(buf, 0, n);
+                LogUtil.logAlways("[悬浮柔光] dex 已通过 openRemoteFile 提取到 " + dst);
+                return true;
+            } else {
+                LogUtil.logAlways("[悬浮柔光] openRemoteFile 返回 null（API 不可用），转 fallback");
+            }
+        } catch (Throwable t) {
+            LogUtil.logAlways("[悬浮柔光] openRemoteFile 失败: " + t);
+        } finally {
+            try { if (os != null) os.close(); } catch (Throwable ignored) {}
+            try { if (is != null) is.close(); } catch (Throwable ignored) {}
+            os = null; is = null;
+        }
+        // fallback 1：定位 APK 后 ZipFile 读 assets
+        if (extractDexViaZipFile(dst)) return true;
+        // fallback 2：getModuleApplicationInfo + AssetManager
+        if (extractDexViaAssetManager(dst)) return true;
+        LogUtil.logAlways("[悬浮柔光] 所有 dex 提取策略均失败");
+        return false;
+    }
+
+    /** fallback 1：locateModuleApkPath 定位 APK 后用 ZipFile 读 assets */
+    private boolean extractDexViaZipFile(java.io.File dst) {
         java.util.zip.ZipFile zip = null;
         java.io.InputStream is = null;
         java.io.OutputStream os = null;
         try {
             String apkPath = locateModuleApkPath();
-            if (apkPath == null) {
-                LogUtil.logAlways("[悬浮柔光] 拿不到模块 APK 路径（三种方式都失败）");
-                return false;
-            }
+            if (apkPath == null) return false;
             java.io.File apkFile = new java.io.File(apkPath);
-            if (!apkFile.exists()) {
-                LogUtil.logAlways("[悬浮柔光] 模块 APK 不存在: " + apkPath);
-                return false;
-            }
+            if (!apkFile.exists()) return false;
             zip = new java.util.zip.ZipFile(apkFile);
             java.util.zip.ZipEntry entry = zip.getEntry(
                     "assets/" + Constants.HEADS_UP_GLASS_DEX_ASSET);
-            if (entry == null) {
-                LogUtil.logAlways("[悬浮柔光] 模块 APK 内未找到资产 "
-                        + Constants.HEADS_UP_GLASS_DEX_ASSET + " (apk=" + apkPath + ")");
-                return false;
-            }
+            if (entry == null) return false;
             is = zip.getInputStream(entry);
             os = new java.io.FileOutputStream(dst);
             byte[] buf = new byte[8192];
@@ -1254,12 +1274,42 @@ public class MainHook extends XposedModule {
             LogUtil.logAlways("[悬浮柔光] dex 已从 " + apkPath + " 提取到 " + dst);
             return true;
         } catch (Throwable t) {
-            LogUtil.logAlways("[悬浮柔光] 从模块 APK 提取 dex 失败: " + t);
             return false;
         } finally {
             try { if (os != null) os.close(); } catch (Throwable ignored) {}
             try { if (is != null) is.close(); } catch (Throwable ignored) {}
             try { if (zip != null) zip.close(); } catch (Throwable ignored) {}
+        }
+    }
+
+    /** fallback 2：getModuleApplicationInfo 拿模块 APK 路径 + AssetManager.open */
+    private boolean extractDexViaAssetManager(java.io.File dst) {
+        java.io.InputStream is = null;
+        java.io.OutputStream os = null;
+        try {
+            android.content.pm.ApplicationInfo ai = getModuleApplicationInfo();
+            if (ai == null || ai.sourceDir == null) return false;
+            android.content.res.AssetManager am = android.content.res.AssetManager
+                    .class.getDeclaredConstructor().newInstance();
+            // 反射 addAssetPath(String) 把模块 APK 加进 AssetManager
+            java.lang.reflect.Method m = android.content.res.AssetManager.class
+                    .getDeclaredMethod("addAssetPath", String.class);
+            m.setAccessible(true);
+            m.invoke(am, ai.sourceDir);
+            // assets 路径不带 "assets/" 前缀
+            is = am.open(Constants.HEADS_UP_GLASS_DEX_ASSET);
+            os = new java.io.FileOutputStream(dst);
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = is.read(buf)) > 0) os.write(buf, 0, n);
+            LogUtil.logAlways("[悬浮柔光] dex 已通过 AssetManager 提取到 " + dst);
+            return true;
+        } catch (Throwable t) {
+            LogUtil.logAlways("[悬浮柔光] AssetManager 提取失败: " + t);
+            return false;
+        } finally {
+            try { if (os != null) os.close(); } catch (Throwable ignored) {}
+            try { if (is != null) is.close(); } catch (Throwable ignored) {}
         }
     }
 
