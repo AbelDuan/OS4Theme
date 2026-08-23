@@ -80,6 +80,8 @@ public class MainHook extends XposedModule {
     /** 悬浮通知柔光玻璃开关（AtomicBoolean，供热路径颜色 hook 读取） */
     private static final java.util.concurrent.atomic.AtomicBoolean sHeadsUpGlassFlag =
             new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HEADS_UP_GLASS);
+    /** heads-up 玻璃参数（从 notification_glass_params_normal 读取，v3.4.0 内联方案） */
+    private static volatile float[] sHeadsUpGlassParams = null;
     /** 锁屏指纹隐藏命中计数（前 3 次记日志） */
     private static int sHideLockFodLogs = 0;
     /** 通知清除按钮命中计数（前 3 次记日志） */
@@ -1040,37 +1042,62 @@ public class MainHook extends XposedModule {
      * 查找并选用 HeadsUpNotificationGlassEffect（与用户 dex 方案完全等价）。
      */
     private void installHeadsUpGlassHooks(ClassLoader cl) {
-        // 1) 注入 dex 到宿主 classloader（开关关时跳过：不注入任何类）
-        if (sHeadsUpGlassFlag.get()) {
-            injectHeadsUpDex(cl);
-        }
-        // 2) 预填 glassParamsArray（注入成功后才有可能填；失败静默）
-        fillHeadsUpGlassParams(cl);
-        // 3) hook 文字颜色资源（开关关时回调直接放行原逻辑）
+        // 1) 读取玻璃参数（notification_glass_params_normal），缓存到 sHeadsUpGlassParams
+        loadHeadsUpGlassParams(cl);
+        // 2) hook 文字颜色资源（开关关时回调直接放行原逻辑）
         installHeadsUpTextColorHooks(cl);
-        // 4) 诊断：记录 NotificationRowBlurEffect.apply 被调用（看 heads-up
-        //    通知触发哪个 effect，确认 SystemUI 是否主动用新注入的类）
-        installEffectCallDiag(cl);
+        // 3) hook NotificationRowBlurEffect.apply：heads-up 通知临时设置 glassParamsArray
+        installHeadsUpGlassSwap(cl);
     }
 
     /**
-     * Effect 替换 hook：hook NotificationRowBlurEffect.apply，heads-up 通知
-     * 改调 HeadsUpNotificationGlassEffect.INSTANCE.apply，普通通知保持原 blur。
-     *
-     * 诊断日志（v3.4.0）确认：heads-up 通知触发时 SystemUI 调用的就是
-     * NotificationRowBlurEffect.apply（不是我们注入的 HeadsUp 类）。
-     * dex 里的 HeadsUp 类只是定义，SystemUI 不主动调用——必须在此 hook
-     * 改路由：row.isHeadsUp() 为 true 时改调 HeadsUpNotificationGlassEffect。
-     *
-     * 等价用户手动方案：用户 dex 内的 HeadsUpNotificationGlassEffect.apply
-     * 内部会调 NotificationRowBlurEffect.apply + MiGlassCompat.setMiGlassCompat
-     * 等（自包含），所以直接转发即可，不会递归（HeadsUp.apply 调的是 row blur
-     * 的内部实现，不会再触发我们的 hook——因为我们 hook 的是 NotificationRowBlurEffect.apply）。
-     *
-     * 注意：HeadsUp.apply 签名是 (Object, Context)（dexdump 确认），
-     * 与 NotificationRowBlurEffect.apply(ExpandableNotificationRow, Context) 兼容。
+     * 从 notification_glass_params_normal 读取玻璃参数，缓存到 sHeadsUpGlassParams。
+     * 与焦点玻璃用同一资源（已验证可用）。
      */
-    private void installEffectCallDiag(ClassLoader cl) {
+    private void loadHeadsUpGlassParams(ClassLoader cl) {
+        try {
+            android.content.Context ctx = currentAppContext();
+            if (ctx == null) {
+                LogUtil.logAlways("[悬浮柔光] 读取玻璃参数失败：无 Context");
+                return;
+            }
+            int rid = ctx.getResources().getIdentifier(
+                    Constants.NORMAL_GLASS_PARAMS_RES, "array", Constants.TARGET_PKG);
+            if (rid == 0) {
+                LogUtil.logAlways("[悬浮柔光] 玻璃参数资源未找到: " + Constants.NORMAL_GLASS_PARAMS_RES);
+                return;
+            }
+            String[] ss = ctx.getResources().getStringArray(rid);
+            final float[] fa = new float[ss.length];
+            for (int i = 0; i < ss.length; i++) {
+                try {
+                    fa[i] = Float.parseFloat(ss[i]);
+                } catch (Throwable ignored) {
+                    fa[i] = 0f;
+                }
+            }
+            sHeadsUpGlassParams = fa;
+            LogUtil.logAlways("[悬浮柔光] 已读取玻璃参数（" + Constants.NORMAL_GLASS_PARAMS_RES
+                    + " len=" + fa.length + "）");
+        } catch (Throwable t) {
+            LogUtil.logAlways("[悬浮柔光] 读取玻璃参数失败: " + t);
+        }
+    }
+
+    /**
+     * 核心 hook：hook NotificationRowBlurEffect.apply，heads-up 通知临时设置
+     * glassParamsArray 为玻璃参数，使 blur 效果呈现玻璃质感；普通通知
+     * 保持原 blur（glassParamsArray 置空）。
+     *
+     * 原理：NotificationRowBlurEffect.apply 在执行时读取自身的
+     * glassParamsArray 字段。若非空则应用玻璃效果，否则应用普通模糊。
+     * 焦点玻璃（installFocusGlassHooks）已验证此机制可靠。
+     *
+     * 线程安全：SystemUI 所有通知视图处理在主线程，无并发竞争。
+     * 不用 dex 注入：完全避免 dex 读取/InMemoryDexClassLoader/注入
+     * classloader 的一系列兼容性问题（v3.4.0 三轮测试均因 dex 注入失败）。
+     */
+    private void installHeadsUpGlassSwap(ClassLoader cl) {
         try {
             final Class<?> rowBlur = Class.forName(Constants.ROW_BLUR_CLASS, false, cl);
             final Class<?> rowCls = Class.forName(
@@ -1078,34 +1105,27 @@ public class MainHook extends XposedModule {
                     false, cl);
             final Method apply = rowBlur.getDeclaredMethod("apply",
                     rowCls, android.content.Context.class);
-            // 预解析 HeadsUp 类（dex 注入后才存在；失败则 hook 不改行为）
-            Class<?> headsUpCls = null;
-            Method headsUpApply = null;
-            try {
-                headsUpCls = Class.forName(Constants.HEADS_UP_GLASS_CLASS, false, cl);
-                // apply(Object, Context)
-                headsUpApply = headsUpCls.getDeclaredMethod("apply",
-                        Object.class, android.content.Context.class);
-            } catch (Throwable t) {
-                LogUtil.logAlways("[悬浮柔光] HeadsUp 类未找到，effect 替换 hook 降级为诊断: " + t);
-            }
-            final Class<?> headsUpClsF = headsUpCls;
-            final Method headsUpApplyF = headsUpApply;
+            // 获取 glassParamsArray 字段（NotificationRowBlurEffect.glassParamsArray）
+            final java.lang.reflect.Field glassParamsField = rowBlur.getDeclaredField("glassParamsArray");
+            glassParamsField.setAccessible(true);
             hook(apply)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("heads-up-effect-swap")
+                    .setId("heads-up-glass-swap")
                     .intercept(new XposedInterface.Hooker() {
                         @Override
                         public Object intercept(XposedInterface.Chain chain) throws Throwable {
                             Object row = chain.getArg(0);
-                            Object ctx = chain.getArg(1);
-                            // 开关关 / HeadsUp 类未注入 → 放行原逻辑
-                            if (!sHeadsUpGlassFlag.get() || headsUpClsF == null) {
+                            // 开关关 → 放行原逻辑
+                            if (!sHeadsUpGlassFlag.get()) {
                                 return chain.proceed();
                             }
-                            // 递归守卫：HeadsUp.apply 内部会调 NotificationRowBlurEffect.apply，
-                            // 二次进入直接放行原逻辑，避免无限递归
-                            if (sInHeadsUpSwap.get()) {
+                            float[] glassParams = sHeadsUpGlassParams;
+                            // 玻璃参数未加载 → 放行原逻辑
+                            if (glassParams == null || glassParams.length == 0) {
+                                if (sEffectCallLogs < 5) {
+                                    sEffectCallLogs++;
+                                    LogUtil.logAlways("[悬浮柔光] 玻璃参数未加载，跳过 heads-up 替换");
+                                }
                                 return chain.proceed();
                             }
                             // 判断 row 是否为 heads-up 状态
@@ -1124,29 +1144,30 @@ public class MainHook extends XposedModule {
                                         + sEffectCallLogs + " isHeadsUp=" + isHeadsUp
                                         + " row=" + (row == null ? "null" : row.getClass().getName()));
                             }
-                            if (!isHeadsUp) {
-                                return chain.proceed(); // 普通通知：原 blur
-                            }
-                            // heads-up 通知：改调 HeadsUpNotificationGlassEffect
-                            sInHeadsUpSwap.set(Boolean.TRUE);
+                            // 保存原 glassParamsArray
+                            float[] original = (float[]) glassParamsField.get(null);
                             try {
-                                Object inst = headsUpClsF.getField("INSTANCE").get(null);
-                                headsUpApplyF.invoke(inst, row, ctx);
-                                if (sEffectCallLogs < 5) {
-                                    LogUtil.logAlways("[悬浮柔光] 已改调 HeadsUpNotificationGlassEffect.apply");
+                                if (isHeadsUp) {
+                                    // heads-up 通知：设置玻璃参数 → blur 呈现玻璃质感
+                                    glassParamsField.set(null, glassParams);
+                                    if (sEffectCallLogs < 5) {
+                                        LogUtil.logAlways("[悬浮柔光] heads-up → 应用玻璃参数 len="
+                                                + glassParams.length);
+                                    }
+                                } else {
+                                    // 普通通知：清空玻璃参数 → blur 呈现普通模糊
+                                    glassParamsField.set(null, null);
                                 }
-                                return null; // 短路原 NotificationRowBlurEffect.apply
-                            } catch (Throwable t) {
-                                LogUtil.logAlways("[悬浮柔光] 改调 HeadsUp 失败，退回原 blur: " + t);
                                 return chain.proceed();
                             } finally {
-                                sInHeadsUpSwap.set(Boolean.FALSE);
+                                // 恢复原 glassParamsArray（保持状态干净）
+                                glassParamsField.set(null, original);
                             }
                         }
                     });
-            LogUtil.logAlways("[悬浮柔光] 已挂钩 NotificationRowBlurEffect.apply（heads-up 改调 Glass）");
+            LogUtil.logAlways("[悬浮柔光] 已挂钩 NotificationRowBlurEffect.apply（heads-up 玻璃替换）");
         } catch (Throwable t) {
-            LogUtil.logAlways("[悬浮柔光] effect 替换 hook 失败: " + t);
+            LogUtil.logAlways("[悬浮柔光] glass swap hook 失败: " + t);
         }
     }
 
@@ -1724,8 +1745,6 @@ public class MainHook extends XposedModule {
     private static volatile int sHeadsUpColorHits = 0;
     /** effect 调用诊断计数（前 5 次记日志，看 heads-up 通知触发哪个 effect） */
     private static volatile int sEffectCallLogs = 0;
-    /** 递归守卫：HeadsUp.apply 内部会调 NotificationRowBlurEffect.apply，二次进入放行原逻辑 */
-    private static final ThreadLocal<Boolean> sInHeadsUpSwap = new ThreadLocal<Boolean>();
 
     /**
      * 判断资源 ID 是否为 5 个目标颜色资源之一。
