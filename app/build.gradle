@@ -4,15 +4,15 @@ plugins {
 
 android {
     namespace 'com.abel.hyperosglass'
-    compileSdk 37
+    compileSdk 36
     buildToolsVersion '37.0.0'
 
     defaultConfig {
         applicationId 'com.abel.hyperosglass'
         minSdk 33
         targetSdk 34
-        versionCode 55
-        versionName '3.4.0'
+        versionCode 56
+        versionName '3.4.1'
     }
 
     signingConfigs {

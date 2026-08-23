@@ -39,7 +39,7 @@ public final class Constants {
     public static final String TARGET_PKG = "com.android.systemui";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.4.0";
+    public static final String VERSION = "3.4.1";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -259,6 +259,7 @@ public final class Constants {
     /** 需要统一为 #e6ffffff 的通知文字颜色资源名（resources.arsc 搜索改名清单）。
      *  hook 时按名解析资源 ID（getIdentifier），命中即返回 HEADS_UP_TEXT_COLOR。 */
     public static final String[] HEADS_UP_TEXT_COLOR_RES = {
+            "notification_action_text_color",
             "notification_time_color",
             "optimized_heads_up_notification_text",
             "notification_primary_text_color_light",
