@@ -1376,6 +1376,63 @@ public class MainHook extends XposedModule {
             } catch (Throwable t) {
                 LogUtil.logAlways("[悬浮玻璃白字] getColor(int, Theme) 挂钩失败: " + t);
             }
+            // 3) getColorStateList(int)（HyperOS 通知文字/单色图标 tint 多走 CLS，仅改 6 文字 id 不染图标）
+            try {
+                final Method gcls = android.content.res.Resources.class.getMethod("getColorStateList", int.class);
+                hook(gcls)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .setId("heads-up-glass-text-cls")
+                        .intercept(new XposedInterface.Hooker() {
+                            @Override
+                            public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                                if (!sHeadsUpGlassFlag.get()) return chain.proceed();
+                                Object self = chain.getThisObject();
+                                if (self instanceof android.content.res.Resources) {
+                                    ensureHeadsUpColorIds((android.content.res.Resources) self);
+                                    int id = (Integer) chain.getArg(0);
+                                    int[] ids = sHeadsUpColorIds;
+                                    if (ids != null) {
+                                        for (int known : ids) {
+                                            if (known == id) return android.content.res.ColorStateList.valueOf(Constants.HEADS_UP_GLASS_TEXT_COLOR);
+                                        }
+                                    }
+                                }
+                                return chain.proceed();
+                            }
+                        });
+                LogUtil.logAlways("[悬浮玻璃白字] 已挂钩 Resources.getColorStateList(int)");
+            } catch (Throwable t) {
+                LogUtil.logAlways("[悬浮玻璃白字] getColorStateList(int) 挂钩失败: " + t);
+            }
+            // 4) getColorStateList(int, Theme)
+            try {
+                final Method gclst = android.content.res.Resources.class.getMethod("getColorStateList",
+                        int.class, android.content.res.Resources.Theme.class);
+                hook(gclst)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .setId("heads-up-glass-text-cls-theme")
+                        .intercept(new XposedInterface.Hooker() {
+                            @Override
+                            public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                                if (!sHeadsUpGlassFlag.get()) return chain.proceed();
+                                Object self = chain.getThisObject();
+                                if (self instanceof android.content.res.Resources) {
+                                    ensureHeadsUpColorIds((android.content.res.Resources) self);
+                                    int id = (Integer) chain.getArg(0);
+                                    int[] ids = sHeadsUpColorIds;
+                                    if (ids != null) {
+                                        for (int known : ids) {
+                                            if (known == id) return android.content.res.ColorStateList.valueOf(Constants.HEADS_UP_GLASS_TEXT_COLOR);
+                                        }
+                                    }
+                                }
+                                return chain.proceed();
+                            }
+                        });
+                LogUtil.logAlways("[悬浮玻璃白字] 已挂钩 Resources.getColorStateList(int, Theme)");
+            } catch (Throwable t) {
+                LogUtil.logAlways("[悬浮玻璃白字] getColorStateList(int, Theme) 挂钩失败: " + t);
+            }
         } catch (Throwable t) {
             LogUtil.logAlways("[悬浮玻璃白字] 挂钩失败: " + t);
         }

@@ -11,8 +11,8 @@ android {
         applicationId 'com.abel.hyperosglass'
         minSdk 33
         targetSdk 34
-        versionCode 59
-        versionName '3.3.9'
+        versionCode 60
+        versionName '3.3.10'
     }
 
     signingConfigs {
