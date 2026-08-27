@@ -1072,68 +1072,124 @@ public class MainHook extends XposedModule {
     }
 
     // ============================================================
-    // 悬浮通知液态玻璃（v3.3.6：ponytail 复用原生 HeadsUpNotificationGlassEffect）
+    // 悬浮通知液态玻璃（v3.3.7：覆盖全部非玻璃 heads-up effect，重定向到原生玻璃）
     // ============================================================
     /**
-     * 原生 SystemUI 已有 HeadsUpNotificationGlassEffect：apply 内部先调用
-     * HeadsUpNotificationBlurEffect.INSTANCE.apply(row, ctx) 做模糊，再叠加
-     * MiGlassCompat.setMiGlassCompat + setMiViewMaterialTypeCompat(1) 做玻璃。
-     * 模块 hook HeadsUpNotificationBlurEffect.apply(row, ctx)：框架本想对悬浮通知
-     * 施加模糊时，改调 HeadsUpNotificationGlassEffect.INSTANCE.apply → 玻璃（含模糊）。
-     * 防递归：线程局部标志。HeadsUpNotificationGlassEffect.apply 会回调用
-     * HeadsUpNotificationBlurEffect.INSTANCE.apply（同一线程同步），此时标志已置位
-     * → 直接 proceed 跑模糊，不二次重定向，循环断开。
-     * （外部 dex「悬浮通知柔光玻璃.dex」在已作废的 v3.4.x 中不可用，故复用原生类。）
+     * 根因（v3.3.6 失效，双层）：
+     *  1) ROM 经 NotificationMaterialStateInteractor 从 headsUpNotificationEffectsMap 取 5 个
+     *     候选之一（Normal / NormalTransparent / Blur / Glass / GlassDark）并调其 apply；
+     *     本机主题配置下选中的并非 BlurEffect。
+     *  2) 关键：该接口是泛型擦除的，selector 调的是 apply(Object, Context) 桥方法，
+     *     而非 apply(ExpandableNotificationRow, Context)。BlurEffect 虽有两个 apply 重载，
+     *     但 selector 永远走 (Object, Context) 桥；GlassEffect 等只有 (Object, Context)。
+     *     故 v3.3.6 仅 hook apply(ExpandableNotificationRow, Context) 的「模糊→玻璃」重定向
+     *     从未被调用 → 悬浮无玻璃；v3.3.7 初版又因 GlassEffect 无该重载而 getMethod 抛
+     *     NoSuchMethodException，整体挂钩中断。
+     *
+     * 修复：所有 effect 的 apply 一律按 (Object, Context) 解析并 hook：
+     *   - Normal / NormalTransparent / Blur（非玻璃）→ 重定向到原生
+     *     HeadsUpNotificationGlassEffect.INSTANCE.apply(Object, Context)（玻璃内含模糊）；
+     *   - Glass / GlassDark（本就玻璃）→ 仅置 sInHeadsUpGlass 守卫后放行原生逻辑，
+     *     其 apply 内部同步回调 BlurEffect，须靠守卫防止 BlurEffect 钩子再次重定向→无限递归。
+     * 调用原生 GlassEffect 前先置位 sInHeadsUpGlass，GlassEffect 内部回调 BlurEffect 时
+     * 钩子见守卫即 proceed（真实模糊），循环断开。TextColor 白字 hook 保持不变。
      */
     private static final ThreadLocal<Boolean> sInHeadsUpGlass = new ThreadLocal<Boolean>();
-    /** 悬浮玻璃重定向命中计数（前 3 次记日志，证明 blur→glass 实际触发） */
+    /** 悬浮玻璃重定向命中计数（前 3 次记日志，证明已实际触发） */
     private static int sHeadsUpGlassLogs = 0;
 
     private void installHeadsUpGlassHooks(ClassLoader cl) {
         try {
-            final Class<?> hb = Class.forName(Constants.HEADS_UP_BLUR_CLASS, false, cl);
-            final Class<?> rowCls = Class.forName(
-                    "com.android.systemui.statusbar.notification.row.ExpandableNotificationRow",
-                    false, cl);
-            final Method happly = hb.getDeclaredMethod("apply", rowCls,
-                    android.content.Context.class);
-            hook(happly)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("heads-up-glass-blur-swap")
-                    .intercept(new XposedInterface.Hooker() {
-                        @Override
-                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                            if (!sHeadsUpGlassFlag.get()) return chain.proceed();
-                            if (Boolean.TRUE.equals(sInHeadsUpGlass.get())) {
-                                // 玻璃 effect 内部回调 blur：直接跑模糊，断开递归
-                                return chain.proceed();
-                            }
-                            Object row = chain.getArg(0);
-                            Object ctx = chain.getArg(1);
-                            try {
-                                Class<?> hg = Class.forName(Constants.HEADS_UP_GLASS_CLASS, false, cl);
-                                Object inst = hg.getField("INSTANCE").get(null);
-                                Method gapply = hg.getMethod("apply", rowCls,
-                                        android.content.Context.class);
-                                sInHeadsUpGlass.set(Boolean.TRUE);
-                                try {
-                                    gapply.invoke(inst, row, ctx);
-                                } finally {
-                                    sInHeadsUpGlass.remove();
+            final Class<?> ctxCls = android.content.Context.class;
+            // 关键：ROM 经 NotificationMaterialStateInteractor 通过泛型擦除的接口调用
+            // apply(Object, Context) 桥方法 —— 而非 apply(ExpandableNotificationRow, Context)。
+            // 因此所有 effect 的 apply 必须按 (Object, Context) 解析，否则 getMethod 抛
+            // NoSuchMethodException（v3.3.7 初版即栽在此）。GlassEffect 等也只有 (Object, Context)。
+            final Class<?> glassCls = Class.forName(Constants.HEADS_UP_GLASS_CLASS, false, cl);
+            final Object glassInst = glassCls.getField("INSTANCE").get(null);
+            final Method glassApply = glassCls.getDeclaredMethod("apply", Object.class, ctxCls);
+
+            // 1) 非玻璃效果 → 重定向到原生玻璃 effect
+            final String[] redirectTargets = new String[]{
+                    Constants.HEADS_UP_NORMAL_CLASS,
+                    Constants.HEADS_UP_NORMAL_TRANSPARENT_CLASS,
+                    Constants.HEADS_UP_BLUR_CLASS,
+            };
+            for (final String target : redirectTargets) {
+                try {
+                    final Class<?> tc = Class.forName(target, false, cl);
+                    final Method tapply = tc.getDeclaredMethod("apply", Object.class, ctxCls);
+                    hook(tapply)
+                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .setId("heads-up-glass-redirect:" + target)
+                            .intercept(new XposedInterface.Hooker() {
+                                @Override
+                                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                                    if (!sHeadsUpGlassFlag.get()) return chain.proceed();
+                                    if (Boolean.TRUE.equals(sInHeadsUpGlass.get())) {
+                                        // 玻璃 effect 内部回调 BlurEffect：直接跑真实模糊，断开递归
+                                        return chain.proceed();
+                                    }
+                                    Object row = chain.getArg(0);
+                                    Object ctx = chain.getArg(1);
+                                    try {
+                                        sInHeadsUpGlass.set(Boolean.TRUE);
+                                        try {
+                                            glassApply.invoke(glassInst, row, ctx);
+                                        } finally {
+                                            sInHeadsUpGlass.remove();
+                                        }
+                                        if (sHeadsUpGlassLogs < 3) {
+                                            sHeadsUpGlassLogs++;
+                                            LogUtil.logAlways("[悬浮玻璃] 已将悬浮通知 " + target
+                                                    + " 重定向为玻璃（HeadsUpNotificationGlassEffect）");
+                                        }
+                                        return null; // 短路原 effect（玻璃已含模糊 + 玻璃）
+                                    } catch (Throwable t) {
+                                        return chain.proceed(); // 失败退回原逻辑
+                                    }
                                 }
-                                if (sHeadsUpGlassLogs < 3) {
-                                    sHeadsUpGlassLogs++;
-                                    LogUtil.logAlways("[悬浮玻璃] 已将悬浮通知模糊重定向为玻璃（HeadsUpNotificationGlassEffect）");
+                            });
+                    LogUtil.logAlways("[悬浮玻璃] 已挂钩 " + target + ".apply(Object, Context) → HeadsUpNotificationGlassEffect");
+                } catch (Throwable t) {
+                    LogUtil.logAlways("[悬浮玻璃] 挂钩 " + target + " 失败: " + t);
+                }
+            }
+
+            // 2) 原生玻璃 effect → 仅置守卫、放行（其内部回调 BlurEffect 须靠守卫断开递归）
+            final String[] glassTargets = new String[]{
+                    Constants.HEADS_UP_GLASS_CLASS,
+                    Constants.HEADS_UP_GLASS_DARK_CLASS,
+            };
+            for (final String target : glassTargets) {
+                try {
+                    final Class<?> gc = Class.forName(target, false, cl);
+                    final Method gapply = gc.getDeclaredMethod("apply", Object.class, ctxCls);
+                    hook(gapply)
+                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .setId("heads-up-glass-guard:" + target)
+                            .intercept(new XposedInterface.Hooker() {
+                                @Override
+                                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                                    if (!sHeadsUpGlassFlag.get()) return chain.proceed();
+                                    if (Boolean.TRUE.equals(sInHeadsUpGlass.get())) {
+                                        return chain.proceed();
+                                    }
+                                    sInHeadsUpGlass.set(Boolean.TRUE);
+                                    try {
+                                        return chain.proceed();
+                                    } finally {
+                                        sInHeadsUpGlass.remove();
+                                    }
                                 }
-                                return null; // 短路模糊（玻璃 effect 已含模糊 + 玻璃）
-                            } catch (Throwable t) {
-                                return chain.proceed(); // 失败退回原模糊逻辑
-                            }
-                        }
-                    });
-            LogUtil.logAlways("[悬浮玻璃] 已挂钩 HeadsUpNotificationBlurEffect.apply → HeadsUpNotificationGlassEffect");
+                            });
+                    LogUtil.logAlways("[悬浮玻璃] 已挂钩 " + target + ".apply(Object, Context)（守卫，放行原生玻璃）");
+                } catch (Throwable t) {
+                    LogUtil.logAlways("[悬浮玻璃] 挂钩 " + target + " 守卫失败: " + t);
+                }
+            }
         } catch (Throwable t) {
-            LogUtil.logAlways("[悬浮玻璃] blur 替换挂钩失败: " + t);
+            LogUtil.logAlways("[悬浮玻璃] 整体挂钩失败: " + t);
         }
     }
 

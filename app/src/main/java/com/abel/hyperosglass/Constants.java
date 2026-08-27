@@ -39,7 +39,7 @@ public final class Constants {
     public static final String TARGET_PKG = "com.android.systemui";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.3.6";
+    public static final String VERSION = "3.3.7";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -175,6 +175,12 @@ public final class Constants {
             "com.android.systemui.statusbar.notification.style.vieweffect.HeadsUpNotificationBlurEffect";
     public static final String HEADS_UP_GLASS_CLASS =
             "com.android.systemui.statusbar.notification.style.vieweffect.HeadsUpNotificationGlassEffect";
+    public static final String HEADS_UP_GLASS_DARK_CLASS =
+            "com.android.systemui.statusbar.notification.style.vieweffect.HeadsUpNotificationGlassDarkEffect";
+    public static final String HEADS_UP_NORMAL_CLASS =
+            "com.android.systemui.statusbar.notification.style.vieweffect.HeadsUpNotificationNormalEffect";
+    public static final String HEADS_UP_NORMAL_TRANSPARENT_CLASS =
+            "com.android.systemui.statusbar.notification.style.vieweffect.HeadsUpNotificationNormalTransparentEffect";
 
     /** 悬浮通知玻璃启用开关（默认开） */
     public static final String PREFS_HEADS_UP_GLASS = "heads_up_glass";
