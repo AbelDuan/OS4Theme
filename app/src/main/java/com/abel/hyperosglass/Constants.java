@@ -39,7 +39,7 @@ public final class Constants {
     public static final String TARGET_PKG = "com.android.systemui";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.3.8";
+    public static final String VERSION = "3.3.9";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -161,17 +161,18 @@ public final class Constants {
     /** 普通通知玻璃参数 array（0x7f0300ce，用户 smali 换用）；运行时 getIdentifier 解析 */
     public static final String NORMAL_GLASS_PARAMS_RES = "notification_glass_params_normal";
 
-    // ── 悬浮通知液态玻璃（v3.3.8：自包含实现，等价于酷安方案「dex 导入类 + 挂载」）──
+    // ── 悬浮通知液态玻璃（v3.3.9：1:1 复刻用户「悬浮通知柔光玻璃.dex」的 apply 字节码）──
     /**
-     * 悬浮（heads-up）通知玻璃：酷安方案核心是「对悬浮通知行背景视图调用
-     * MiGlassCompat.setMiGlassCompat(bg, 参数) + setMiViewMaterialTypeCompat(1, bg)」，
-     * 玻璃参数即系统原生 HeadsUpNotificationGlassEffect.apply 所用（classes2.dex 反编译
-     * 提取的 42 个 float，见 MainHook.HEADS_UP_GLASS_PARAMS，与原生完全一致）。
-     * 故无需 import 外部「悬浮通知柔光玻璃.dex」——直接复用系统 MiGlassCompat + 原生参数，
-     * 自包含落地玻璃（且规避原生 apply 内部 check-cast 在非标准行类型时崩溃的风险）。
-     * hook 覆盖 5 个 heads-up effect 的 apply(Object, Context) 桥（selector 泛型擦除永远走此桥）：
-     *   Normal/NormalTransparent/Blur → 重定向到玻璃；Glass/GlassDark → 守卫放行。
-     * 仅影响悬浮通知，不波及下拉栏（后者走 notification_row_* 系列，本模块未 hook）。
+     * 悬浮（heads-up）通知玻璃：用户提供了「悬浮通知柔光玻璃.dex」，内部类即
+     * HeadsUpNotificationGlassDarkEffect（与系统同名）。dexdump 其 apply 字节码后，
+     * 本模块在 Java 侧 1:1 复刻（不运行时加载该 dex，规避 kotlin/classloader 依赖）：
+     *   1) NotificationRowBlurEffect.INSTANCE.apply(row, ctx)   // 行模糊（ROW_BLUR_CLASS）
+     *   2) 玻璃参数：Resources.getStringArray(0x7f0300ce) 逐元素 parseFloat（42 float，与 dex 同源）
+     *   3) MiGlassCompat.setMiGlassCompat(bg, params) + setMiViewMaterialTypeCompat(1, bg)
+     *      （bg = row.getInjector().getBackgroundNormal()）
+     * hook 覆盖 5 个 heads-up effect 的 apply(Object, Context) 桥（selector 泛型擦除永远走此桥），
+     * 全部重定向到玻璃；仅影响悬浮通知，不波及下拉栏（后者走 notification_row_* 系列）。
+     * 白字由 installHeadsUpTextColorHooks 单独处理（仅 6 个文字 color，不染图标）。
      */
     public static final String HEADS_UP_BLUR_CLASS =
             "com.android.systemui.statusbar.notification.style.vieweffect.HeadsUpNotificationBlurEffect";

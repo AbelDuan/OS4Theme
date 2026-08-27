@@ -1075,29 +1075,29 @@ public class MainHook extends XposedModule {
     // 悬浮通知液态玻璃（v3.3.7：覆盖全部非玻璃 heads-up effect，重定向到原生玻璃）
     // ============================================================
     /**
-     * 悬浮通知液态玻璃（v3.3.8）：自包含实现，等价于酷安方案「dex 导入类 + 挂载」。
+     * 悬浮通知液态玻璃（v3.3.9）：1:1 复刻用户提供的「悬浮通知柔光玻璃.dex」
+     * （HeadsUpNotificationGlassDarkEffect.apply 反编译字节码）。
      *
-     * 酷安方案核心：对悬浮通知行背景视图调用
-     *   MiGlassCompat.setMiGlassCompat(bg, 玻璃参数) + setMiViewMaterialTypeCompat(1, bg)
-     * 即可产生液态玻璃；玻璃参数取自系统原生 HeadsUpNotificationGlassEffect.apply
-     * （classes2.dex 反编译提取的 42 个 float，与原生完全一致）。
+     * dex apply 真实流程（dexdump 确认）：
+     *   1) NotificationRowBlurEffect.INSTANCE.apply(row, ctx)   // 行模糊（ROW_BLUR_CLASS，
+     *      注意：是行级模糊，不是 v3.3.8 误用的 HeadsUpNotificationBlurEffect —— 这是失效根因）
+     *   2) 玻璃参数懒加载：Resources.getStringArray(0x7f0300ce) 逐元素 Float.parseFloat（42 float）
+     *   3) bg = row.getInjector().getBackgroundNormal()
+     *      MiGlassCompat.setMiGlassCompat(bg, params) + setMiViewMaterialTypeCompat(1, bg)
      *
-     * 比 v3.3.7 更稳：不再依赖外部 dex，也不再依赖原生 GlassEffect.apply 内部的
-     * check-cast ExpandableNotificationRow（行类型一旦非标准会抛异常→无玻璃）。
-     * 本实现直接反射行 → getInjector().getBackgroundNormal() 取背景视图并施加玻璃，
-     * row 为 ExpandableNotificationRow 时额外走原生模糊（与 GlassEffect 顺序一致）。
+     * 本模块在 Java 侧 1:1 复刻（不运行时加载 dex，规避 kotlin/classloader 依赖），
+     * 参数运行时从同一 SystemUI 资源 0x7f0300ce 现取，与原生/酷安完全一致。
      *
-     * hook 覆盖 5 个 heads-up effect 的 apply(Object, Context) 桥方法（泛型擦除，
-     * selector 永远走此桥）：Normal / NormalTransparent / Blur 重定向到玻璃；
-     * Glass / GlassDark 仅置 sInHeadsUpGlass 守卫放行（其内部回调 BlurEffect 须防递归）。
-     * 仅影响悬浮通知，不波及下拉通知栏（后者走 notification_row_* 系列，本模块未 hook）。
+     * hook 覆盖 5 个 heads-up effect 的 apply(Object, Context) 桥（selector 泛型擦除永远走此桥），
+     * 全部重定向到上述玻璃逻辑；仅影响悬浮通知，不波及下拉（后者走 notification_row_* 系列）。
+     * 白字走 installHeadsUpTextColorHooks（仅 6 个文字 color，不染图标 → 规避头像/图标变纯白）。
      */
     private static final ThreadLocal<Boolean> sInHeadsUpGlass = new ThreadLocal<Boolean>();
     /** 悬浮玻璃应用成功计数（前 3 次记日志，证明已生效） */
     private static int sHeadsUpGlassLogs = 0;
     /** 诊断：钩子是否被 selector 真正命中（无论开关），仅记前 5 次，用于定位「不生效」根因 */
     private static int sHeadsUpDiagCount = 0;
-    /** 玻璃参数：与系统原生 HeadsUpNotificationGlassEffect 完全一致（dex 反编译提取 42 float） */
+    /** 玻璃参数兜底：dex 反编译提取的 42 float（资源 0x7f0300ce 读取失败时使用） */
     private static final float[] HEADS_UP_GLASS_PARAMS = {
             0.5f, 1.0f, 0.0f, 0.800000011920929f, 0.5f, 1.2000000476837158f, 0.0f, 0.20000000298023224f,
             0.0f, 0.0f, 0.029999999329447746f, 1.0f, 1.0f, 1.0f, 1.5f, 0.0f,
@@ -1106,6 +1106,14 @@ public class MainHook extends XposedModule {
             1.2000000476837158f, 0.6000000238418579f, 0.800000011920929f, 1.149999976158142f, 3.0f,
             0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f
     };
+    /**
+     * 玻璃参数资源 id：与用户 dex 的 HeadsUpNotificationGlassDarkEffect.apply 完全一致 ——
+     * 它从 Resources.getStringArray(0x7f0300ce) 懒加载 42 个 float 字符串。本模块
+     * 运行时从同一 SystemUI 资源现取，保证与原生/酷安方案参数一致（不依赖硬编码）。
+     */
+    private static final int HEADS_UP_GLASS_PARAMS_RES_ID = 0x7f0300ce;
+    /** 懒加载的玻璃参数（首次悬浮通知时从资源解析，缓存复用） */
+    private static volatile float[] sHeadsUpGlassParams = null;
 
     private void installHeadsUpGlassHooks(ClassLoader cl) {
         try {
@@ -1115,13 +1123,15 @@ public class MainHook extends XposedModule {
             final Class<?> miGlass = Class.forName("com.miui.systemui.util.MiGlassCompat", false, cl);
             final Method setMiGlass = miGlass.getMethod("setMiGlassCompat", viewCls, float[].class);
             final Method setMiType = miGlass.getMethod("setMiViewMaterialTypeCompat", int.class, viewCls);
-            // 原生模糊（row 为 ExpandableNotificationRow 时额外施加，与 GlassEffect 顺序一致）
-            final Class<?> blurCls = Class.forName(Constants.HEADS_UP_BLUR_CLASS, false, cl);
+            // 行模糊：复刻用户 dex 的 HeadsUpNotificationGlassDarkEffect.apply —— 用的是
+            // NotificationRowBlurEffect（ROW_BLUR_CLASS），不是 HeadsUpNotificationBlurEffect。
+            // 这是 v3.3.8 失效的根因之一：用了错误的模糊类。
+            final Class<?> blurCls = Class.forName(Constants.ROW_BLUR_CLASS, false, cl);
             final Object blurInst = blurCls.getField("INSTANCE").get(null);
             final Method blurApply = blurCls.getDeclaredMethod("apply", Object.class, ctxCls);
-            // 行类型（仅用于 instanceof 判断，决定要不要加原生模糊）
-            final Class<?> rowCls = Class.forName(
-                    "com.android.systemui.statusbar.notification.row.ExpandableNotificationRow", false, cl);
+            // 缓存到静态字段，供 applyHeadsUpGlassMaterial 热路径复用（复刻 dex 的行模糊）
+            sHeadsUpDiagBlurInst = blurInst;
+            sHeadsUpDiagBlurApply = blurApply;
 
             // 1) 非玻璃效果 → 重定向到玻璃
             final String[] redirectTargets = new String[]{
@@ -1155,13 +1165,9 @@ public class MainHook extends XposedModule {
                                     try {
                                         sInHeadsUpGlass.set(Boolean.TRUE);
                                         try {
-                                            // row 是标准 ExpandableNotificationRow 时额外加原生模糊
-                                            if (rowCls.isInstance(row)) {
-                                                try { blurApply.invoke(blurInst, row, ctx); }
-                                                catch (Throwable ignore) { /* 模糊失败不阻断玻璃 */ }
-                                            }
-                                            // 对背景视图施加玻璃材质（酷安方案核心，自包含、无外部 dex 依赖）
-                                            applyHeadsUpGlassMaterial(row, setMiGlass, setMiType);
+                                            // 行模糊 + 背景玻璃材质（复刻 dex：行模糊走 NotificationRowBlurEffect，
+                                            // 玻璃参数从资源 0x7f0300ce 现取，见 applyHeadsUpGlassMaterial）
+                                            applyHeadsUpGlassMaterial(row, ctx, setMiGlass, setMiType);
                                         } finally {
                                             sInHeadsUpGlass.remove();
                                         }
@@ -1202,17 +1208,33 @@ public class MainHook extends XposedModule {
                                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
                                     if (!sHeadsUpGlassFlag.get()) return chain.proceed();
                                     if (Boolean.TRUE.equals(sInHeadsUpGlass.get())) {
-                                        return chain.proceed();
+                                        return chain.proceed(); // 原生玻璃内部回调 BlurEffect：跑真实模糊，断开递归
                                     }
-                                    sInHeadsUpGlass.set(Boolean.TRUE);
+                                    Object row = chain.getArg(0);
+                                    Object ctx = chain.getArg(1);
                                     try {
+                                        sInHeadsUpGlass.set(Boolean.TRUE);
+                                        try {
+                                            // 原生 Glass/GlassDark 也重定向到 dex 柔光玻璃（统一观感）
+                                            applyHeadsUpGlassMaterial(row, ctx, setMiGlass, setMiType);
+                                        } finally {
+                                            sInHeadsUpGlass.remove();
+                                        }
+                                        if (sHeadsUpGlassLogs < 3) {
+                                            sHeadsUpGlassLogs++;
+                                            LogUtil.logAlways("[悬浮玻璃] 已将悬浮通知 " + target
+                                                    + " 应用为液态玻璃（MiGlassCompat + materialType=1）");
+                                        }
+                                        return null;
+                                    } catch (Throwable t) {
+                                        LogUtil.logAlways("[悬浮玻璃][诊断] 应用玻璃异常 target=" + target
+                                                + " rowClass=" + (row == null ? "null" : row.getClass().getName())
+                                                + " err=" + t.getClass().getName() + ":" + t.getMessage());
                                         return chain.proceed();
-                                    } finally {
-                                        sInHeadsUpGlass.remove();
                                     }
                                 }
                             });
-                    LogUtil.logAlways("[悬浮玻璃] 已挂钩 " + target + ".apply(Object, Context)（守卫，放行原生玻璃）");
+                    LogUtil.logAlways("[悬浮玻璃] 已挂钩 " + target + ".apply(Object, Context) → 液态玻璃");
                 } catch (Throwable t) {
                     LogUtil.logAlways("[悬浮玻璃] 挂钩 " + target + " 守卫失败: " + t);
                 }
@@ -1223,12 +1245,26 @@ public class MainHook extends XposedModule {
     }
 
     /**
-     * 自包含玻璃：行 → getInjector().getBackgroundNormal() 取背景视图，
-     * 调用 MiGlassCompat.setMiGlassCompat(bg, 参数) + setMiViewMaterialTypeCompat(1, bg)。
-     * 反射解析，兼容任意行类型（非标准类型不会因 check-cast 崩溃）。
+     * 复刻用户 dex 的 HeadsUpNotificationGlassDarkEffect.apply：
+     * 1) 行模糊 NotificationRowBlurEffect.INSTANCE.apply(row, ctx)；
+     * 2) 玻璃参数从 SystemUI 资源 0x7f0300ce（string-array）现取，逐元素 parseFloat；
+     * 3) 对 row.getInjector().getBackgroundNormal() 背景视图调
+     *    MiGlassCompat.setMiGlassCompat(bg, params) + setMiViewMaterialTypeCompat(1, bg)。
+     * 反射解析，兼容任意行类型（非标准行无 getInjector 时安全跳过，不会崩）。
      */
-    private static void applyHeadsUpGlassMaterial(Object row, Method setMiGlass, Method setMiType)
-            throws Throwable {
+    private static void applyHeadsUpGlassMaterial(Object row, Object ctxObj,
+            Method setMiGlass, Method setMiType) throws Throwable {
+        android.content.Context ctx = (android.content.Context) ctxObj;
+        // 1) 行模糊（dex 顺序：先模糊后玻璃）
+        if (sHeadsUpDiagBlurInst != null && sHeadsUpDiagBlurApply != null) {
+            try {
+                sHeadsUpDiagBlurApply.invoke(sHeadsUpDiagBlurInst, row, ctx);
+            } catch (Throwable ignore) { /* 模糊失败不阻断玻璃 */ }
+        }
+        // 2) 参数（优先资源，失败回退硬编码）
+        float[] params = ensureHeadsUpGlassParams(ctx.getResources());
+        if (params == null) return;
+        // 3) 背景视图施加玻璃
         Object injector = null;
         try {
             injector = row.getClass().getMethod("getInjector").invoke(row);
@@ -1239,9 +1275,34 @@ public class MainHook extends XposedModule {
             bg = injector.getClass().getMethod("getBackgroundNormal").invoke(injector);
         } catch (Throwable ignore) { /* 无 getBackgroundNormal */ }
         if (bg instanceof android.view.View) {
-            setMiGlass.invoke(null, bg, HEADS_UP_GLASS_PARAMS);
+            setMiGlass.invoke(null, bg, params);
             setMiType.invoke(null, 1, bg);
         }
+    }
+
+    /** 行模糊 INSTANCE / apply（installHeadsUpGlassHooks 解析后缓存，apply 热路径复用） */
+    private static volatile Object sHeadsUpDiagBlurInst = null;
+    private static volatile Method sHeadsUpDiagBlurApply = null;
+
+    /** 懒加载玻璃参数：优先 SystemUI 资源 0x7f0300ce string-array，失败回退硬编码 42 float */
+    private static synchronized float[] ensureHeadsUpGlassParams(android.content.res.Resources res) {
+        if (sHeadsUpGlassParams != null) return sHeadsUpGlassParams;
+        try {
+            String[] arr = res.getStringArray(HEADS_UP_GLASS_PARAMS_RES_ID);
+            if (arr != null && arr.length > 0) {
+                float[] f = new float[arr.length];
+                for (int i = 0; i < arr.length; i++) f[i] = Float.parseFloat(arr[i].trim());
+                sHeadsUpGlassParams = f;
+                LogUtil.logAlways("[悬浮玻璃] 已从资源 0x" + Integer.toHexString(HEADS_UP_GLASS_PARAMS_RES_ID)
+                        + " 加载玻璃参数 " + f.length + " 个（复刻 dex 同源）");
+                return sHeadsUpGlassParams;
+            }
+        } catch (Throwable t) {
+            LogUtil.logAlways("[悬浮玻璃] 资源参数加载失败（" + t.getClass().getSimpleName()
+                    + "），转硬编码兜底 42 float");
+        }
+        sHeadsUpGlassParams = HEADS_UP_GLASS_PARAMS;
+        return sHeadsUpGlassParams;
     }
 
     // ============================================================
