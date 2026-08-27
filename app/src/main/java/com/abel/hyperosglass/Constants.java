@@ -39,7 +39,7 @@ public final class Constants {
     public static final String TARGET_PKG = "com.android.systemui";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.3.4";
+    public static final String VERSION = "3.3.5";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -56,6 +56,22 @@ public final class Constants {
     public static final String[] TARGET_METHODS = {
             "getDefaultSysUiTheme",
             "getDefaultPluginTheme",
+    };
+
+    /**
+     * 玻璃真正落地的「字段写入」方法（v3.3.5 修复）：
+     *   dexdump 实证（miui.systemui.plugin 18.2.2.2.0）：
+     *   - getDefaultSysUiTheme() 已恒返回 true（旧 getter 钩子等于 no-op）；
+     *   - updateDefaultSysUiTheme() 调 setDefaultSysUiTheme(file.exists())，
+     *     file = /data/system/theme/com.android.systemui；该文件不存在 →
+     *     setDefaultSysUiTheme(false) → 字段 defaultSysUiTheme=false → 玻璃关。
+     *     （日志 "updating sysui theme to false" 即此方法）
+     *   - 玻璃开关的真正闸门是字段 defaultSysUiTheme/defaultPluginTheme，由 setter 写入。
+     *     v3.3.5：改钩 setter，玻璃开启时强制入参 true → 字段恒 true → 保留玻璃。
+     */
+    public static final String[] TARGET_SETTER_METHODS = {
+            "setDefaultSysUiTheme",
+            "setDefaultPluginTheme",
     };
 
     // ── 插件 classloader 获取（v3.0 液态玻璃修复的关键）──
@@ -166,10 +182,12 @@ public final class Constants {
     public static final String FOD_SHELF_SPACE_FLOW_CLASS =
             "com.android.systemui.statusbar.notification.stack.domain.interactor."
                     + "SharedNotificationContainerInteractor$useExtraShelfSpace$1";
-    /** 通知位置计算的 suspend lambda（输入含 HAS_ENROLLED 位） */
+    /** 通知位置计算的 suspend lambda（输入含 HAS_ENROLLED 位）
+     *  ponytail: 主 SystemUI 17.03.260226.r 该 lambda 编译序号由 $106 变为 $104，
+     *  旧值 ClassNotFound 导致锁屏通知下沉失效——已对齐当前 ROM。 */
     public static final String FOD_NOTIFICATION_POSITION_FLOW_CLASS =
             "com.android.keyguard.panel.KeyguardPanelViewController"
-                    + "$nsslLockYPosition_delegate$lambda$106$$inlined$combine$1$3";
+                    + "$nsslLockYPosition_delegate$lambda$104$$inlined$combine$1$3";
     /** flow 输入数组中「已录入指纹」位的下标 */
     public static final int FOD_FLOW_HAS_ENROLLED_INDEX = 6;
 

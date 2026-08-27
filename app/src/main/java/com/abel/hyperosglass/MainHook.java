@@ -80,9 +80,11 @@ public class MainHook extends XposedModule {
     /** 通知清除按钮命中计数（前 3 次记日志） */
     private static int sDismissBtnLogs = 0;
 
-    /** flow 诊断计数（前 5 次调用记日志，确认锁屏时是否真的被调用） */
-    private static int sFlow1Logs = 0;
-    private static int sFlow2Logs = 0;
+            /** flow 诊断计数（前 5 次调用记日志，确认锁屏时是否真的被调用） */
+            private static int sFlow1Logs = 0;
+            private static int sFlow2Logs = 0;
+            /** 玻璃 setter 强制 true 计数（前 3 次记日志，证明字段被强制置 true） */
+            private static int sGlassSetLogs = 0;
     /** 插件 classloader 补挂计数（前 3 次记日志） */
     private static int sPluginClLogs = 0;
     /** 媒体岛防御命中计数（前 3 次记日志） */
@@ -309,7 +311,9 @@ public class MainHook extends XposedModule {
         }
     }
 
-    /** 用指定 ClassLoader 找 ThemeUtils 并挂两个 getter（幂等，成功一次即止） */
+    /** 用指定 ClassLoader 找 ThemeUtils 并挂 getter + setter（幂等，成功一次即止）
+     *  v3.3.5：getter 恒 true（no-op）改为钩 setter 强制字段 true —— 真正闸门是
+     *  defaultSysUiTheme/defaultPluginTheme 字段，由 setDefault* 写入。 */
     private void tryHookThemeUtilsIn(ClassLoader loader) {
         try {
             if (loader == null) return;
@@ -347,6 +351,36 @@ public class MainHook extends XposedModule {
                     LogUtil.logAlways("[玻璃] ThemeUtils." + name + " 挂钩失败: " + t);
                 }
             }
+            // v3.3.5：钩 setter，玻璃开启时强制入参 true → 字段恒 true → 保留玻璃
+            for (String name : Constants.TARGET_SETTER_METHODS) {
+                try {
+                    Method m = findVoidBooleanMethod(c, name);
+                    if (m == null) {
+                        LogUtil.logAlways("[玻璃] ThemeUtils." + name + " 未找到（跳过）");
+                        continue;
+                    }
+                    hook(m)
+                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .setId("glass_set_" + name)
+                            .intercept(new XposedInterface.Hooker() {
+                                @Override
+                                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                                    if (sGlassEnabled) {
+                                        if (sGlassSetLogs < 3) {
+                                            sGlassSetLogs++;
+                                            LogUtil.logAlways("[玻璃] setDefault*Theme 强制 true（保留液态玻璃，"
+                                                    + "原入参被覆盖）");
+                                        }
+                                        return chain.proceed(new Object[]{true});
+                                    }
+                                    return chain.proceed();
+                                }
+                            });
+                    LogUtil.logAlways("[玻璃] 已挂钩 ThemeUtils." + name + "（玻璃开启时强制 true）");
+                } catch (Throwable t) {
+                    LogUtil.logAlways("[玻璃] ThemeUtils." + name + " 挂钩失败: " + t);
+                }
+            }
         } catch (Throwable t) {
             // 类不在本 loader（正常：插件 loader 尚未就绪），静默等待 createClassLoader 回调
         }
@@ -360,6 +394,25 @@ public class MainHook extends XposedModule {
                     && m.getReturnType() == boolean.class) {
                 return m;
             }
+        }
+        return null;
+    }
+
+    /** 遍历类及父类找 (Z)V setter（v3.3.5 玻璃字段写入钩子用）
+     *  用 getDeclaredMethods：setDefaultSysUiTheme 是 private（仅 updateDefault* 内部调用），
+     *  getMethods() 只返回 public → 漏掉；必须 declared + 父类链。 */
+    private static Method findVoidBooleanMethod(Class<?> c, String name) {
+        Class<?> cur = c;
+        while (cur != null && cur != Object.class) {
+            for (Method m : cur.getDeclaredMethods()) {
+                if (m.getName().equals(name)
+                        && m.getParameterCount() == 1
+                        && m.getParameterTypes()[0] == boolean.class
+                        && m.getReturnType() == void.class) {
+                    return m;
+                }
+            }
+            cur = cur.getSuperclass();
         }
         return null;
     }
