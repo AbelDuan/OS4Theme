@@ -128,12 +128,12 @@ public class MainHook extends XposedModule {
 
             // 宿主包：通知下沉（flow 类在宿主 loader）+ 玻璃（插件工厂在宿主 loader）
             // + 媒体岛崩溃防御（吞异常版，系统 bug 必要保护）
-            // + 展开按钮药丸（v3.0.2 精准命中：仅 2 参构造 + 严格 id 匹配）
             // + 锁屏指纹图标/动画隐藏（v3.1.0 用户 smali 方案，仅锁屏生效）
+            // + 焦点通知玻璃（v3.2.0）
+            // + 悬浮通知液态玻璃（v3.3.9+）及其文字/图标/胶囊染色（v3.3.11）
             installNotificationSinkHooks(cl);
             installGlassHooks(cl);
             installMediaIslandDefense(cl);
-            installExpandButtonColor(cl);
             installLockFodHooks(cl);
             installHideDismissButtonHook(cl);
             installFocusGlassHooks(cl);
@@ -1277,7 +1277,81 @@ public class MainHook extends XposedModule {
         if (bg instanceof android.view.View) {
             setMiGlass.invoke(null, bg, params);
             setMiType.invoke(null, 1, bg);
+            // 对 row 内容（文字/图标/胶囊）染色，保证在深色玻璃上可见
+            tintHeadsUpRow(row, ctx);
         }
+    }
+
+    /**
+     * 悬浮通知内容染色：递归遍历 row 子 View，
+     * - TextView 及其子类 → 白色文字
+     * - ImageView → 白色 tint（跳过头像/应用图标/位图，避免把头像染成纯白）
+     * - id 为 expand_button_pill 的容器 → 半透明深色药丸背景
+     * 仅影响当前悬浮通知行，不波及下拉通知。
+     */
+    private static void tintHeadsUpRow(Object row, android.content.Context ctx) {
+        if (!(row instanceof android.view.View)) return;
+        android.view.View root = (android.view.View) row;
+        int expandPillId = ctx.getResources().getIdentifier("expand_button_pill", "id", "com.android.systemui");
+        tintHeadsUpViewRecursive(root, expandPillId);
+    }
+
+    private static void tintHeadsUpViewRecursive(android.view.View v, int expandPillId) {
+        if (v == null) return;
+        try {
+            // 1) 展开胶囊背景：半透明深色 + 胶囊圆角
+            if (expandPillId != 0 && v.getId() == expandPillId) {
+                android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.GradientDrawable();
+                gd.setShape(android.graphics.drawable.GradientDrawable.RECTANGLE);
+                gd.setCornerRadius(999f); // 足够大即胶囊形
+                gd.setColor(Constants.HEADS_UP_GLASS_PILL_BG_COLOR);
+                v.setBackground(gd);
+            }
+            // 2) 文字 → 白色
+            if (v instanceof android.widget.TextView) {
+                ((android.widget.TextView) v).setTextColor(Constants.HEADS_UP_GLASS_TEXT_COLOR);
+            }
+            // 3) 图标 → 白色 tint，但跳过头像/应用图标/位图类图标
+            else if (v instanceof android.widget.ImageView) {
+                android.widget.ImageView iv = (android.widget.ImageView) v;
+                if (!isAvatarOrAppIcon(iv)) {
+                    iv.setImageTintList(android.content.res.ColorStateList.valueOf(Constants.HEADS_UP_GLASS_ICON_COLOR));
+                }
+            }
+            // 4) 递归子 View
+            if (v instanceof android.view.ViewGroup) {
+                android.view.ViewGroup vg = (android.view.ViewGroup) v;
+                int n = vg.getChildCount();
+                for (int i = 0; i < n; i++) {
+                    tintHeadsUpViewRecursive(vg.getChildAt(i), expandPillId);
+                }
+            }
+        } catch (Throwable ignored) {
+            // 单个 View 染色失败不影响整体
+        }
+    }
+
+    /** 判断 ImageView 是否为头像/应用图标/位图，应避免染成白色 */
+    private static boolean isAvatarOrAppIcon(android.widget.ImageView iv) {
+        try {
+            String idName = viewIdName(iv);
+            if (idName != null) {
+                String n = idName.toLowerCase();
+                if (n.contains("icon") && (n.contains("app") || n.contains("badge") || n.contains("profile")
+                        || n.contains("avatar") || n.contains("photo") || n.contains("conversation"))) {
+                    return true;
+                }
+                if (n.contains("avatar") || n.contains("photo") || n.contains("profile")
+                        || n.contains("contact") || n.contains("picture")) {
+                    return true;
+                }
+            }
+            android.graphics.drawable.Drawable d = iv.getDrawable();
+            if (d instanceof android.graphics.drawable.BitmapDrawable) return true;
+            // 若 drawable 已着色（tint 非空）且不是默认 tint，保守跳过
+        } catch (Throwable ignored) {
+        }
+        return false;
     }
 
     /** 行模糊 INSTANCE / apply（installHeadsUpGlassHooks 解析后缓存，apply 热路径复用） */
@@ -1315,6 +1389,8 @@ public class MainHook extends XposedModule {
      * 仅 com.android.systemui 进程安装（onPackageLoaded 已限制 pkg）。
      */
     private static volatile int[] sHeadsUpColorIds = null;
+    /** 白字 Resources hook 命中计数（前 5 次记日志，用于诊断） */
+    private static int sHeadsUpColorHitLogs = 0;
 
     private void installHeadsUpTextColorHooks(ClassLoader cl) {
         try {
@@ -1336,7 +1412,14 @@ public class MainHook extends XposedModule {
                                     int[] ids = sHeadsUpColorIds;
                                     if (ids != null) {
                                         for (int known : ids) {
-                                            if (known == id) return Constants.HEADS_UP_GLASS_TEXT_COLOR;
+                                            if (known == id) {
+                                                if (sHeadsUpColorHitLogs < 5) {
+                                                    sHeadsUpColorHitLogs++;
+                                                    LogUtil.logAlways("[悬浮玻璃白字] getColor 命中 id=0x"
+                                                            + Integer.toHexString(id));
+                                                }
+                                                return Constants.HEADS_UP_GLASS_TEXT_COLOR;
+                                            }
                                         }
                                     }
                                 }
@@ -1365,7 +1448,14 @@ public class MainHook extends XposedModule {
                                     int[] ids = sHeadsUpColorIds;
                                     if (ids != null) {
                                         for (int known : ids) {
-                                            if (known == id) return Constants.HEADS_UP_GLASS_TEXT_COLOR;
+                                            if (known == id) {
+                                                if (sHeadsUpColorHitLogs < 5) {
+                                                    sHeadsUpColorHitLogs++;
+                                                    LogUtil.logAlways("[悬浮玻璃白字] getColor(int,Theme) 命中 id=0x"
+                                                            + Integer.toHexString(id));
+                                                }
+                                                return Constants.HEADS_UP_GLASS_TEXT_COLOR;
+                                            }
                                         }
                                     }
                                 }
@@ -1393,7 +1483,14 @@ public class MainHook extends XposedModule {
                                     int[] ids = sHeadsUpColorIds;
                                     if (ids != null) {
                                         for (int known : ids) {
-                                            if (known == id) return android.content.res.ColorStateList.valueOf(Constants.HEADS_UP_GLASS_TEXT_COLOR);
+                                            if (known == id) {
+                                                if (sHeadsUpColorHitLogs < 5) {
+                                                    sHeadsUpColorHitLogs++;
+                                                    LogUtil.logAlways("[悬浮玻璃白字] getColorStateList 命中 id=0x"
+                                                            + Integer.toHexString(id));
+                                                }
+                                                return android.content.res.ColorStateList.valueOf(Constants.HEADS_UP_GLASS_TEXT_COLOR);
+                                            }
                                         }
                                     }
                                 }
@@ -1422,7 +1519,14 @@ public class MainHook extends XposedModule {
                                     int[] ids = sHeadsUpColorIds;
                                     if (ids != null) {
                                         for (int known : ids) {
-                                            if (known == id) return android.content.res.ColorStateList.valueOf(Constants.HEADS_UP_GLASS_TEXT_COLOR);
+                                            if (known == id) {
+                                                if (sHeadsUpColorHitLogs < 5) {
+                                                    sHeadsUpColorHitLogs++;
+                                                    LogUtil.logAlways("[悬浮玻璃白字] getColorStateList(int,Theme) 命中 id=0x"
+                                                            + Integer.toHexString(id));
+                                                }
+                                                return android.content.res.ColorStateList.valueOf(Constants.HEADS_UP_GLASS_TEXT_COLOR);
+                                            }
                                         }
                                     }
                                 }
@@ -1438,7 +1542,7 @@ public class MainHook extends XposedModule {
         }
     }
 
-    /** 预解析 6 个通知文字 color 的 id（仅一次，运行时 getIdentifier 防 ROM 差异） */
+    /** 预解析通知 color 资源 id（仅一次，运行时 getIdentifier 防 ROM 差异） */
     private static synchronized void ensureHeadsUpColorIds(android.content.res.Resources res) {
         if (sHeadsUpColorIds != null) return;
         try {
@@ -1451,8 +1555,9 @@ public class MainHook extends XposedModule {
             int i = 0;
             for (int v : set) arr[i++] = v;
             sHeadsUpColorIds = arr;
-            LogUtil.logAlways("[悬浮玻璃白字] 已解析 6 个文字颜色 id（命中 "
-                    + arr.length + " 个）: " + java.util.Arrays.toString(arr));
+            LogUtil.logAlways("[悬浮玻璃白字] 已解析 " + Constants.HEADS_UP_GLASS_COLOR_NAMES.length
+                    + " 个 color 资源 id（命中 " + arr.length + " 个）: "
+                    + java.util.Arrays.toString(arr));
         } catch (Throwable t) {
             sHeadsUpColorIds = new int[0]; // 避免反复重试
             LogUtil.logAlways("[悬浮玻璃白字] 解析颜色 id 失败: " + t);

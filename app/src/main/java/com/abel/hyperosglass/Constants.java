@@ -39,7 +39,7 @@ public final class Constants {
     public static final String TARGET_PKG = "com.android.systemui";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.3.10";
+    public static final String VERSION = "3.3.11";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -190,11 +190,19 @@ public final class Constants {
     public static final boolean DEFAULT_HEADS_UP_GLASS = true;
 
     /**
-     * 玻璃上白字：6 个通知文字颜色强制改为 #e6ffffff（约 90% 白），保证玻璃半透明
-     * 背景上文字清晰（用户方案：resources.arsc 中这 6 个 color 改同值）。经
-     * Resources.getColor 钩子按 id 拦截返回（预解析 O(1)，热路径零字符串开销）。
+     * 玻璃上白字：通知文字/图标颜色强制改为 #e6ffffff（约 90% 白），保证玻璃半透明
+     * 背景上内容清晰。胶囊背景在深色玻璃上改为 25% 白色（0x40ffffff），替代原来
+     * 全局白透方案，避免影响下拉通知。
      */
     public static final int HEADS_UP_GLASS_TEXT_COLOR = 0xE6FFFFFF;
+    public static final int HEADS_UP_GLASS_ICON_COLOR = 0xFFFFFFFF;
+    public static final int HEADS_UP_GLASS_PILL_BG_COLOR = 0x40FFFFFF;
+
+    /**
+     * 悬浮通知期间需要改白的 color 资源名（Resources hook + View 级染色兜底）。
+     * 除用户指定的 6 个文字色外，新增状态/图标/胶囊相关资源，确保铃铛、展开箭头、
+     * 胶囊背景在深色玻璃上可见。
+     */
     public static final String[] HEADS_UP_GLASS_COLOR_NAMES = {
             "notification_action_text_color",
             "notification_time_color",
@@ -202,6 +210,13 @@ public final class Constants {
             "notification_primary_text_color_light",
             "notification_secondary_text_color_light",
             "optimized_heads_up_notification_action_text",
+            // 状态/图标色（ColorStateList，需 getColorStateList hook）
+            "notification_state_color_default",
+            "notification_state_color_light",
+            "notification_state_color_dark",
+            // 胶囊背景与图标背景
+            "notification_expand_button_pill_color",
+            "notification_icon_bg_color",
     };
 
     /** 遗留升级迁移：v2.1.8 及更早用 fod_mode(int 三态)，v2.1.9 起改用 sink_enabled(bool) */
