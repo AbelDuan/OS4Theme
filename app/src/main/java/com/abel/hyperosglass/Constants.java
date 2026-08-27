@@ -39,7 +39,7 @@ public final class Constants {
     public static final String TARGET_PKG = "com.android.systemui";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.3.11";
+    public static final String VERSION = "3.3.12";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -196,12 +196,13 @@ public final class Constants {
      */
     public static final int HEADS_UP_GLASS_TEXT_COLOR = 0xE6FFFFFF;
     public static final int HEADS_UP_GLASS_ICON_COLOR = 0xFFFFFFFF;
-    public static final int HEADS_UP_GLASS_PILL_BG_COLOR = 0x40FFFFFF;
 
     /**
      * 悬浮通知期间需要改白的 color 资源名（Resources hook + View 级染色兜底）。
-     * 除用户指定的 6 个文字色外，新增状态/图标/胶囊相关资源，确保铃铛、展开箭头、
-     * 胶囊背景在深色玻璃上可见。
+     * 除用户指定的 6 个文字色外，新增状态/图标相关资源，确保铃铛、展开箭头
+     * 在深色玻璃上可见。
+     * 注意：展开胶囊背景（notification_expand_button_pill_color）不在此列表——
+     * 用户要求保留系统原色，不强制改白（v3.3.12 起移除）。
      */
     public static final String[] HEADS_UP_GLASS_COLOR_NAMES = {
             "notification_action_text_color",
@@ -214,8 +215,7 @@ public final class Constants {
             "notification_state_color_default",
             "notification_state_color_light",
             "notification_state_color_dark",
-            // 胶囊背景与图标背景
-            "notification_expand_button_pill_color",
+            // 图标背景（保持系统原色）
             "notification_icon_bg_color",
     };
 

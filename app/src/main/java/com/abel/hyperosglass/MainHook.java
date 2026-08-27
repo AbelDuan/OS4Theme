@@ -1286,44 +1286,34 @@ public class MainHook extends XposedModule {
      * 悬浮通知内容染色：递归遍历 row 子 View，
      * - TextView 及其子类 → 白色文字
      * - ImageView → 白色 tint（跳过头像/应用图标/位图，避免把头像染成纯白）
-     * - id 为 expand_button_pill 的容器 → 半透明深色药丸背景
-     * 仅影响当前悬浮通知行，不波及下拉通知。
+     * 仅影响当前悬浮通知行，不波及下拉通知。胶囊背景保留系统原色（v3.3.12 移除强制改白）。
      */
     private static void tintHeadsUpRow(Object row, android.content.Context ctx) {
         if (!(row instanceof android.view.View)) return;
         android.view.View root = (android.view.View) row;
-        int expandPillId = ctx.getResources().getIdentifier("expand_button_pill", "id", "com.android.systemui");
-        tintHeadsUpViewRecursive(root, expandPillId);
+        tintHeadsUpViewRecursive(root);
     }
 
-    private static void tintHeadsUpViewRecursive(android.view.View v, int expandPillId) {
+    private static void tintHeadsUpViewRecursive(android.view.View v) {
         if (v == null) return;
         try {
-            // 1) 展开胶囊背景：半透明深色 + 胶囊圆角
-            if (expandPillId != 0 && v.getId() == expandPillId) {
-                android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.GradientDrawable();
-                gd.setShape(android.graphics.drawable.GradientDrawable.RECTANGLE);
-                gd.setCornerRadius(999f); // 足够大即胶囊形
-                gd.setColor(Constants.HEADS_UP_GLASS_PILL_BG_COLOR);
-                v.setBackground(gd);
-            }
-            // 2) 文字 → 白色
+            // 1) 文字 → 白色
             if (v instanceof android.widget.TextView) {
                 ((android.widget.TextView) v).setTextColor(Constants.HEADS_UP_GLASS_TEXT_COLOR);
             }
-            // 3) 图标 → 白色 tint，但跳过头像/应用图标/位图类图标
+            // 2) 图标 → 白色 tint，但跳过头像/应用图标/位图类图标
             else if (v instanceof android.widget.ImageView) {
                 android.widget.ImageView iv = (android.widget.ImageView) v;
                 if (!isAvatarOrAppIcon(iv)) {
                     iv.setImageTintList(android.content.res.ColorStateList.valueOf(Constants.HEADS_UP_GLASS_ICON_COLOR));
                 }
             }
-            // 4) 递归子 View
+            // 3) 递归子 View
             if (v instanceof android.view.ViewGroup) {
                 android.view.ViewGroup vg = (android.view.ViewGroup) v;
                 int n = vg.getChildCount();
                 for (int i = 0; i < n; i++) {
-                    tintHeadsUpViewRecursive(vg.getChildAt(i), expandPillId);
+                    tintHeadsUpViewRecursive(vg.getChildAt(i));
                 }
             }
         } catch (Throwable ignored) {
