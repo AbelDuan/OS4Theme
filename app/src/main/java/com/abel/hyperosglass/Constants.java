@@ -39,7 +39,7 @@ public final class Constants {
     public static final String TARGET_PKG = "com.android.systemui";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.3.5";
+    public static final String VERSION = "3.3.6";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -160,6 +160,40 @@ public final class Constants {
     public static final String FOCUS_GLASS_PARAMS_RES = "focus_notification_glass_params_normal";
     /** 普通通知玻璃参数 array（0x7f0300ce，用户 smali 换用）；运行时 getIdentifier 解析 */
     public static final String NORMAL_GLASS_PARAMS_RES = "notification_glass_params_normal";
+
+    // ── 悬浮通知液态玻璃（v3.3.6，ponytail：复用原生 HeadsUpNotificationGlassEffect）──
+    /**
+     * 悬浮（heads-up）通知玻璃：原生 SystemUI 已有 HeadsUpNotificationGlassEffect，
+     * 其内部先调用 HeadsUpNotificationBlurEffect.INSTANCE.apply(row, ctx) 做模糊，
+     * 再叠加 MiGlassCompat.setMiGlassCompat + setMiViewMaterialTypeCompat(1) 做玻璃。
+     * 模块不直接 import 外部 dex（「悬浮通知柔光玻璃.dex」在已作废的 v3.4.x 中、不可用），
+     * 而是 hook HeadsUpNotificationBlurEffect.apply：当框架本欲对悬浮通知施加模糊时，
+     * 改用 HeadsUpNotificationGlassEffect.INSTANCE.apply 施加玻璃（含模糊）。
+     * 防递归：线程局部标志——玻璃 effect 内部回调 blur 时直接 proceed，断开无限循环。
+     */
+    public static final String HEADS_UP_BLUR_CLASS =
+            "com.android.systemui.statusbar.notification.style.vieweffect.HeadsUpNotificationBlurEffect";
+    public static final String HEADS_UP_GLASS_CLASS =
+            "com.android.systemui.statusbar.notification.style.vieweffect.HeadsUpNotificationGlassEffect";
+
+    /** 悬浮通知玻璃启用开关（默认开） */
+    public static final String PREFS_HEADS_UP_GLASS = "heads_up_glass";
+    public static final boolean DEFAULT_HEADS_UP_GLASS = true;
+
+    /**
+     * 玻璃上白字：6 个通知文字颜色强制改为 #e6ffffff（约 90% 白），保证玻璃半透明
+     * 背景上文字清晰（用户方案：resources.arsc 中这 6 个 color 改同值）。经
+     * Resources.getColor 钩子按 id 拦截返回（预解析 O(1)，热路径零字符串开销）。
+     */
+    public static final int HEADS_UP_GLASS_TEXT_COLOR = 0xE6FFFFFF;
+    public static final String[] HEADS_UP_GLASS_COLOR_NAMES = {
+            "notification_action_text_color",
+            "notification_time_color",
+            "optimized_heads_up_notification_text",
+            "notification_primary_text_color_light",
+            "notification_secondary_text_color_light",
+            "optimized_heads_up_notification_action_text",
+    };
 
     /** 遗留升级迁移：v2.1.8 及更早用 fod_mode(int 三态)，v2.1.9 起改用 sink_enabled(bool) */
     public static final String PREFS_FOD_MODE_LEGACY = "fod_mode";

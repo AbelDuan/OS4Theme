@@ -4,3 +4,7 @@ build/
 local.properties
 captures/
 .externalNativeBuild/
+
+# distributables (publish via GitHub Release)
+app/release/
+*.apk
