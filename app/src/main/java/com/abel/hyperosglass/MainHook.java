@@ -1097,6 +1097,8 @@ public class MainHook extends XposedModule {
     private static final ThreadLocal<Boolean> sInHeadsUpGlass = new ThreadLocal<Boolean>();
     /** 悬浮玻璃重定向命中计数（前 3 次记日志，证明已实际触发） */
     private static int sHeadsUpGlassLogs = 0;
+    /** 诊断：钩子是否被 selector 真正命中（无论开关），仅记前 5 次，用于定位「不生效」根因 */
+    private static int sHeadsUpDiagCount = 0;
 
     private void installHeadsUpGlassHooks(ClassLoader cl) {
         try {
@@ -1125,6 +1127,14 @@ public class MainHook extends XposedModule {
                             .intercept(new XposedInterface.Hooker() {
                                 @Override
                                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                                    // 诊断：钩子是否被 selector 真正命中（无论开关），仅记前 5 次
+                                    if (sHeadsUpDiagCount < 5) {
+                                        sHeadsUpDiagCount++;
+                                        Object r0 = chain.getArg(0);
+                                        LogUtil.logAlways("[悬浮玻璃][诊断] 命中重定向钩子 target=" + target
+                                                + " rowClass=" + (r0 == null ? "null"
+                                                    : r0.getClass().getName()));
+                                    }
                                     if (!sHeadsUpGlassFlag.get()) return chain.proceed();
                                     if (Boolean.TRUE.equals(sInHeadsUpGlass.get())) {
                                         // 玻璃 effect 内部回调 BlurEffect：直接跑真实模糊，断开递归
@@ -1146,6 +1156,9 @@ public class MainHook extends XposedModule {
                                         }
                                         return null; // 短路原 effect（玻璃已含模糊 + 玻璃）
                                     } catch (Throwable t) {
+                                        LogUtil.logAlways("[悬浮玻璃][诊断] 重定向异常 target=" + target
+                                                + " rowClass=" + (row == null ? "null" : row.getClass().getName())
+                                                + " err=" + t.getClass().getName() + ":" + t.getMessage());
                                         return chain.proceed(); // 失败退回原逻辑
                                     }
                                 }
