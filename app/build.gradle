@@ -11,8 +11,10 @@ android {
         applicationId 'com.abel.hyperosglass'
         minSdk 33
         targetSdk 34
-        versionCode 62
-        versionName '3.3.12'
+        // 回滚基线：代码等价 3.3.5（已移除 3.3.6–3.3.12 悬浮通知液态玻璃实验功能）。
+        // versionCode 提到 63 仅为满足覆盖安装（> 3.3.12 的 62）；功能与 3.3.5 完全一致。
+        versionCode 63
+        versionName '3.3.5'
     }
 
     signingConfigs {

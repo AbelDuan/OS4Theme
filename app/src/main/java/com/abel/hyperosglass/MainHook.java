@@ -66,8 +66,6 @@ public class MainHook extends XposedModule {
     private volatile boolean sHideLockFod = Constants.DEFAULT_HIDE_LOCK_FOD;
     private volatile boolean sHideDismissBtn = Constants.DEFAULT_HIDE_DISMISS_BTN;
     private volatile boolean sFocusGlass = Constants.DEFAULT_FOCUS_GLASS;
-    /** 悬浮通知玻璃开关（volatile 布尔，reloadPrefs 写入） */
-    private volatile boolean sHeadsUpGlass = Constants.DEFAULT_HEADS_UP_GLASS;
     /** 隐藏锁屏指纹开关（AtomicBoolean，供热路径拦截器读取） */
     private static final java.util.concurrent.atomic.AtomicBoolean sHideLockFodFlag =
             new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HIDE_LOCK_FOD);
@@ -77,9 +75,6 @@ public class MainHook extends XposedModule {
     /** 液态玻璃焦点通知开关（AtomicBoolean） */
     private static final java.util.concurrent.atomic.AtomicBoolean sFocusGlassFlag =
             new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_FOCUS_GLASS);
-    /** 悬浮通知玻璃开关（AtomicBoolean，供热路径拦截器读取） */
-    private static final java.util.concurrent.atomic.AtomicBoolean sHeadsUpGlassFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HEADS_UP_GLASS);
     /** 锁屏指纹隐藏命中计数（前 3 次记日志） */
     private static int sHideLockFodLogs = 0;
     /** 通知清除按钮命中计数（前 3 次记日志） */
@@ -128,17 +123,15 @@ public class MainHook extends XposedModule {
 
             // 宿主包：通知下沉（flow 类在宿主 loader）+ 玻璃（插件工厂在宿主 loader）
             // + 媒体岛崩溃防御（吞异常版，系统 bug 必要保护）
+            // + 展开按钮药丸（v3.0.2 精准命中：仅 2 参构造 + 严格 id 匹配）
             // + 锁屏指纹图标/动画隐藏（v3.1.0 用户 smali 方案，仅锁屏生效）
-            // + 焦点通知玻璃（v3.2.0）
-            // + 悬浮通知液态玻璃（v3.3.9+）及其文字/图标/胶囊染色（v3.3.11）
             installNotificationSinkHooks(cl);
             installGlassHooks(cl);
             installMediaIslandDefense(cl);
+            installExpandButtonColor(cl);
             installLockFodHooks(cl);
             installHideDismissButtonHook(cl);
             installFocusGlassHooks(cl);
-            installHeadsUpGlassHooks(cl);
-            installHeadsUpTextColorHooks(cl);
         } catch (Throwable t) {
             LogUtil.logAlways("onPackageLoaded 异常: " + t);
         }
@@ -170,8 +163,6 @@ public class MainHook extends XposedModule {
                     Constants.DEFAULT_HIDE_DISMISS_BTN);
             boolean newFocusGlass = sPrefs.getBoolean(Constants.PREFS_FOCUS_GLASS,
                     Constants.DEFAULT_FOCUS_GLASS);
-            boolean newHeadsUp = sPrefs.getBoolean(Constants.PREFS_HEADS_UP_GLASS,
-                    Constants.DEFAULT_HEADS_UP_GLASS);
             boolean log = sPrefs.getBoolean(Constants.PREFS_ENABLE_LOG,
                     Constants.DEFAULT_ENABLE_LOG);
             sSinkEnabled = newSink;
@@ -182,13 +173,10 @@ public class MainHook extends XposedModule {
             sHideDismissFlag.set(newHideDismiss);
             sFocusGlass = newFocusGlass;
             sFocusGlassFlag.set(newFocusGlass);
-            sHeadsUpGlass = newHeadsUp;
-            sHeadsUpGlassFlag.set(newHeadsUp);
             LogUtil.setEnabled(log);
             LogUtil.logAlways("设置(框架)：sink=" + sSinkEnabled + "，glass=" + sGlassEnabled
                     + "，hideLockFod=" + sHideLockFod + "，hideDismiss=" + sHideDismissBtn
-                    + "，focusGlass=" + sFocusGlass + "，headsUpGlass=" + sHeadsUpGlass
-                    + "，日志=" + log);
+                    + "，focusGlass=" + sFocusGlass + "，日志=" + log);
         } catch (Throwable t) {
             LogUtil.logAlways("读取设置失败: " + t);
         }
@@ -251,8 +239,6 @@ public class MainHook extends XposedModule {
                     Constants.DEFAULT_HIDE_DISMISS_BTN);
             boolean focus = out.getBoolean(Constants.PREFS_FOCUS_GLASS,
                     Constants.DEFAULT_FOCUS_GLASS);
-            boolean headsUp = out.getBoolean(Constants.PREFS_HEADS_UP_GLASS,
-                    Constants.DEFAULT_HEADS_UP_GLASS);
             boolean log = out.getBoolean(Constants.PREFS_ENABLE_LOG,
                     Constants.DEFAULT_ENABLE_LOG);
             sSinkEnabled = sink;
@@ -263,12 +249,10 @@ public class MainHook extends XposedModule {
             sHideDismissFlag.set(dismiss);
             sFocusGlass = focus;
             sFocusGlassFlag.set(focus);
-            sHeadsUpGlass = headsUp;
-            sHeadsUpGlassFlag.set(headsUp);
             LogUtil.setEnabled(log);
             LogUtil.logAlways("设置(真实值同步)：sink=" + sink + "，glass=" + glass
                     + "，hideLockFod=" + fod + "，hideDismiss=" + dismiss
-                    + "，focusGlass=" + focus + "，headsUpGlass=" + headsUp + "，日志=" + log);
+                    + "，focusGlass=" + focus + "，日志=" + log);
         } catch (Throwable t) {
             LogUtil.logAlways("设置(真实值同步) 应用失败: " + t);
         }
@@ -1069,489 +1053,6 @@ public class MainHook extends XposedModule {
         } catch (Throwable ignored) {
         }
         return null;
-    }
-
-    // ============================================================
-    // 悬浮通知液态玻璃（v3.3.7：覆盖全部非玻璃 heads-up effect，重定向到原生玻璃）
-    // ============================================================
-    /**
-     * 悬浮通知液态玻璃（v3.3.9）：1:1 复刻用户提供的「悬浮通知柔光玻璃.dex」
-     * （HeadsUpNotificationGlassDarkEffect.apply 反编译字节码）。
-     *
-     * dex apply 真实流程（dexdump 确认）：
-     *   1) NotificationRowBlurEffect.INSTANCE.apply(row, ctx)   // 行模糊（ROW_BLUR_CLASS，
-     *      注意：是行级模糊，不是 v3.3.8 误用的 HeadsUpNotificationBlurEffect —— 这是失效根因）
-     *   2) 玻璃参数懒加载：Resources.getStringArray(0x7f0300ce) 逐元素 Float.parseFloat（42 float）
-     *   3) bg = row.getInjector().getBackgroundNormal()
-     *      MiGlassCompat.setMiGlassCompat(bg, params) + setMiViewMaterialTypeCompat(1, bg)
-     *
-     * 本模块在 Java 侧 1:1 复刻（不运行时加载 dex，规避 kotlin/classloader 依赖），
-     * 参数运行时从同一 SystemUI 资源 0x7f0300ce 现取，与原生/酷安完全一致。
-     *
-     * hook 覆盖 5 个 heads-up effect 的 apply(Object, Context) 桥（selector 泛型擦除永远走此桥），
-     * 全部重定向到上述玻璃逻辑；仅影响悬浮通知，不波及下拉（后者走 notification_row_* 系列）。
-     * 白字走 installHeadsUpTextColorHooks（仅 6 个文字 color，不染图标 → 规避头像/图标变纯白）。
-     */
-    private static final ThreadLocal<Boolean> sInHeadsUpGlass = new ThreadLocal<Boolean>();
-    /** 悬浮玻璃应用成功计数（前 3 次记日志，证明已生效） */
-    private static int sHeadsUpGlassLogs = 0;
-    /** 诊断：钩子是否被 selector 真正命中（无论开关），仅记前 5 次，用于定位「不生效」根因 */
-    private static int sHeadsUpDiagCount = 0;
-    /** 玻璃参数兜底：dex 反编译提取的 42 float（资源 0x7f0300ce 读取失败时使用） */
-    private static final float[] HEADS_UP_GLASS_PARAMS = {
-            0.5f, 1.0f, 0.0f, 0.800000011920929f, 0.5f, 1.2000000476837158f, 0.0f, 0.20000000298023224f,
-            0.0f, 0.0f, 0.029999999329447746f, 1.0f, 1.0f, 1.0f, 1.5f, 0.0f,
-            0.6000000238418579f, 0.6000000238418579f, 1.0f, 62.0f, 3.799999952316284f, 80.0f, 600.0f, 1.0f,
-            0.800000011920929f, -0.4000000059604645f, 0.6000000238418579f, -0.800000011920929f,
-            1.2000000476837158f, 0.6000000238418579f, 0.800000011920929f, 1.149999976158142f, 3.0f,
-            0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f
-    };
-    /**
-     * 玻璃参数资源 id：与用户 dex 的 HeadsUpNotificationGlassDarkEffect.apply 完全一致 ——
-     * 它从 Resources.getStringArray(0x7f0300ce) 懒加载 42 个 float 字符串。本模块
-     * 运行时从同一 SystemUI 资源现取，保证与原生/酷安方案参数一致（不依赖硬编码）。
-     */
-    private static final int HEADS_UP_GLASS_PARAMS_RES_ID = 0x7f0300ce;
-    /** 懒加载的玻璃参数（首次悬浮通知时从资源解析，缓存复用） */
-    private static volatile float[] sHeadsUpGlassParams = null;
-
-    private void installHeadsUpGlassHooks(ClassLoader cl) {
-        try {
-            final Class<?> ctxCls = android.content.Context.class;
-            final Class<?> viewCls = android.view.View.class;
-            // MiGlassCompat 静态玻璃方法（玻璃落地）
-            final Class<?> miGlass = Class.forName("com.miui.systemui.util.MiGlassCompat", false, cl);
-            final Method setMiGlass = miGlass.getMethod("setMiGlassCompat", viewCls, float[].class);
-            final Method setMiType = miGlass.getMethod("setMiViewMaterialTypeCompat", int.class, viewCls);
-            // 行模糊：复刻用户 dex 的 HeadsUpNotificationGlassDarkEffect.apply —— 用的是
-            // NotificationRowBlurEffect（ROW_BLUR_CLASS），不是 HeadsUpNotificationBlurEffect。
-            // 这是 v3.3.8 失效的根因之一：用了错误的模糊类。
-            final Class<?> blurCls = Class.forName(Constants.ROW_BLUR_CLASS, false, cl);
-            final Object blurInst = blurCls.getField("INSTANCE").get(null);
-            final Method blurApply = blurCls.getDeclaredMethod("apply", Object.class, ctxCls);
-            // 缓存到静态字段，供 applyHeadsUpGlassMaterial 热路径复用（复刻 dex 的行模糊）
-            sHeadsUpDiagBlurInst = blurInst;
-            sHeadsUpDiagBlurApply = blurApply;
-
-            // 1) 非玻璃效果 → 重定向到玻璃
-            final String[] redirectTargets = new String[]{
-                    Constants.HEADS_UP_NORMAL_CLASS,
-                    Constants.HEADS_UP_NORMAL_TRANSPARENT_CLASS,
-                    Constants.HEADS_UP_BLUR_CLASS,
-            };
-            for (final String target : redirectTargets) {
-                try {
-                    final Class<?> tc = Class.forName(target, false, cl);
-                    final Method tapply = tc.getDeclaredMethod("apply", Object.class, ctxCls);
-                    hook(tapply)
-                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                            .setId("heads-up-glass-redirect:" + target)
-                            .intercept(new XposedInterface.Hooker() {
-                                @Override
-                                public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                                    if (sHeadsUpDiagCount < 5) {
-                                        sHeadsUpDiagCount++;
-                                        Object r0 = chain.getArg(0);
-                                        LogUtil.logAlways("[悬浮玻璃][诊断] 命中重定向钩子 target=" + target
-                                                + " rowClass=" + (r0 == null ? "null"
-                                                    : r0.getClass().getName()));
-                                    }
-                                    if (!sHeadsUpGlassFlag.get()) return chain.proceed();
-                                    if (Boolean.TRUE.equals(sInHeadsUpGlass.get())) {
-                                        return chain.proceed(); // 原生玻璃内部回调 BlurEffect：跑真实模糊，断开递归
-                                    }
-                                    Object row = chain.getArg(0);
-                                    Object ctx = chain.getArg(1);
-                                    try {
-                                        sInHeadsUpGlass.set(Boolean.TRUE);
-                                        try {
-                                            // 行模糊 + 背景玻璃材质（复刻 dex：行模糊走 NotificationRowBlurEffect，
-                                            // 玻璃参数从资源 0x7f0300ce 现取，见 applyHeadsUpGlassMaterial）
-                                            applyHeadsUpGlassMaterial(row, ctx, setMiGlass, setMiType);
-                                        } finally {
-                                            sInHeadsUpGlass.remove();
-                                        }
-                                        if (sHeadsUpGlassLogs < 3) {
-                                            sHeadsUpGlassLogs++;
-                                            LogUtil.logAlways("[悬浮玻璃] 已将悬浮通知 " + target
-                                                    + " 应用为液态玻璃（MiGlassCompat + materialType=1）");
-                                        }
-                                        return null; // 短路原 effect（玻璃已覆盖）
-                                    } catch (Throwable t) {
-                                        LogUtil.logAlways("[悬浮玻璃][诊断] 应用玻璃异常 target=" + target
-                                                + " rowClass=" + (row == null ? "null" : row.getClass().getName())
-                                                + " err=" + t.getClass().getName() + ":" + t.getMessage());
-                                        return chain.proceed(); // 失败退回原逻辑
-                                    }
-                                }
-                            });
-                    LogUtil.logAlways("[悬浮玻璃] 已挂钩 " + target + ".apply(Object, Context) → 液态玻璃");
-                } catch (Throwable t) {
-                    LogUtil.logAlways("[悬浮玻璃] 挂钩 " + target + " 失败: " + t);
-                }
-            }
-
-            // 2) 原生玻璃 effect → 仅置守卫、放行（其内部回调 BlurEffect 须靠守卫断开递归）
-            final String[] glassTargets = new String[]{
-                    Constants.HEADS_UP_GLASS_CLASS,
-                    Constants.HEADS_UP_GLASS_DARK_CLASS,
-            };
-            for (final String target : glassTargets) {
-                try {
-                    final Class<?> gc = Class.forName(target, false, cl);
-                    final Method gapply = gc.getDeclaredMethod("apply", Object.class, ctxCls);
-                    hook(gapply)
-                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                            .setId("heads-up-glass-guard:" + target)
-                            .intercept(new XposedInterface.Hooker() {
-                                @Override
-                                public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                                    if (!sHeadsUpGlassFlag.get()) return chain.proceed();
-                                    if (Boolean.TRUE.equals(sInHeadsUpGlass.get())) {
-                                        return chain.proceed(); // 原生玻璃内部回调 BlurEffect：跑真实模糊，断开递归
-                                    }
-                                    Object row = chain.getArg(0);
-                                    Object ctx = chain.getArg(1);
-                                    try {
-                                        sInHeadsUpGlass.set(Boolean.TRUE);
-                                        try {
-                                            // 原生 Glass/GlassDark 也重定向到 dex 柔光玻璃（统一观感）
-                                            applyHeadsUpGlassMaterial(row, ctx, setMiGlass, setMiType);
-                                        } finally {
-                                            sInHeadsUpGlass.remove();
-                                        }
-                                        if (sHeadsUpGlassLogs < 3) {
-                                            sHeadsUpGlassLogs++;
-                                            LogUtil.logAlways("[悬浮玻璃] 已将悬浮通知 " + target
-                                                    + " 应用为液态玻璃（MiGlassCompat + materialType=1）");
-                                        }
-                                        return null;
-                                    } catch (Throwable t) {
-                                        LogUtil.logAlways("[悬浮玻璃][诊断] 应用玻璃异常 target=" + target
-                                                + " rowClass=" + (row == null ? "null" : row.getClass().getName())
-                                                + " err=" + t.getClass().getName() + ":" + t.getMessage());
-                                        return chain.proceed();
-                                    }
-                                }
-                            });
-                    LogUtil.logAlways("[悬浮玻璃] 已挂钩 " + target + ".apply(Object, Context) → 液态玻璃");
-                } catch (Throwable t) {
-                    LogUtil.logAlways("[悬浮玻璃] 挂钩 " + target + " 守卫失败: " + t);
-                }
-            }
-        } catch (Throwable t) {
-            LogUtil.logAlways("[悬浮玻璃] 整体挂钩失败: " + t);
-        }
-    }
-
-    /**
-     * 复刻用户 dex 的 HeadsUpNotificationGlassDarkEffect.apply：
-     * 1) 行模糊 NotificationRowBlurEffect.INSTANCE.apply(row, ctx)；
-     * 2) 玻璃参数从 SystemUI 资源 0x7f0300ce（string-array）现取，逐元素 parseFloat；
-     * 3) 对 row.getInjector().getBackgroundNormal() 背景视图调
-     *    MiGlassCompat.setMiGlassCompat(bg, params) + setMiViewMaterialTypeCompat(1, bg)。
-     * 反射解析，兼容任意行类型（非标准行无 getInjector 时安全跳过，不会崩）。
-     */
-    private static void applyHeadsUpGlassMaterial(Object row, Object ctxObj,
-            Method setMiGlass, Method setMiType) throws Throwable {
-        android.content.Context ctx = (android.content.Context) ctxObj;
-        // 1) 行模糊（dex 顺序：先模糊后玻璃）
-        if (sHeadsUpDiagBlurInst != null && sHeadsUpDiagBlurApply != null) {
-            try {
-                sHeadsUpDiagBlurApply.invoke(sHeadsUpDiagBlurInst, row, ctx);
-            } catch (Throwable ignore) { /* 模糊失败不阻断玻璃 */ }
-        }
-        // 2) 参数（优先资源，失败回退硬编码）
-        float[] params = ensureHeadsUpGlassParams(ctx.getResources());
-        if (params == null) return;
-        // 3) 背景视图施加玻璃
-        Object injector = null;
-        try {
-            injector = row.getClass().getMethod("getInjector").invoke(row);
-        } catch (Throwable ignore) { /* 非标准行，无 getInjector */ }
-        if (injector == null) return;
-        Object bg = null;
-        try {
-            bg = injector.getClass().getMethod("getBackgroundNormal").invoke(injector);
-        } catch (Throwable ignore) { /* 无 getBackgroundNormal */ }
-        if (bg instanceof android.view.View) {
-            setMiGlass.invoke(null, bg, params);
-            setMiType.invoke(null, 1, bg);
-            // 对 row 内容（文字/图标/胶囊）染色，保证在深色玻璃上可见
-            tintHeadsUpRow(row, ctx);
-        }
-    }
-
-    /**
-     * 悬浮通知内容染色：递归遍历 row 子 View，
-     * - TextView 及其子类 → 白色文字
-     * - ImageView → 白色 tint（跳过头像/应用图标/位图，避免把头像染成纯白）
-     * 仅影响当前悬浮通知行，不波及下拉通知。胶囊背景保留系统原色（v3.3.12 移除强制改白）。
-     */
-    private static void tintHeadsUpRow(Object row, android.content.Context ctx) {
-        if (!(row instanceof android.view.View)) return;
-        android.view.View root = (android.view.View) row;
-        tintHeadsUpViewRecursive(root);
-    }
-
-    private static void tintHeadsUpViewRecursive(android.view.View v) {
-        if (v == null) return;
-        try {
-            // 1) 文字 → 白色
-            if (v instanceof android.widget.TextView) {
-                ((android.widget.TextView) v).setTextColor(Constants.HEADS_UP_GLASS_TEXT_COLOR);
-            }
-            // 2) 图标 → 白色 tint，但跳过头像/应用图标/位图类图标
-            else if (v instanceof android.widget.ImageView) {
-                android.widget.ImageView iv = (android.widget.ImageView) v;
-                if (!isAvatarOrAppIcon(iv)) {
-                    iv.setImageTintList(android.content.res.ColorStateList.valueOf(Constants.HEADS_UP_GLASS_ICON_COLOR));
-                }
-            }
-            // 3) 递归子 View
-            if (v instanceof android.view.ViewGroup) {
-                android.view.ViewGroup vg = (android.view.ViewGroup) v;
-                int n = vg.getChildCount();
-                for (int i = 0; i < n; i++) {
-                    tintHeadsUpViewRecursive(vg.getChildAt(i));
-                }
-            }
-        } catch (Throwable ignored) {
-            // 单个 View 染色失败不影响整体
-        }
-    }
-
-    /** 判断 ImageView 是否为头像/应用图标/位图，应避免染成白色 */
-    private static boolean isAvatarOrAppIcon(android.widget.ImageView iv) {
-        try {
-            String idName = viewIdName(iv);
-            if (idName != null) {
-                String n = idName.toLowerCase();
-                if (n.contains("icon") && (n.contains("app") || n.contains("badge") || n.contains("profile")
-                        || n.contains("avatar") || n.contains("photo") || n.contains("conversation"))) {
-                    return true;
-                }
-                if (n.contains("avatar") || n.contains("photo") || n.contains("profile")
-                        || n.contains("contact") || n.contains("picture")) {
-                    return true;
-                }
-            }
-            android.graphics.drawable.Drawable d = iv.getDrawable();
-            if (d instanceof android.graphics.drawable.BitmapDrawable) return true;
-            // 若 drawable 已着色（tint 非空）且不是默认 tint，保守跳过
-        } catch (Throwable ignored) {
-        }
-        return false;
-    }
-
-    /** 行模糊 INSTANCE / apply（installHeadsUpGlassHooks 解析后缓存，apply 热路径复用） */
-    private static volatile Object sHeadsUpDiagBlurInst = null;
-    private static volatile Method sHeadsUpDiagBlurApply = null;
-
-    /** 懒加载玻璃参数：优先 SystemUI 资源 0x7f0300ce string-array，失败回退硬编码 42 float */
-    private static synchronized float[] ensureHeadsUpGlassParams(android.content.res.Resources res) {
-        if (sHeadsUpGlassParams != null) return sHeadsUpGlassParams;
-        try {
-            String[] arr = res.getStringArray(HEADS_UP_GLASS_PARAMS_RES_ID);
-            if (arr != null && arr.length > 0) {
-                float[] f = new float[arr.length];
-                for (int i = 0; i < arr.length; i++) f[i] = Float.parseFloat(arr[i].trim());
-                sHeadsUpGlassParams = f;
-                LogUtil.logAlways("[悬浮玻璃] 已从资源 0x" + Integer.toHexString(HEADS_UP_GLASS_PARAMS_RES_ID)
-                        + " 加载玻璃参数 " + f.length + " 个（复刻 dex 同源）");
-                return sHeadsUpGlassParams;
-            }
-        } catch (Throwable t) {
-            LogUtil.logAlways("[悬浮玻璃] 资源参数加载失败（" + t.getClass().getSimpleName()
-                    + "），转硬编码兜底 42 float");
-        }
-        sHeadsUpGlassParams = HEADS_UP_GLASS_PARAMS;
-        return sHeadsUpGlassParams;
-    }
-
-    // ============================================================
-    // 悬浮玻璃白字（v3.3.6：Resources.getColor 按 id 拦截 6 个通知文字色）
-    // ============================================================
-    /**
-     * 用户方案：resources.arsc 中 6 个通知文字 color 改为 #e6ffffff，使玻璃半透明
-     * 背景上白字清晰。LibXposed API 102 无资源钩子，故 hook Resources.getColor(int)
-     * / getColor(int, Theme)：预解析 6 个 id 入数组，热路径仅 O(1) int 比较（零字符串）。
-     * 仅 com.android.systemui 进程安装（onPackageLoaded 已限制 pkg）。
-     */
-    private static volatile int[] sHeadsUpColorIds = null;
-    /** 白字 Resources hook 命中计数（前 5 次记日志，用于诊断） */
-    private static int sHeadsUpColorHitLogs = 0;
-
-    private void installHeadsUpTextColorHooks(ClassLoader cl) {
-        try {
-            if (cl == null) return;
-            // 1) getColor(int)
-            try {
-                final Method gc = android.content.res.Resources.class.getMethod("getColor", int.class);
-                hook(gc)
-                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                        .setId("heads-up-glass-text-color")
-                        .intercept(new XposedInterface.Hooker() {
-                            @Override
-                            public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                                if (!sHeadsUpGlassFlag.get()) return chain.proceed();
-                                Object self = chain.getThisObject();
-                                if (self instanceof android.content.res.Resources) {
-                                    ensureHeadsUpColorIds((android.content.res.Resources) self);
-                                    int id = (Integer) chain.getArg(0);
-                                    int[] ids = sHeadsUpColorIds;
-                                    if (ids != null) {
-                                        for (int known : ids) {
-                                            if (known == id) {
-                                                if (sHeadsUpColorHitLogs < 5) {
-                                                    sHeadsUpColorHitLogs++;
-                                                    LogUtil.logAlways("[悬浮玻璃白字] getColor 命中 id=0x"
-                                                            + Integer.toHexString(id));
-                                                }
-                                                return Constants.HEADS_UP_GLASS_TEXT_COLOR;
-                                            }
-                                        }
-                                    }
-                                }
-                                return chain.proceed();
-                            }
-                        });
-                LogUtil.logAlways("[悬浮玻璃白字] 已挂钩 Resources.getColor(int)");
-            } catch (Throwable t) {
-                LogUtil.logAlways("[悬浮玻璃白字] getColor(int) 挂钩失败: " + t);
-            }
-            // 2) getColor(int, Theme)（API 23+，新控件常用）
-            try {
-                final Method gct = android.content.res.Resources.class.getMethod("getColor",
-                        int.class, android.content.res.Resources.Theme.class);
-                hook(gct)
-                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                        .setId("heads-up-glass-text-color-theme")
-                        .intercept(new XposedInterface.Hooker() {
-                            @Override
-                            public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                                if (!sHeadsUpGlassFlag.get()) return chain.proceed();
-                                Object self = chain.getThisObject();
-                                if (self instanceof android.content.res.Resources) {
-                                    ensureHeadsUpColorIds((android.content.res.Resources) self);
-                                    int id = (Integer) chain.getArg(0);
-                                    int[] ids = sHeadsUpColorIds;
-                                    if (ids != null) {
-                                        for (int known : ids) {
-                                            if (known == id) {
-                                                if (sHeadsUpColorHitLogs < 5) {
-                                                    sHeadsUpColorHitLogs++;
-                                                    LogUtil.logAlways("[悬浮玻璃白字] getColor(int,Theme) 命中 id=0x"
-                                                            + Integer.toHexString(id));
-                                                }
-                                                return Constants.HEADS_UP_GLASS_TEXT_COLOR;
-                                            }
-                                        }
-                                    }
-                                }
-                                return chain.proceed();
-                            }
-                        });
-                LogUtil.logAlways("[悬浮玻璃白字] 已挂钩 Resources.getColor(int, Theme)");
-            } catch (Throwable t) {
-                LogUtil.logAlways("[悬浮玻璃白字] getColor(int, Theme) 挂钩失败: " + t);
-            }
-            // 3) getColorStateList(int)（HyperOS 通知文字/单色图标 tint 多走 CLS，仅改 6 文字 id 不染图标）
-            try {
-                final Method gcls = android.content.res.Resources.class.getMethod("getColorStateList", int.class);
-                hook(gcls)
-                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                        .setId("heads-up-glass-text-cls")
-                        .intercept(new XposedInterface.Hooker() {
-                            @Override
-                            public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                                if (!sHeadsUpGlassFlag.get()) return chain.proceed();
-                                Object self = chain.getThisObject();
-                                if (self instanceof android.content.res.Resources) {
-                                    ensureHeadsUpColorIds((android.content.res.Resources) self);
-                                    int id = (Integer) chain.getArg(0);
-                                    int[] ids = sHeadsUpColorIds;
-                                    if (ids != null) {
-                                        for (int known : ids) {
-                                            if (known == id) {
-                                                if (sHeadsUpColorHitLogs < 5) {
-                                                    sHeadsUpColorHitLogs++;
-                                                    LogUtil.logAlways("[悬浮玻璃白字] getColorStateList 命中 id=0x"
-                                                            + Integer.toHexString(id));
-                                                }
-                                                return android.content.res.ColorStateList.valueOf(Constants.HEADS_UP_GLASS_TEXT_COLOR);
-                                            }
-                                        }
-                                    }
-                                }
-                                return chain.proceed();
-                            }
-                        });
-                LogUtil.logAlways("[悬浮玻璃白字] 已挂钩 Resources.getColorStateList(int)");
-            } catch (Throwable t) {
-                LogUtil.logAlways("[悬浮玻璃白字] getColorStateList(int) 挂钩失败: " + t);
-            }
-            // 4) getColorStateList(int, Theme)
-            try {
-                final Method gclst = android.content.res.Resources.class.getMethod("getColorStateList",
-                        int.class, android.content.res.Resources.Theme.class);
-                hook(gclst)
-                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                        .setId("heads-up-glass-text-cls-theme")
-                        .intercept(new XposedInterface.Hooker() {
-                            @Override
-                            public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                                if (!sHeadsUpGlassFlag.get()) return chain.proceed();
-                                Object self = chain.getThisObject();
-                                if (self instanceof android.content.res.Resources) {
-                                    ensureHeadsUpColorIds((android.content.res.Resources) self);
-                                    int id = (Integer) chain.getArg(0);
-                                    int[] ids = sHeadsUpColorIds;
-                                    if (ids != null) {
-                                        for (int known : ids) {
-                                            if (known == id) {
-                                                if (sHeadsUpColorHitLogs < 5) {
-                                                    sHeadsUpColorHitLogs++;
-                                                    LogUtil.logAlways("[悬浮玻璃白字] getColorStateList(int,Theme) 命中 id=0x"
-                                                            + Integer.toHexString(id));
-                                                }
-                                                return android.content.res.ColorStateList.valueOf(Constants.HEADS_UP_GLASS_TEXT_COLOR);
-                                            }
-                                        }
-                                    }
-                                }
-                                return chain.proceed();
-                            }
-                        });
-                LogUtil.logAlways("[悬浮玻璃白字] 已挂钩 Resources.getColorStateList(int, Theme)");
-            } catch (Throwable t) {
-                LogUtil.logAlways("[悬浮玻璃白字] getColorStateList(int, Theme) 挂钩失败: " + t);
-            }
-        } catch (Throwable t) {
-            LogUtil.logAlways("[悬浮玻璃白字] 挂钩失败: " + t);
-        }
-    }
-
-    /** 预解析通知 color 资源 id（仅一次，运行时 getIdentifier 防 ROM 差异） */
-    private static synchronized void ensureHeadsUpColorIds(android.content.res.Resources res) {
-        if (sHeadsUpColorIds != null) return;
-        try {
-            java.util.Set<Integer> set = new java.util.HashSet<Integer>();
-            for (String name : Constants.HEADS_UP_GLASS_COLOR_NAMES) {
-                int id = res.getIdentifier(name, "color", Constants.TARGET_PKG);
-                if (id != 0) set.add(id);
-            }
-            int[] arr = new int[set.size()];
-            int i = 0;
-            for (int v : set) arr[i++] = v;
-            sHeadsUpColorIds = arr;
-            LogUtil.logAlways("[悬浮玻璃白字] 已解析 " + Constants.HEADS_UP_GLASS_COLOR_NAMES.length
-                    + " 个 color 资源 id（命中 " + arr.length + " 个）: "
-                    + java.util.Arrays.toString(arr));
-        } catch (Throwable t) {
-            sHeadsUpColorIds = new int[0]; // 避免反复重试
-            LogUtil.logAlways("[悬浮玻璃白字] 解析颜色 id 失败: " + t);
-        }
     }
 
     // ============================================================

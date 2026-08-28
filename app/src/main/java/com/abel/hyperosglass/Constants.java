@@ -39,7 +39,7 @@ public final class Constants {
     public static final String TARGET_PKG = "com.android.systemui";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.3.12";
+    public static final String VERSION = "3.3.5";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -160,64 +160,6 @@ public final class Constants {
     public static final String FOCUS_GLASS_PARAMS_RES = "focus_notification_glass_params_normal";
     /** 普通通知玻璃参数 array（0x7f0300ce，用户 smali 换用）；运行时 getIdentifier 解析 */
     public static final String NORMAL_GLASS_PARAMS_RES = "notification_glass_params_normal";
-
-    // ── 悬浮通知液态玻璃（v3.3.9：1:1 复刻用户「悬浮通知柔光玻璃.dex」的 apply 字节码）──
-    /**
-     * 悬浮（heads-up）通知玻璃：用户提供了「悬浮通知柔光玻璃.dex」，内部类即
-     * HeadsUpNotificationGlassDarkEffect（与系统同名）。dexdump 其 apply 字节码后，
-     * 本模块在 Java 侧 1:1 复刻（不运行时加载该 dex，规避 kotlin/classloader 依赖）：
-     *   1) NotificationRowBlurEffect.INSTANCE.apply(row, ctx)   // 行模糊（ROW_BLUR_CLASS）
-     *   2) 玻璃参数：Resources.getStringArray(0x7f0300ce) 逐元素 parseFloat（42 float，与 dex 同源）
-     *   3) MiGlassCompat.setMiGlassCompat(bg, params) + setMiViewMaterialTypeCompat(1, bg)
-     *      （bg = row.getInjector().getBackgroundNormal()）
-     * hook 覆盖 5 个 heads-up effect 的 apply(Object, Context) 桥（selector 泛型擦除永远走此桥），
-     * 全部重定向到玻璃；仅影响悬浮通知，不波及下拉栏（后者走 notification_row_* 系列）。
-     * 白字由 installHeadsUpTextColorHooks 单独处理（仅 6 个文字 color，不染图标）。
-     */
-    public static final String HEADS_UP_BLUR_CLASS =
-            "com.android.systemui.statusbar.notification.style.vieweffect.HeadsUpNotificationBlurEffect";
-    public static final String HEADS_UP_GLASS_CLASS =
-            "com.android.systemui.statusbar.notification.style.vieweffect.HeadsUpNotificationGlassEffect";
-    public static final String HEADS_UP_GLASS_DARK_CLASS =
-            "com.android.systemui.statusbar.notification.style.vieweffect.HeadsUpNotificationGlassDarkEffect";
-    public static final String HEADS_UP_NORMAL_CLASS =
-            "com.android.systemui.statusbar.notification.style.vieweffect.HeadsUpNotificationNormalEffect";
-    public static final String HEADS_UP_NORMAL_TRANSPARENT_CLASS =
-            "com.android.systemui.statusbar.notification.style.vieweffect.HeadsUpNotificationNormalTransparentEffect";
-
-    /** 悬浮通知玻璃启用开关（默认开） */
-    public static final String PREFS_HEADS_UP_GLASS = "heads_up_glass";
-    public static final boolean DEFAULT_HEADS_UP_GLASS = true;
-
-    /**
-     * 玻璃上白字：通知文字/图标颜色强制改为 #e6ffffff（约 90% 白），保证玻璃半透明
-     * 背景上内容清晰。胶囊背景在深色玻璃上改为 25% 白色（0x40ffffff），替代原来
-     * 全局白透方案，避免影响下拉通知。
-     */
-    public static final int HEADS_UP_GLASS_TEXT_COLOR = 0xE6FFFFFF;
-    public static final int HEADS_UP_GLASS_ICON_COLOR = 0xFFFFFFFF;
-
-    /**
-     * 悬浮通知期间需要改白的 color 资源名（Resources hook + View 级染色兜底）。
-     * 除用户指定的 6 个文字色外，新增状态/图标相关资源，确保铃铛、展开箭头
-     * 在深色玻璃上可见。
-     * 注意：展开胶囊背景（notification_expand_button_pill_color）不在此列表——
-     * 用户要求保留系统原色，不强制改白（v3.3.12 起移除）。
-     */
-    public static final String[] HEADS_UP_GLASS_COLOR_NAMES = {
-            "notification_action_text_color",
-            "notification_time_color",
-            "optimized_heads_up_notification_text",
-            "notification_primary_text_color_light",
-            "notification_secondary_text_color_light",
-            "optimized_heads_up_notification_action_text",
-            // 状态/图标色（ColorStateList，需 getColorStateList hook）
-            "notification_state_color_default",
-            "notification_state_color_light",
-            "notification_state_color_dark",
-            // 图标背景（保持系统原色）
-            "notification_icon_bg_color",
-    };
 
     /** 遗留升级迁移：v2.1.8 及更早用 fod_mode(int 三态)，v2.1.9 起改用 sink_enabled(bool) */
     public static final String PREFS_FOD_MODE_LEGACY = "fod_mode";
