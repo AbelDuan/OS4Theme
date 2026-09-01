@@ -1,12 +1,15 @@
 package com.abel.hyperosglass;
 
 import android.content.SharedPreferences;
+import android.provider.Settings;
 import android.view.View;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.WeakHashMap;
 
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
@@ -54,8 +57,17 @@ import io.github.libxposed.api.XposedModuleInterface;
  */
 public class MainHook extends XposedModule {
 
-    /** 已挂钩的 ThemeUtils 类（避免重复挂钩） */
-    private static final Set<String> glassHooked = new HashSet<String>();
+    /** 已挂钩的 ThemeUtils 类对象（v3.3.6：按 Class 身份去重，不再按类名）
+     *  ThemeUtils 在宿主与 MIUISystemUIPlugin 插件中各有独立 ClassLoader 副本，
+     *  旧版用「类名字符串」去重 → 首个副本挂钩后，其余副本被误判为已挂钩而直接
+     *  return 跳过；控制中心所在的插件副本因此从未挂钩 → 液态玻璃丢失。
+     *  这是 v3.3.5 丢玻璃的真实根因（此前误判为 ART 内联）。
+     *  改按 Class 对象身份去重后每个副本各自挂钩；弱引用避免持有 loader 造成泄漏。 */
+    private static final Set<Class<?>> glassHooked =
+            Collections.newSetFromMap(new WeakHashMap<Class<?>, Boolean>());
+    /** 已挂钩的 MiBlurCompat 类对象（v3.3.9：线 A 总闸门，仅液态模式强制 true）。多 ClassLoader 副本同样需 Class 身份去重。 */
+    private static final Set<Class<?>> miBlurCompatHooked =
+            Collections.newSetFromMap(new WeakHashMap<Class<?>, Boolean>());
     /** 已挂钩的通知下沉目标类（每个类独立去重） */
     private static final Set<String> sinkHooked = new HashSet<String>();
 
@@ -85,12 +97,18 @@ public class MainHook extends XposedModule {
             private static int sFlow2Logs = 0;
             /** 玻璃 setter 强制 true 计数（前 3 次记日志，证明字段被强制置 true） */
             private static int sGlassSetLogs = 0;
+            /** 记录 updateDefault* 跳过的日志条数（最多 3 条） */
+            private static int sGlassUpdLogs = 0;
+            /** 记录字段置 true 的日志条数（最多 4 条） */
+            private static int sPokeLogs = 0;
     /** 插件 classloader 补挂计数（前 3 次记日志） */
     private static int sPluginClLogs = 0;
     /** 媒体岛防御命中计数（前 3 次记日志） */
     private static int sIslandDefLogs = 0;
     /** 展开按钮药丸命中计数（前 3 次记日志） */
     private static int sExpandFixLogs = 0;
+    /** v3.3.9：MiBlurCompat 总闸门挂钩命中计数（前 3 次记日志） */
+    private static int sMiBlurLogs = 0;
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
@@ -167,6 +185,8 @@ public class MainHook extends XposedModule {
                     Constants.DEFAULT_ENABLE_LOG);
             sSinkEnabled = newSink;
             sGlassEnabled = newGlass;
+            // v3.3.7：开关为「开」时补写字段（含用户关→开的场景，见方法注释）
+            if (newGlass) reassertAllThemeUtilsFields();
             sHideLockFod = newHideLockFod;
             sHideLockFodFlag.set(newHideLockFod);
             sHideDismissBtn = newHideDismiss;
@@ -243,6 +263,8 @@ public class MainHook extends XposedModule {
                     Constants.DEFAULT_ENABLE_LOG);
             sSinkEnabled = sink;
             sGlassEnabled = glass;
+            // v3.3.7：真实值同步后同样补写一次（此时插件副本通常已挂钩）
+            if (glass) reassertAllThemeUtilsFields();
             sHideLockFod = fod;
             sHideLockFodFlag.set(fod);
             sHideDismissBtn = dismiss;
@@ -286,6 +308,7 @@ public class MainHook extends XposedModule {
             if (cl == null) return;
             // 1) 先直接试宿主 loader（少数版本插件类可能并入宿主 dex）
             tryHookThemeUtilsIn(cl);
+            tryHookMiBlurCompatIn(cl);
             // 2) hook 插件工厂 createClassLoader：插件加载时拿到 loader 补挂
             final Class<?> factory =
                     Class.forName(Constants.PLUGIN_FACTORY_CLASS, false, cl);
@@ -301,11 +324,13 @@ public class MainHook extends XposedModule {
                             Object loader = chain.proceed(); // 插件 ClassLoader（新建或缓存）
                             if (loader instanceof ClassLoader) {
                                 tryHookThemeUtilsIn((ClassLoader) loader);
+                                // v3.3.9：补挂 MiBlurCompat（线 A 总闸门，仅液态模式强制 true）。
+                                tryHookMiBlurCompatIn((ClassLoader) loader);
                             }
                             return loader;
                         }
                     });
-            LogUtil.logAlways("[玻璃] 已挂钩 PluginFactory.createClassLoader（插件加载时补挂 ThemeUtils）");
+            LogUtil.logAlways("[玻璃] 已挂钩 PluginFactory.createClassLoader（插件加载时补挂 ThemeUtils + MiBlurCompat + MiuiDefaultThemeControllerImpl）");
         } catch (Throwable t) {
             LogUtil.logAlways("[玻璃] 插件工厂挂钩失败: " + t);
         }
@@ -317,11 +342,17 @@ public class MainHook extends XposedModule {
     private void tryHookThemeUtilsIn(ClassLoader loader) {
         try {
             if (loader == null) return;
-            Class<?> c = Class.forName(Constants.TARGET_CLASS, false, loader);
+            final Class<?> c = Class.forName(Constants.TARGET_CLASS, false, loader);
             if (c == null) return;
             synchronized (glassHooked) {
-                if (glassHooked.contains(Constants.TARGET_CLASS)) return;
-                glassHooked.add(Constants.TARGET_CLASS);
+                if (glassHooked.contains(c)) {
+                    if (sPluginClLogs < 8) {
+                        sPluginClLogs++;
+                        LogUtil.logAlways("[玻璃] ThemeUtils 副本已挂钩，跳过: " + loader);
+                    }
+                    return;
+                }
+                glassHooked.add(c);
             }
             if (sPluginClLogs < 3) {
                 sPluginClLogs++;
@@ -381,8 +412,114 @@ public class MainHook extends XposedModule {
                     LogUtil.logAlways("[玻璃] ThemeUtils." + name + " 挂钩失败: " + t);
                 }
             }
+            // v3.3.6：钩 updateDefault*Theme() —— 从源头阻断 false 写入。
+            // 这类方法是 setDefault*(false) 的唯一来源（字节码实证 5af870/5af83c：
+            //   setDefault*Theme(!new File("/data/system/theme/<pkg>").exists())，
+            //   文件存在 → false → 玻璃关）。第三方主题一应用即生成该文件。
+            // 这两个 ()V 方法体积较大（17 code units）不会被 ART 内联，挂钩可靠性
+            // 高于 getter/setter；玻璃开启时直接跳过整个方法体，字段保持 true。
+            for (String name : Constants.TARGET_UPDATE_METHODS) {
+                try {
+                    Method m = findVoidNoArgMethod(c, name);
+                    if (m == null) {
+                        LogUtil.logAlways("[玻璃] ThemeUtils." + name + " 未找到（跳过）");
+                        continue;
+                    }
+                    hook(m)
+                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .setId("glass_upd_" + name)
+                            .intercept(new XposedInterface.Hooker() {
+                                @Override
+                                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                                    if (sGlassEnabled) {
+                                        if (sGlassUpdLogs < 3) {
+                                            sGlassUpdLogs++;
+                                            LogUtil.logAlways("[玻璃] " + name
+                                                    + " 已跳过（第三方主题不得把默认主题置 false）");
+                                        }
+                                        // 跳过原方法体 → setter 不再被调用 → 字段不会
+                                        // 被写成 true，必须自己写（防御 ART 内联副本）。
+                                        pokeDefaultThemeFieldsTrue(c);
+                                        return null; // ()V
+                                    }
+                                    return chain.proceed();
+                                }
+                            });
+                    LogUtil.logAlways("[玻璃] 已挂钩 ThemeUtils." + name + "（玻璃开启时跳过）");
+                } catch (Throwable t) {
+                    LogUtil.logAlways("[玻璃] ThemeUtils." + name + " 挂钩失败: " + t);
+                }
+            }
+            // v3.3.7：挂钩成功后立刻把两个默认主题字段置 true。
+            // getter 仅 3 code units 会被 ART 内联，内联副本直接 sget 字段、不过 hook；
+            // 而 v3.3.6 跳过 updateDefault* 后 setter 不再触发，字段会停在 <clinit>
+            // 初值（原厂为 false，样本 APK 里的 true 是 Magisk 补丁追加的）。
+            // 这里主动写一次，使「字段 true」与「getter 强制 true」双保险。
+            if (sGlassEnabled) pokeDefaultThemeFieldsTrue(c);
         } catch (Throwable t) {
             // 类不在本 loader（正常：插件 loader 尚未就绪），静默等待 createClassLoader 回调
+        }
+    }
+
+    /** v3.3.9：钩 MiBlurCompat.getBackgroundMaterialOpenedInDefaultTheme（线 A 总闸门）。
+     *  静态方法 (Context)Z，PUBLIC STATIC FINAL，46 code units 不会被 ART 内联。
+     *  仅当系统当前 material_style == 1（Bionics / 液态玻璃）时才强制 true，避免关闭/磨砂
+     *  模式下被强制玻璃导致磁贴形状/背景错乱。其余模式调用原逻辑，保留系统材质判据。
+     *  按 Class 对象身份去重（同 ThemeUtils 的多 ClassLoader 副本陷阱）。 */
+    private void tryHookMiBlurCompatIn(ClassLoader loader) {
+        try {
+            if (loader == null) return;
+            final Class<?> c = Class.forName(Constants.TARGET_MI_BLUR_COMPAT_CLASS, false, loader);
+            if (c == null) return;
+            synchronized (miBlurCompatHooked) {
+                if (miBlurCompatHooked.contains(c)) return;
+                miBlurCompatHooked.add(c);
+            }
+            LogUtil.logAlways("[玻璃] 已从插件 loader 拿到 MiBlurCompat: " + loader);
+            for (String name : Constants.TARGET_MI_BLUR_COMPAT_METHODS) {
+                try {
+                    // 找 PUBLIC STATIC + (Context)Z + 返回 boolean 的方法
+                    Method m = findStaticBooleanMethodWithContextParam(c, name);
+                    if (m == null) {
+                        LogUtil.logAlways("[玻璃] MiBlurCompat." + name + " 未找到（跳过）");
+                        continue;
+                    }
+                    hook(m)
+                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .setId("glass_miblur_" + name)
+                            .intercept(new XposedInterface.Hooker() {
+                                @Override
+                                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                                    if (sGlassEnabled) {
+                                        try {
+                                            Object arg0 = chain.getArg(0);
+                                            if (arg0 instanceof android.content.Context) {
+                                                int style = Settings.Secure.getInt(
+                                                        ((android.content.Context) arg0).getContentResolver(),
+                                                        "material_style", 0);
+                                                if (style == 1) {
+                                                    if (sMiBlurLogs < 3) {
+                                                        sMiBlurLogs++;
+                                                        LogUtil.logAlways("[玻璃] MiBlurCompat." + name
+                                                                + " 液态模式强制 true（第三方主题不得关玻璃）");
+                                                    }
+                                                    return Boolean.TRUE;
+                                                }
+                                            }
+                                        } catch (Throwable ignored) {
+                                            // 读设置失败时回退到原逻辑
+                                        }
+                                    }
+                                    return chain.proceed();
+                                }
+                            });
+                    LogUtil.logAlways("[玻璃] 已挂钩 MiBlurCompat." + name + "（仅液态模式强制 true）");
+                } catch (Throwable t) {
+                    LogUtil.logAlways("[玻璃] MiBlurCompat." + name + " 挂钩失败: " + t);
+                }
+            }
+        } catch (Throwable t) {
+            // 类不在本 loader（正常），静默等待 createClassLoader 回调
         }
     }
 
@@ -415,6 +552,85 @@ public class MainHook extends XposedModule {
             cur = cur.getSuperclass();
         }
         return null;
+    }
+
+    /** 遍历类及父类找 ()V 无参方法（v3.3.6 updateDefault*Theme 钩子用） */
+    private static Method findVoidNoArgMethod(Class<?> c, String name) {
+        Class<?> cur = c;
+        while (cur != null && cur != Object.class) {
+            for (Method m : cur.getDeclaredMethods()) {
+                if (m.getName().equals(name)
+                        && m.getParameterCount() == 0
+                        && m.getReturnType() == void.class) {
+                    return m;
+                }
+            }
+            cur = cur.getSuperclass();
+        }
+        return null;
+    }
+
+    /** v3.3.8：找 PUBLIC STATIC + (android.content.Context)Z + 返回 boolean 的方法
+     *  （用于 MiBlurCompat.getBackgroundMaterialOpenedInDefaultTheme）。
+     *  遍历类+父类 + declared，覆盖 static 私有或 protected 情形。 */
+    private static Method findStaticBooleanMethodWithContextParam(Class<?> c, String name) {
+        Class<?> cur = c;
+        while (cur != null && cur != Object.class) {
+            for (Method m : cur.getDeclaredMethods()) {
+                if (m.getName().equals(name)
+                        && java.lang.reflect.Modifier.isStatic(m.getModifiers())
+                        && m.getParameterCount() == 1
+                        && m.getParameterTypes()[0] == android.content.Context.class
+                        && m.getReturnType() == boolean.class) {
+                    return m;
+                }
+            }
+            cur = cur.getSuperclass();
+        }
+        return null;
+    }
+
+    /** v3.3.7：把 ThemeUtils 的两个默认主题静态字段直接写成 true。
+     *  幂等：已是 true 则跳过（setter 也有 if-eq 短路，重复写无害且不打日志）。
+     *  目的：覆盖「getter 被 ART 内联 → 调用方直接读字段」的那条路径。
+     *  注意：反射读写 static 字段会触发该类 <clinit>；ThemeUtils.<clinit> 仅做
+     *  new-instance + 反射取 MiuiResources.mPackage，无副作用，安全。 */
+    private static void pokeDefaultThemeFieldsTrue(Class<?> c) {
+        for (String fn : Constants.TARGET_THEME_FIELDS) {
+            try {
+                Field f = c.getDeclaredField(fn);
+                if (f.getType() != boolean.class) continue;
+                f.setAccessible(true);
+                if (f.getBoolean(null)) continue; // 已是 true，不打扰
+                f.setBoolean(null, true);
+                if (sPokeLogs < 4) {
+                    sPokeLogs++;
+                    LogUtil.logAlways("[玻璃] 字段 " + fn + " 已置 true（防御 ART 内联副本）");
+                }
+            } catch (Throwable t) {
+                if (sPokeLogs < 4) {
+                    sPokeLogs++;
+                    LogUtil.logAlways("[玻璃] 字段 " + fn + " 置 true 失败: " + t);
+                }
+            }
+        }
+    }
+
+    /** v3.3.7：把所有已挂钩副本的默认主题字段重 poke 为 true。
+     *  场景：用户关闭玻璃开关期间，updateDefault* 钩子放行 → 系统走原逻辑把字段
+     *  写成 false；重新打开开关时不会自动触发 updateDefault*，字段会一直停在
+     *  false，ART 内联副本读到 false → 玻璃不回来。开关翻「开」时主动补写。
+     *  幂等且廉价：字段已是 true 时直接跳过（setter 的 if-eq 同理会短路）。 */
+    private void reassertAllThemeUtilsFields() {
+        if (!sGlassEnabled) return;
+        synchronized (glassHooked) {
+            for (Class<?> c : glassHooked) {
+                try {
+                    pokeDefaultThemeFieldsTrue(c);
+                } catch (Throwable ignored) {
+                }
+            }
+        }
     }
 
     // ============================================================
@@ -618,42 +834,24 @@ public class MainHook extends XposedModule {
     private static final Set<String> sNonExpandClasses =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
 
-    /** 快速类名判断：类名含展开按钮特征（v1.6.2 语义） */
-    private static boolean isExpandClass(String cls) {
-        if (cls == null) return false;
-        String cn = cls.toLowerCase();
-        return cn.contains("expandbutton") || cn.contains("expandicon")
-                || cn.contains("chevron") || cn.contains("arrowbutton");
-    }
-
-    /** id 名判断：含展开特征；volume_ 开头（音量面板）绝不命中（v2.1.1 教训） */
-    private static boolean isExpandIdName(String idName) {
-        if (idName == null) return false;
-        String n = idName.toLowerCase();
-        if (n.startsWith("volume_")) return false;
-        return n.contains("expand_button") || n.contains("expandbutton")
-                || n.contains("chevron") || n.contains("expand_arrow");
-    }
-
-    /** v1.6.2 核心：判断 View 是否「展开按钮」。
-     *  性能优化（v3.0.9）：本方法在每次 View.setBackground / setBackgroundTintList
-     *  时都会被调用（全局 hook），必须极快。顺序：先查两个 O(1) 缓存 Set
-     *  （已确认展开类 / 已确认无关类，绝大多数 View 在此返回），字符串分析
-     *  （toLowerCase + contains）仅在每类**首次**遇到时执行一次，结果入缓存。 */
+    /** v3.3.6：判断 View 是否「通知栏展开按钮」。
+     *  旧版用关键词宽泛匹配（expandbutton / expandicon / chevron / arrowbutton），
+     *  会误命中控制中心的 chevron 箭头等图标 → 背景被替换成白透药丸 → 出现
+     *  「方底 / 圆底混杂、颜色不一致」（快速切换材质时控制中心重建即触发）。
+     *  改为「类名 + id 名」双条件精确匹配，实测命中
+     *  com.android.internal.widget.NotificationOptimizedLinearLayout + expand_button_pill。
+     *  性能：本方法在每次 View.setBackground 时被调用（全局 hook），先查两个 O(1)
+     *  缓存 Set（已确认展开类 / 已确认无关类），字符串分析每类仅首次执行。 */
     private static boolean isExpandView(View v) {
         try {
             String cls = v.getClass().getName();
             // 快路径 O(1)：两类缓存 Set 优先（已确认的类不再做字符串分析）
             if (sConfirmedViewClass.contains(cls)) return true;
             if (sNonExpandClasses.contains(cls)) return false;
-            // 慢路径（每类仅首次）：类名关键词
-            if (isExpandClass(cls)) {
-                sConfirmedViewClass.add(cls);
-                return true;
-            }
-            // 类名不含特征：查 id 资源名兜底（展开按钮类名常无特征）
-            String idName = viewIdName(v);
-            if (isExpandIdName(idName)) {
+            // 慢路径（每类仅首次）：类名 + id 名双条件精确匹配
+            boolean hit = Constants.EXPAND_BUTTON_VIEW_CLASS.equals(cls)
+                    && Constants.EXPAND_BUTTON_PILL_ID_NAME.equals(viewIdName(v));
+            if (hit) {
                 sConfirmedViewClass.add(cls);
                 return true;
             }

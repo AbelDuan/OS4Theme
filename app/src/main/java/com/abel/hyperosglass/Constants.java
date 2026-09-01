@@ -39,7 +39,7 @@ public final class Constants {
     public static final String TARGET_PKG = "com.android.systemui";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.3.5";
+    public static final String VERSION = "3.3.9";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -59,19 +59,79 @@ public final class Constants {
     };
 
     /**
-     * 玻璃真正落地的「字段写入」方法（v3.3.5 修复）：
-     *   dexdump 实证（miui.systemui.plugin 18.2.2.2.0）：
-     *   - getDefaultSysUiTheme() 已恒返回 true（旧 getter 钩子等于 no-op）；
-     *   - updateDefaultSysUiTheme() 调 setDefaultSysUiTheme(file.exists())，
-     *     file = /data/system/theme/com.android.systemui；该文件不存在 →
-     *     setDefaultSysUiTheme(false) → 字段 defaultSysUiTheme=false → 玻璃关。
-     *     （日志 "updating sysui theme to false" 即此方法）
-     *   - 玻璃开关的真正闸门是字段 defaultSysUiTheme/defaultPluginTheme，由 setter 写入。
-     *     v3.3.5：改钩 setter，玻璃开启时强制入参 true → 字段恒 true → 保留玻璃。
+     * 玻璃真正落地的「字段写入」方法（v3.3.5 引入，v3.3.7 修正注释）。
+     *   dexdump 实证（miui.systemui.plugin）：
+     *   - 字段名 defaultSysUiTheme / defaultPluginTheme（static boolean，非 final）；
+     *   - setter @5af5bc / @5af570（29 code units）开头即短路：
+     *       sget-boolean v1, 字段
+     *       if-eq v2, v1, →return      ← 新值==旧值：不写、不打日志
+     *       Log.i("ThemeUtils", "updating sysui theme to " + v2)
+     *       sput-boolean v2, 字段
+     *     故「字段已为 true 时再 setDefault*(true)」是无害空转，可放心重复调用。
+     *   - 玻璃开启时强制入参 true → 字段恒 true。
+     *   ⚠️ v3.3.5 原注释称「getter 已恒返回 true，旧 getter 钩子等于 no-op」——
+     *      错误，getter 仍读字段；另称「文件不存在 → setDefault(false)」也写反了，
+     *      真实逻辑是 !exists()（见 TARGET_UPDATE_METHODS）。均已由字节码证伪。
      */
     public static final String[] TARGET_SETTER_METHODS = {
             "setDefaultSysUiTheme",
             "setDefaultPluginTheme",
+    };
+
+    /**
+     * 默认主题的两个静态字段（v3.3.7）。
+     *   为什么需要直接改字段（而不只靠 getter 钩子）——
+     *   1) 全量核对：classes.dex / classes2.dex / classes3.dex 三个 dex 中，
+     *      除 setter 自身的 if-eq 相等判断外 **无任何 sget 直读**，消费全部走 getter；
+     *   2) 但 getter 本体仅 3 code units，会被 ART **内联进调用方**，内联副本
+     *      直接读字段、不经过 hook → getter 钩子拦不住内联副本；
+     *   3) v3.3.6 起跳过 updateDefault*() 后 setter 不再被调用，字段退回 <clinit>
+     *      初值；而样本 APK 里 <clinit> 那两条 sput-boolean true 是 Magisk 补丁
+     *      **追加**的，原厂 <clinit> 无此赋值 → 字段初值为 false。
+     *   故挂钩后必须主动把字段写成 true，不依赖 <clinit> 初值，也不依赖
+     *   updateDefault*() 是否被调用过。
+     */
+    public static final String[] TARGET_THEME_FIELDS = {
+            "defaultSysUiTheme",
+            "defaultPluginTheme",
+    };
+
+    /**
+     * v3.3.6：默认主题字段的「写入来源」方法（玻璃开启时跳过，从源头阻断 false）。
+     *   dexdump 字节码实证（updateDefaultSysUiTheme @5af870 / updateDefaultPluginTheme @5af83c）：
+     *     new-instance File, "/data/system/theme/com.android.systemui"
+     *     invoke-virtual File.exists()Z
+     *     xor-int/lit8 v0, v0, #1                      ← 取反
+     *     invoke-direct setDefaultSysUiTheme(v0)
+     *   即 setDefaultSysUiTheme(!exists())：**文件存在 → false → 玻璃关**。
+     *   第三方主题一应用就会在 /data/system/theme/ 下生成这两个文件 → 玻璃被关。
+     *   （注：v3.3.5 注释写成「文件不存在 → setDefaultSysUiTheme(false)」，逻辑写反了，
+     *    已由字节码证伪，勿再引用。）
+     *   这两个方法是 PUBLIC FINAL ()V、体积 17 code units，不会被 ART 内联，
+     *   挂钩可靠性高于 getter（getter 会被内联副本绕过）。
+     */
+    public static final String[] TARGET_UPDATE_METHODS = {
+            "updateDefaultSysUiTheme",
+            "updateDefaultPluginTheme",
+    };
+
+    /**
+     * v3.3.9：线 A 总闸门「getBackgroundMaterialOpenedInDefaultTheme(Context) → boolean」
+     *   第三方主题下 ThemeUtils 两个 getter 全为 true 仍可能没玻璃——真正的总闸门在这里。
+     *   公式（dexdump @472029 实证，PUBLIC STATIC FINAL，46 code units）：
+     *     getBackgroundMaterialOpenedInDefaultTheme(ctx) =
+     *         MATERIAL_SUPPORTED                              ← miuix HyperMaterialUtils.isEnable()
+     *         && MiBlurCompat.getBlurCompat(config) == 1      ← 反射读 Configuration.blur
+     *         && ThemeUtils.getDefaultPluginTheme()
+     *         && ThemeUtils.getDefaultSysUiTheme()
+     *   v3.3.8 直接强制 true 覆盖整个 AND，导致"关闭/磨砂"模式也被强制玻璃、磁贴形状/背景错乱。
+     *   v3.3.9 改为仅当系统设置 material_style == 1（Bionics / 液态玻璃）时才强制 true，
+     *   其余模式调用原逻辑，避免破坏三模式切换。
+     *   该方法静态、体积 46 code units，不会被 ART 内联。
+     */
+    public static final String TARGET_MI_BLUR_COMPAT_CLASS = "miui.systemui.util.MiBlurCompat";
+    public static final String[] TARGET_MI_BLUR_COMPAT_METHODS = {
+            "getBackgroundMaterialOpenedInDefaultTheme",
     };
 
     // ── 插件 classloader 获取（v3.0 液态玻璃修复的关键）──
