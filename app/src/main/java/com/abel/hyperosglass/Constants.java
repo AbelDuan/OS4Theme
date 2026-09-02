@@ -32,7 +32,7 @@ public final class Constants {
     public static final String TARGET_PKG = "com.android.systemui";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.3.11";
+    public static final String VERSION = "3.3.12";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -190,6 +190,27 @@ public final class Constants {
      *  的 blur（NotificationRowBlurEffect）与玻璃参数（notification_glass_params_normal） */
     public static final String PREFS_FOCUS_GLASS = "focus_glass";
     public static final boolean DEFAULT_FOCUS_GLASS = true;
+
+    /** 悬浮通知液态玻璃（v3.3.12，默认启用）：悬浮通知（heads-up）渲染玻璃时
+     *  用普通通知的液态玻璃配方（notification_glass_params_normal）替换系统给
+     *  悬浮通知的专属玻璃参数数组（alpha 更高更透、反射偏移不同）——消除
+     *  「弹出→展开」观感跳变，悬浮通知与列表通知同一液态玻璃。
+     *  跟随系统玻璃材质开关：仅当 material_style != -1（玻璃材质开启，实际
+     *  只在 ==1 液态档系统才会调玻璃管线）时替换；关闭/磨砂档由系统自行渲染，
+     *  模块不干预（v3.3.8「三模式全坏」教训）。参照 lyugo0306/hyperos4-glass-blur
+     *  的 isHeadsUpArray 识别法（特征值比对，非栈名判定）。 */
+    public static final String PREFS_HUN_GLASS = "hun_glass";
+    public static final boolean DEFAULT_HUN_GLASS = true;
+
+    /** HUN 专属玻璃参数数组的特征（hyperos4-glass-blur dexdump 实证）：
+     *  [14] alpha ≈ 1.5（列表配方 0.1，HUN 明显更透）
+     *  [22] 反射偏移 offset ≈ 600（列表配方 800） */
+    public static final int HUN_GLASS_ALPHA_INDEX = 14;
+    public static final float HUN_GLASS_ALPHA = 1.5f;
+    public static final int HUN_GLASS_REFLECT_INDEX = 22;
+    public static final float HUN_GLASS_REFLECT = 600.0f;
+    /** setMiGlass 参数数组最短长度（越界防御） */
+    public static final int HUN_GLASS_MIN_LEN = 36;
 
     // ── 通知清除按钮图标隐藏（v3.3.2：原位置不动，仅图标 INVISIBLE）──
     /** 按钮 View 的 id 资源名（aapt2 确认 0x7f0b0865；CircleAndTickAnimView） */

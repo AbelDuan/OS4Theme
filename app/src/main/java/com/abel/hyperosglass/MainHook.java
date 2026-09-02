@@ -78,6 +78,7 @@ public class MainHook extends XposedModule {
     private volatile boolean sHideLockFod = Constants.DEFAULT_HIDE_LOCK_FOD;
     private volatile boolean sHideDismissBtn = Constants.DEFAULT_HIDE_DISMISS_BTN;
     private volatile boolean sFocusGlass = Constants.DEFAULT_FOCUS_GLASS;
+    private volatile boolean sHunGlass = Constants.DEFAULT_HUN_GLASS;
     /** 隐藏锁屏指纹开关（AtomicBoolean，供热路径拦截器读取） */
     private static final java.util.concurrent.atomic.AtomicBoolean sHideLockFodFlag =
             new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HIDE_LOCK_FOD);
@@ -87,6 +88,9 @@ public class MainHook extends XposedModule {
     /** 液态玻璃焦点通知开关（AtomicBoolean） */
     private static final java.util.concurrent.atomic.AtomicBoolean sFocusGlassFlag =
             new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_FOCUS_GLASS);
+    /** 悬浮通知液态玻璃开关（v3.3.12，AtomicBoolean，供热路径 setMiGlass 拦截器读取） */
+    private static final java.util.concurrent.atomic.AtomicBoolean sHunGlassFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HUN_GLASS);
     // v3.3.11 日志精简：删除此处原有的 10 个「前 N 次记日志」计数器
     // （flow1/flow2/glassSet/glassUpd/poke/pluginCl/islandDef/expandFix/miBlur/hideFod/dismiss）。
     // 统一改用 LogUtil.logAlwaysOnce(key, msg)：常开、但每种事件全进程只记 1 条。
@@ -132,6 +136,7 @@ public class MainHook extends XposedModule {
             installLockFodHooks(cl);
             installHideDismissButtonHook(cl);
             installFocusGlassHooks(cl);
+            installHunGlassHooks(cl);
         } catch (Throwable t) {
             LogUtil.logAlways("onPackageLoaded 异常: " + t);
         }
@@ -163,6 +168,8 @@ public class MainHook extends XposedModule {
                     Constants.DEFAULT_HIDE_DISMISS_BTN);
             boolean newFocusGlass = sPrefs.getBoolean(Constants.PREFS_FOCUS_GLASS,
                     Constants.DEFAULT_FOCUS_GLASS);
+            boolean newHunGlass = sPrefs.getBoolean(Constants.PREFS_HUN_GLASS,
+                    Constants.DEFAULT_HUN_GLASS);
             boolean log = sPrefs.getBoolean(Constants.PREFS_ENABLE_LOG,
                     Constants.DEFAULT_ENABLE_LOG);
             sSinkEnabled = newSink;
@@ -175,10 +182,13 @@ public class MainHook extends XposedModule {
             sHideDismissFlag.set(newHideDismiss);
             sFocusGlass = newFocusGlass;
             sFocusGlassFlag.set(newFocusGlass);
+            sHunGlass = newHunGlass;
+            sHunGlassFlag.set(newHunGlass);
             LogUtil.setEnabled(log);
             LogUtil.logAlways("设置(框架)：sink=" + sSinkEnabled + "，glass=" + sGlassEnabled
                     + "，hideLockFod=" + sHideLockFod + "，hideDismiss=" + sHideDismissBtn
-                    + "，focusGlass=" + sFocusGlass + "，日志=" + log);
+                    + "，focusGlass=" + sFocusGlass + "，hunGlass=" + sHunGlass
+                    + "，日志=" + log);
         } catch (Throwable t) {
             LogUtil.logAlways("读取设置失败: " + t);
         }
@@ -241,6 +251,8 @@ public class MainHook extends XposedModule {
                     Constants.DEFAULT_HIDE_DISMISS_BTN);
             boolean focus = out.getBoolean(Constants.PREFS_FOCUS_GLASS,
                     Constants.DEFAULT_FOCUS_GLASS);
+            boolean hun = out.getBoolean(Constants.PREFS_HUN_GLASS,
+                    Constants.DEFAULT_HUN_GLASS);
             boolean log = out.getBoolean(Constants.PREFS_ENABLE_LOG,
                     Constants.DEFAULT_ENABLE_LOG);
             sSinkEnabled = sink;
@@ -253,10 +265,12 @@ public class MainHook extends XposedModule {
             sHideDismissFlag.set(dismiss);
             sFocusGlass = focus;
             sFocusGlassFlag.set(focus);
+            sHunGlass = hun;
+            sHunGlassFlag.set(hun);
             LogUtil.setEnabled(log);
             LogUtil.logAlways("设置(真实值同步)：sink=" + sink + "，glass=" + glass
                     + "，hideLockFod=" + fod + "，hideDismiss=" + dismiss
-                    + "，focusGlass=" + focus + "，日志=" + log);
+                    + "，focusGlass=" + focus + "，hunGlass=" + hun + "，日志=" + log);
         } catch (Throwable t) {
             LogUtil.logAlways("设置(真实值同步) 应用失败: " + t);
         }
@@ -1293,6 +1307,135 @@ public class MainHook extends XposedModule {
         } catch (Throwable ignored) {
         }
         return null;
+    }
+
+    // ============================================================
+    // 悬浮通知液态玻璃（v3.3.12，参照 lyugo0306/hyperos4-glass-blur）
+    // ============================================================
+    /**
+     * 悬浮通知（heads-up）在玻璃渲染管线里用【专属参数数组】
+     * （alpha[14]≈1.5 更透、反射偏移[22]≈600），点开/收起时切回列表配方 →
+     * 观感跳变。hook android.view.View.setMiGlass(float[])（MIUI 对 framework
+     * View 的公开 patch，通知行/控制中心玻璃参数都走这里），识别到悬浮通知
+     * 数组就替换成普通通知的液态玻璃配方（notification_glass_params_normal，
+     * 与列表同一观感）。
+     *
+     * 跟随系统玻璃材质开关：仅当 material_style != -1（玻璃材质开启；磨砂/关闭
+     * 档系统根本不会调玻璃渲染管线）时才替换，关闭档由系统自行渲染、模块不
+     * 干预——v3.3.8「无条件强制三模式全坏」教训的延续。
+     *
+     * 性能（常驻热路径纪律）：成本按升序排列——
+     *   1) volatile 开关读（无分配）
+     *   2) 参数数组类型/长度检查（无分配）
+     *   3) 4 次 float 特征比较（零分配；99.99% 的调用在此返回）
+     *   4) 栈前缀判定（仅特征命中后执行一次——悬浮通知弹出级别频率）
+     *   5) materialStyle() 2s TTL 缓存（非首次为纯内存读）
+     * 热路径不拼字符串、不写日志（命中后 hitOnce + 拼接只发生一次）。
+     */
+    private void installHunGlassHooks(ClassLoader cl) {
+        try {
+            // setMiGlass 是 MIUI 对 framework View 的公开方法 patch，
+            // 进程内共享的 View 类直接 getMethod 拿（与 cl 无关）。
+            final Method setMiGlass;
+            try {
+                setMiGlass = android.view.View.class.getMethod(
+                        "setMiGlass", float[].class);
+            } catch (NoSuchMethodException nsme) {
+                LogUtil.logAlways("[悬浮通知玻璃] View.setMiGlass 不存在（非 MIUI 或 ROM 未 patch），跳过");
+                return;
+            }
+            hook(setMiGlass)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("hun-glass-unify")
+                    .intercept(new XposedInterface.Hooker() {
+                        @Override
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            try {
+                                // 1) 开关（热路径第一步，无分配）
+                                if (!sHunGlassFlag.get()) return chain.proceed();
+                                // 2) 参数形态
+                                Object arg0 = chain.getArg(0);
+                                if (!(arg0 instanceof float[])) return chain.proceed();
+                                float[] p = (float[]) arg0;
+                                if (p.length < Constants.HUN_GLASS_MIN_LEN) return chain.proceed();
+                                // 3) 悬浮通知专属数组特征（alpha≈1.5 && 反射偏移≈600）
+                                if (!isHunGlassArray(p)) return chain.proceed();
+                                // 4) 栈前缀：仅通知路径（含 headsup 子包）才替换，
+                                //    排除控制中心等同样调 setMiGlass 的场景
+                                if (!isNotificationCall()) return chain.proceed();
+                                // 5) 跟随系统玻璃材质开关：关闭/磨砂档让位
+                                Object self = chain.getThisObject();
+                                if (!(self instanceof View)) return chain.proceed();
+                                android.content.Context ctx = ((View) self).getContext();
+                                if (ctx == null) return chain.proceed();
+                                if (materialStyle(ctx) == -1) return chain.proceed();
+                                // 6) 统一配方（资源解析一次后缓存）
+                                float[] norm = hunNormalParams(ctx);
+                                if (norm == null || norm == p) return chain.proceed();
+                                if (LogUtil.hitOnce("hun-glass-unify")) {
+                                    LogUtil.logAlways("[悬浮通知玻璃] HUN 专属玻璃数组 → 统一为列表液态玻璃配方（len="
+                                            + p.length + "，alpha " + p[Constants.HUN_GLASS_ALPHA_INDEX]
+                                            + "→" + norm[Constants.HUN_GLASS_ALPHA_INDEX] + "）");
+                                }
+                                return chain.proceed(new Object[]{norm});
+                            } catch (Throwable ignored) {
+                                // 任何异常都不破坏原调用
+                            }
+                            return chain.proceed();
+                        }
+                    });
+            LogUtil.logAlways("[悬浮通知玻璃] 已挂钩 View.setMiGlass（悬浮通知液态玻璃，跟随系统玻璃材质开关）");
+        } catch (Throwable t) {
+            LogUtil.logAlways("[悬浮通知玻璃] 挂钩失败: " + t);
+        }
+    }
+
+    /** 悬浮通知专属玻璃参数数组特征（hyperos4-glass-blur dexdump 实证）：
+     *  [14] alpha≈1.5（列表配方 0.1，HUN 更透）、[22] 反射偏移≈600（列表 800）。 */
+    private static boolean isHunGlassArray(float[] p) {
+        return Math.abs(p[Constants.HUN_GLASS_ALPHA_INDEX] - Constants.HUN_GLASS_ALPHA) < 0.01f
+                && Math.abs(p[Constants.HUN_GLASS_REFLECT_INDEX] - Constants.HUN_GLASS_REFLECT) < 0.01f;
+    }
+
+    /** 调用栈是否来自通知路径（含 headsup 子包）。仅特征命中后调用（悬浮通知弹出
+     *  级别频率），遍历栈的成本可忽略。 */
+    private static boolean isNotificationCall() {
+        StackTraceElement[] st = Thread.currentThread().getStackTrace();
+        for (StackTraceElement f : st) {
+            if (f.getClassName().startsWith("com.android.systemui.statusbar.notification.")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 悬浮通知统一配方缓存（普通通知液态玻璃参数 notification_glass_params_normal）。
+     *  与 fillFocusGlassParams 同一资源；独立缓存避免改其填充逻辑（聚焦类静态字段）。
+     *  首次成功解析后全局复用，不成功（资源名随 ROM 变化）则每次悬浮通知出现再试。 */
+    private static volatile float[] sHunNormalParams = null;
+
+    private static float[] hunNormalParams(android.content.Context ctx) {
+        float[] cached = sHunNormalParams;
+        if (cached != null) return cached;
+        try {
+            int rid = ctx.getResources().getIdentifier(
+                    Constants.NORMAL_GLASS_PARAMS_RES, "array", Constants.TARGET_PKG);
+            if (rid == 0) return null;
+            String[] ss = ctx.getResources().getStringArray(rid);
+            float[] fa = new float[ss.length];
+            for (int i = 0; i < ss.length; i++) {
+                try {
+                    fa[i] = Float.parseFloat(ss[i]);
+                } catch (Throwable ignored) {
+                    fa[i] = 0f;
+                }
+            }
+            if (fa.length < Constants.HUN_GLASS_MIN_LEN) return null;
+            sHunNormalParams = fa;
+            return fa;
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     // ============================================================

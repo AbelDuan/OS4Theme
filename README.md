@@ -2,7 +2,7 @@
 
 澎湃OS 4 / HyperOS 4 主题增强 **LSPosed 模块**。应用第三方主题后保留系统界面的「液态玻璃」模糊，并提供通知、锁屏等多项体验增强。
 
-- 当前版本：**v3.3.11**（`versionCode` 61）
+- 当前版本：**v3.3.12**（`versionCode` 62）
 - 包名：`com.abel.hyperosglass`
 - 框架：LibXposed API **102**（`minApiVersion=100`、`targetApiVersion=102`）
 
@@ -22,14 +22,15 @@
 
 1. **三方主题液态玻璃** — 核心功能。应用第三方主题后，强制保留状态栏 / 控制中心 / 通知面板的液态玻璃模糊效果。
 2. **焦点通知液态玻璃** — 焦点通知（如正在播放、通话）改用普通通知的玻璃模糊与玻璃参数，统一视觉。
-3. **通知下沉** — 关闭锁屏「指纹让位」额外 shelf 空间，通知铺满下沉，不再被指纹图标顶到上方。
-4. **锁屏指纹图标 / 动画隐藏** — 仅锁屏（解锁）场景生效；支付、应用内指纹完全不受影响。
-5. **通知清除按钮隐藏** — 隐藏通知面板的「清除通知」按钮（图标置不可见 + 容器移出屏外，不拦截触摸）。
+3. **悬浮通知液态玻璃** — 悬浮通知（heads-up）的玻璃参数统一为列表液态玻璃配方，消除「弹出 → 展开」观感跳变；**跟随系统玻璃材质开关**——玻璃材质开启时生效，关闭 / 磨砂档由系统自行渲染，模块不干预。
+4. **通知下沉** — 关闭锁屏「指纹让位」额外 shelf 空间，通知铺满下沉，不再被指纹图标顶到上方。
+5. **锁屏指纹图标 / 动画隐藏** — 仅锁屏（解锁）场景生效；支付、应用内指纹完全不受影响。
+6. **通知清除按钮隐藏** — 隐藏通知面板的「清除通知」按钮（图标置不可见 + 容器移出屏外，不拦截触摸）。
 
 ### 内置功能（无独立开关）
 
-6. **通知展开按钮白透** — 跟随「三方主题液态玻璃」开关。把展开按钮的染色替换为白透药丸 / 清 tint，避免第三方主题把按钮染成深色。
-7. **媒体岛崩溃防御** — 无开关，系统 bug 必要保护。捕获播放媒体时 `MiPalette` 加载库失败导致的 `UnsatisfiedLinkError`，避免 SystemUI 主线程崩溃循环（系统原版即崩，与模块功能无关）。
+7. **通知展开按钮白透** — 跟随「三方主题液态玻璃」开关。把展开按钮的染色替换为白透药丸 / 清 tint，避免第三方主题把按钮染成深色。
+8. **媒体岛崩溃防御** — 无开关，系统 bug 必要保护。捕获播放媒体时 `MiPalette` 加载库失败导致的 `UnsatisfiedLinkError`，避免 SystemUI 主线程崩溃循环（系统原版即崩，与模块功能无关）。
 
 ## 工作原理（简要）
 
@@ -42,6 +43,7 @@
 - 跳过 `updateDefault*Theme()`（从源头阻断 `false` 写入）；
 - 主动把两个静态字段写成 `true`（防御 ART 把 3-code-unit 的 getter **内联**进调用方、直接读字段而绕过 hook）；
 - **v3.3.9 追加**：hook `MiBlurCompat.getBackgroundMaterialOpenedInDefaultTheme`（玻璃总闸门），**仅当系统 `material_style == 1`（液态玻璃模式）时**强制返回 `true`，关闭 / 磨砂模式走原逻辑，避免磁贴形状与背景错乱。
+- **v3.3.12 悬浮通知液态玻璃**：悬浮通知（heads-up）在玻璃渲染管线中使用**专属参数数组**（alpha≈1.5 更透、反射偏移≈600），点开 / 收起切回列表配方会产生观感跳变。模块 hook `android.view.View.setMiGlass(float[])`（MIUI 对 framework View 的公开 patch），以特征值比对识别悬浮通知数组后统一替换为普通通知的液态玻璃配方（系统 `notification_glass_params_normal`，与列表同一观感）。**跟随系统玻璃材质开关**：仅 `material_style != -1` 时替换，关闭 / 磨砂档由系统自行渲染、模块不干预。热路径按「开关 → 数组特征 → 栈前缀 → 材质 TTL」顺序判定，99.99% 调用在两次零分配比较内返回（参照 lyugo0306/hyperos4-glass-blur 的 isHeadsUpArray 识别法）。
 - **v3.3.10 / v3.3.11 功耗纪律**：全模块无定时器 / 轮询 / 广播 / ContentObserver，待机开销≈0。热路径判定回调只读 volatile 布尔或 O(1) 缓存，绝不写日志；日志统一「once 语义」（同 key 全进程仅记 1 条，命中事件零字符串分配）+ Xposed 日志 300 行总量上限；`material_style` 读取带 2s TTL 缓存（原实现每次 Binder 到 SettingsProvider）。「重启系统界面」用 `killall com.android.systemui`（SIGTERM，失败自动 SIGKILL 兜底）替代 `am crash`——不产生 dropbox 崩溃记录、logcat 无崩溃栈，SystemUI 为 persistent 进程，死亡后由 AMS 立即拉起。
 
 **关键修复（v3.0）**：`ThemeUtils` 在插件独立 ClassLoader 中，宿主 `onPackageLoaded` 的 `Class.forName` 必然失败（v2.1.x 移除 loadClass 拦截后玻璃 hook 从未挂上）。改为 hook 宿主侧 `PluginInstance$PluginFactory.createClassLoader()`——宿主加载插件 APK 时创建 ClassLoader 的唯一入口，在其回调中拿到插件 ClassLoader 后补挂。多 ClassLoader 副本用 `WeakHashMap` 按 **Class 对象身份**去重（旧版按类名字符串去重会漏挂控制中心所在的插件副本）。
