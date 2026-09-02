@@ -1428,6 +1428,7 @@ public class MainHook extends XposedModule {
      * 可见性监听绝不会在锁屏触发；全部受 sAodBatterySyncFlag 门控，关闭即完全透传。
      */
     private void installAodBatteryHooks(ClassLoader cl) {
+        LogUtil.logAlways("[息屏电池] installAodBatteryHooks 调用, flag=" + sAodBatterySyncFlag.get());
         installAodCombineHook(cl);
         installAodBatteryModeHook(cl);
         installAodFullAodHook(cl);
@@ -1449,8 +1450,11 @@ public class MainHook extends XposedModule {
                         if (o instanceof Object[] arr && arr.length == Constants.AOD_ARR_LEN) {
                             boolean dozing = Boolean.TRUE.equals(arr[Constants.AOD_IDX_DOZING]);
                             sAodDozing = dozing;
+                            LogUtil.log("[息屏电池] combine dozing=" + dozing
+                                    + " fullAod=" + arr[Constants.AOD_IDX_FULL_AOD]);
                             if (dozing && !Boolean.TRUE.equals(arr[Constants.AOD_IDX_FULL_AOD])) {
                                 arr[Constants.AOD_IDX_FULL_AOD] = Boolean.TRUE;
+                                LogUtil.log("[息屏电池] combine 强制 fullAod=true（AOD 状态栏可见）");
                             }
                         }
                         return chain.proceed();
@@ -1476,12 +1480,14 @@ public class MainHook extends XposedModule {
                         if (z) {
                             // 进入 AOD：早期可靠信号，并强制系统样式
                             sAodDozing = true;
+                            LogUtil.log("[息屏电池] 进入AOD: toggleAodMode(true)→强制false（系统状态栏样式）");
                             Object[] args = chain.getArgs().toArray();
                             args[0] = Boolean.FALSE;
                             return chain.proceed(args);
                         }
                         // 退出 AOD（锁屏/亮屏）：复位 sDozing，否则锁屏状态栏会被持续误隐藏
                         sAodDozing = false;
+                        LogUtil.log("[息屏电池] 退出AOD: toggleAodMode(false), sAodDozing=false");
                         return chain.proceed();
                     });
             LogUtil.logAlways("[息屏电池] 已挂钩 " + Constants.AOD_BATTERY_CLASS + ".toggleAodMode");
@@ -1519,6 +1525,7 @@ public class MainHook extends XposedModule {
                         if (!sAodBatterySyncFlag.get()) return chain.proceed();
                         boolean a = Boolean.TRUE.equals(chain.getArg(0));
                         sAodDozing = !a; // a=false→AOD(true)；a=true→锁屏/亮屏(false)
+                        LogUtil.log("[息屏电池] animateFullAod(a=" + a + ") → sAodDozing=" + sAodDozing);
                         return chain.proceed();
                     });
             LogUtil.logAlways("[息屏电池] 已挂钩 " + sig + ".animateFullAod");
@@ -1552,6 +1559,7 @@ public class MainHook extends XposedModule {
                                                 if (sAodBatterySyncFlag.get() && sAodDozing
                                                         && ls.getVisibility() != View.GONE) {
                                                     ls.setVisibility(View.GONE);
+                                                    LogUtil.log("[息屏电池] 隐藏 left_side（运营商）");
                                                 }
                                             });
                                 }
@@ -1562,6 +1570,7 @@ public class MainHook extends XposedModule {
                                                 if (sAodBatterySyncFlag.get() && sAodDozing
                                                         && cs.getVisibility() != View.GONE) {
                                                     cs.setVisibility(View.GONE);
+                                                    LogUtil.log("[息屏电池] 隐藏 statusIcons（信号/WiFi）");
                                                 }
                                             });
                                 }
