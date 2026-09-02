@@ -1,0 +1,55 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.abel.hyperosglass'
+    compileSdk 37
+    buildToolsVersion '37.0.0'
+
+    defaultConfig {
+        applicationId 'com.abel.hyperosglass'
+        minSdk 33
+        targetSdk 34
+        versionCode 71
+        versionName '3.4'
+    }
+
+    signingConfigs {
+        // 与 debug 共用同一 keystore：正式版可覆盖安装，不会签名冲突
+        release {
+            storeFile file(System.getProperty('user.home') + '/.android/debug.keystore')
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // 离线环境无 lint 依赖缓存，release 构建跳过 lint（本模块为 Xposed 小工具，
+    // lint 检查无实际收益）
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
+    }
+}
+
+dependencies {
+    // LibXposed API 仅编译期需要，运行时由 LSPosed 提供。
+    // 已内置到 app/libs/libxposed-api-102.jar（零传递依赖），无需联网。
+    compileOnly files('libs/libxposed-api-102.jar')
+}
