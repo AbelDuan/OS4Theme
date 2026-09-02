@@ -60,6 +60,8 @@ public class StatusProvider extends ContentProvider {
                             Constants.PREFS_FOCUS_GLASS, Constants.DEFAULT_FOCUS_GLASS))
                     .putBoolean(Constants.PREFS_HUN_GLASS, sp.getBoolean(
                             Constants.PREFS_HUN_GLASS, Constants.DEFAULT_HUN_GLASS))
+                    .putBoolean(Constants.PREFS_HUN_DARK_TEXT, sp.getBoolean(
+                            Constants.PREFS_HUN_DARK_TEXT, Constants.DEFAULT_HUN_DARK_TEXT))
                     .putBoolean(Constants.PREFS_ENABLE_LOG, sp.getBoolean(
                             Constants.PREFS_ENABLE_LOG, Constants.DEFAULT_ENABLE_LOG))
                     .commit();
@@ -79,6 +81,8 @@ public class StatusProvider extends ContentProvider {
                 sp.getBoolean(Constants.PREFS_FOCUS_GLASS, Constants.DEFAULT_FOCUS_GLASS));
         out.putBoolean(Constants.PREFS_HUN_GLASS,
                 sp.getBoolean(Constants.PREFS_HUN_GLASS, Constants.DEFAULT_HUN_GLASS));
+        out.putBoolean(Constants.PREFS_HUN_DARK_TEXT,
+                sp.getBoolean(Constants.PREFS_HUN_DARK_TEXT, Constants.DEFAULT_HUN_DARK_TEXT));
         out.putBoolean(Constants.PREFS_ENABLE_LOG,
                 sp.getBoolean(Constants.PREFS_ENABLE_LOG, Constants.DEFAULT_ENABLE_LOG));
         out.putBoolean("ok", true);

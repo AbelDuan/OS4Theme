@@ -32,7 +32,7 @@ public final class Constants {
     public static final String TARGET_PKG = "com.android.systemui";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.3.12";
+    public static final String VERSION = "3.3.13";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -211,6 +211,41 @@ public final class Constants {
     public static final float HUN_GLASS_REFLECT = 600.0f;
     /** setMiGlass 参数数组最短长度（越界防御） */
     public static final int HUN_GLASS_MIN_LEN = 36;
+
+    /**
+     * 悬浮通知内容引用暗色资源（v3.3.13，默认启用）：悬浮通知（heads-up）的
+     * 标题/正文/时间/操作按钮文字在【亮色模式】下也使用暗色模式的文字颜色组
+     * （notification_*_color_with_bg_dark 白字系）。
+     *
+     * 背景（真机 SystemUI classes2.dex + aapt2 资源实证）：
+     *  - MIUI 通知 wrapper（MiuiNotificationTemplateViewWrapper /
+     *    MiuiNotificationBigTextViewWrapper）在 HUN 挂载/刷新时调用
+     *    updateTransparentBgAndTextColor(NotificationEntry, Z)，是 HUN 内容改色的
+     *    唯一入口（列表通知不调用 → 天然不影响下拉列表）；
+     *  - Z=true（透明背景）→ getColor(with_bg_dark 组)：title #e6ffffff / text
+     *    #80ffffff / time #33ffffff —— 无 night 变体，深浅色模式恒为白字系；
+     *  - Z=false（普通背景，竖屏 HUN 默认）→ getColor(_light/普通组)：
+     *    notification_primary_text_color_light 浅色=#ff000000（纯黑）、night=
+     *    #ffffffff（白）→ 深色模式正常白字、浅色模式黑字；
+     *  - v3.3.12 统一 HUN 玻璃为列表液态玻璃配方后，HUN 背景为半透明玻璃，
+     *    浅色模式黑字叠玻璃 → 可见性极差（用户实测）。
+     *
+     * 实现：hook 两个 wrapper 的 updateTransparentBgAndTextColor（PUBLIC FINAL，
+     *  hook 父类即覆盖 compact/decorated 等全部 HUN 子类形态），仅当系统为
+     *  亮色模式（uiMode 非 night）且系统传入 Z=false（黑字分支）时把 Z 强制为
+     *  true；深色模式透传系统原值不干预（与 v3.3.12 玻璃跟随系统同哲学）。
+     *  colorized 通知在方法体内自行跳过，不受影响。
+     */
+    public static final String PREFS_HUN_DARK_TEXT = "hun_dark_text";
+    public static final boolean DEFAULT_HUN_DARK_TEXT = true;
+
+    /** HUN 内容改色 hook 目标 wrapper 类（宿主 SystemUI classes2.dex，PUBLIC FINAL 方法） */
+    public static final String[] HUN_TEXT_COLOR_WRAPPER_CLASSES = {
+            "com.android.systemui.statusbar.notification.row.wrapper.MiuiNotificationTemplateViewWrapper",
+            "com.android.systemui.statusbar.notification.row.wrapper.MiuiNotificationBigTextViewWrapper",
+    };
+    /** 两个 wrapper 共有的改色方法名（签名含 NotificationEntry + boolean） */
+    public static final String HUN_TEXT_COLOR_METHOD = "updateTransparentBgAndTextColor";
 
     // ── 通知清除按钮图标隐藏（v3.3.2：原位置不动，仅图标 INVISIBLE）──
     /** 按钮 View 的 id 资源名（aapt2 确认 0x7f0b0865；CircleAndTickAnimView） */

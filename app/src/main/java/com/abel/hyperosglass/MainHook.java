@@ -79,6 +79,8 @@ public class MainHook extends XposedModule {
     private volatile boolean sHideDismissBtn = Constants.DEFAULT_HIDE_DISMISS_BTN;
     private volatile boolean sFocusGlass = Constants.DEFAULT_FOCUS_GLASS;
     private volatile boolean sHunGlass = Constants.DEFAULT_HUN_GLASS;
+    /** 悬浮通知内容引用暗色资源（v3.3.13，亮色模式下 HUN 文字强制 with_bg_dark 白字组） */
+    private volatile boolean sHunDarkText = Constants.DEFAULT_HUN_DARK_TEXT;
     /** 隐藏锁屏指纹开关（AtomicBoolean，供热路径拦截器读取） */
     private static final java.util.concurrent.atomic.AtomicBoolean sHideLockFodFlag =
             new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HIDE_LOCK_FOD);
@@ -91,6 +93,9 @@ public class MainHook extends XposedModule {
     /** 悬浮通知液态玻璃开关（v3.3.12，AtomicBoolean，供热路径 setMiGlass 拦截器读取） */
     private static final java.util.concurrent.atomic.AtomicBoolean sHunGlassFlag =
             new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HUN_GLASS);
+    /** 悬浮通知内容暗色资源开关（v3.3.13，AtomicBoolean，供热路径改色拦截器读取） */
+    private static final java.util.concurrent.atomic.AtomicBoolean sHunDarkTextFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HUN_DARK_TEXT);
     // v3.3.11 日志精简：删除此处原有的 10 个「前 N 次记日志」计数器
     // （flow1/flow2/glassSet/glassUpd/poke/pluginCl/islandDef/expandFix/miBlur/hideFod/dismiss）。
     // 统一改用 LogUtil.logAlwaysOnce(key, msg)：常开、但每种事件全进程只记 1 条。
@@ -137,6 +142,7 @@ public class MainHook extends XposedModule {
             installHideDismissButtonHook(cl);
             installFocusGlassHooks(cl);
             installHunGlassHooks(cl);
+            installHunTextColorHooks(cl);
         } catch (Throwable t) {
             LogUtil.logAlways("onPackageLoaded 异常: " + t);
         }
@@ -170,6 +176,8 @@ public class MainHook extends XposedModule {
                     Constants.DEFAULT_FOCUS_GLASS);
             boolean newHunGlass = sPrefs.getBoolean(Constants.PREFS_HUN_GLASS,
                     Constants.DEFAULT_HUN_GLASS);
+            boolean newHunDarkText = sPrefs.getBoolean(Constants.PREFS_HUN_DARK_TEXT,
+                    Constants.DEFAULT_HUN_DARK_TEXT);
             boolean log = sPrefs.getBoolean(Constants.PREFS_ENABLE_LOG,
                     Constants.DEFAULT_ENABLE_LOG);
             sSinkEnabled = newSink;
@@ -184,10 +192,13 @@ public class MainHook extends XposedModule {
             sFocusGlassFlag.set(newFocusGlass);
             sHunGlass = newHunGlass;
             sHunGlassFlag.set(newHunGlass);
+            sHunDarkText = newHunDarkText;
+            sHunDarkTextFlag.set(newHunDarkText);
             LogUtil.setEnabled(log);
             LogUtil.logAlways("设置(框架)：sink=" + sSinkEnabled + "，glass=" + sGlassEnabled
                     + "，hideLockFod=" + sHideLockFod + "，hideDismiss=" + sHideDismissBtn
                     + "，focusGlass=" + sFocusGlass + "，hunGlass=" + sHunGlass
+                    + "，hunDarkText=" + sHunDarkText
                     + "，日志=" + log);
         } catch (Throwable t) {
             LogUtil.logAlways("读取设置失败: " + t);
@@ -253,6 +264,8 @@ public class MainHook extends XposedModule {
                     Constants.DEFAULT_FOCUS_GLASS);
             boolean hun = out.getBoolean(Constants.PREFS_HUN_GLASS,
                     Constants.DEFAULT_HUN_GLASS);
+            boolean hunText = out.getBoolean(Constants.PREFS_HUN_DARK_TEXT,
+                    Constants.DEFAULT_HUN_DARK_TEXT);
             boolean log = out.getBoolean(Constants.PREFS_ENABLE_LOG,
                     Constants.DEFAULT_ENABLE_LOG);
             sSinkEnabled = sink;
@@ -267,10 +280,13 @@ public class MainHook extends XposedModule {
             sFocusGlassFlag.set(focus);
             sHunGlass = hun;
             sHunGlassFlag.set(hun);
+            sHunDarkText = hunText;
+            sHunDarkTextFlag.set(hunText);
             LogUtil.setEnabled(log);
             LogUtil.logAlways("设置(真实值同步)：sink=" + sink + "，glass=" + glass
                     + "，hideLockFod=" + fod + "，hideDismiss=" + dismiss
-                    + "，focusGlass=" + focus + "，hunGlass=" + hun + "，日志=" + log);
+                    + "，focusGlass=" + focus + "，hunGlass=" + hun
+                    + "，hunDarkText=" + hunText + "，日志=" + log);
         } catch (Throwable t) {
             LogUtil.logAlways("设置(真实值同步) 应用失败: " + t);
         }
@@ -1436,6 +1452,96 @@ public class MainHook extends XposedModule {
         } catch (Throwable t) {
             return null;
         }
+    }
+
+    // ============================================================
+    // 悬浮通知内容暗色资源（v3.3.13）
+    // ============================================================
+    /**
+     * 亮色模式下悬浮通知（HUN）内容（标题/正文/时间/操作按钮文字）强制引用
+     * 暗色模式资源。真机 classes2.dex 实证：MIUI 通知 wrapper 在 HUN 挂载
+     * （setHeadsUpChild）与内容刷新（onReinflated，仅 mIsHeadsUpWrapper=true）
+     * 时调用 updateTransparentBgAndTextColor(NotificationEntry, Z)，这是 HUN
+     * 内容改色的唯一入口（列表通知不调用 → 天然不影响下拉列表）；
+     * Z=true 走 notification_*_color_with_bg_dark 白字组（无 night 变体，恒白），
+     * Z=false 走 _light/普通组（浅色=纯黑 #ff000000、night=白）→ 深色模式正常
+     * 白字、浅色模式黑字叠玻璃不可见（v3.3.12 统一玻璃后 HUN 背景为半透明玻璃）。
+     *
+     * 方案：hook 两个 wrapper 的该方法（PUBLIC FINAL，hook 父类即覆盖
+     * compact/decorated 等全部 HUN 子类形态），仅当 ① 开关开、② 系统当前为
+     * 亮色模式（uiMode 非 night）、③ 系统传入 Z=false（黑字分支）时把 Z 强制为
+     * true → 内容恒用 with_bg_dark 白字组。深色模式完全透传系统原值，模块不
+     * 干预（v3.3.8「三模式全坏」教训的延续）。colorized 通知在系统方法体内
+     * 自行跳过，不受影响。
+     *
+     * 频率：HUN 挂载/刷新级别（远低于 setMiGlass 热路径），仍遵守快速失败：
+     * 开关读 → Z 已 true 短路 → 亮色判定 → 替换参数，全程无字符串拼接。
+     */
+    private void installHunTextColorHooks(ClassLoader cl) {
+        if (cl == null) return;
+        Class<?> entryCls = null;
+        try {
+            entryCls = Class.forName(
+                    "com.android.systemui.statusbar.notification.collection.NotificationEntry",
+                    false, cl);
+        } catch (Throwable t) {
+            LogUtil.logAlways("[悬浮通知暗字] NotificationEntry 类不存在，跳过: " + t);
+            return;
+        }
+        final Class<?> entryFinal = entryCls;
+        for (final String clsName : Constants.HUN_TEXT_COLOR_WRAPPER_CLASSES) {
+            try {
+                final Class<?> wrapper = Class.forName(clsName, false, cl);
+                final Method m = wrapper.getDeclaredMethod(
+                        Constants.HUN_TEXT_COLOR_METHOD, entryFinal, boolean.class);
+                m.setAccessible(true);
+                hook(m)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .setId("hun-dark-text")
+                        .intercept(new XposedInterface.Hooker() {
+                            @Override
+                            public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                                try {
+                                    // 1) 开关（快速短路，无分配）
+                                    if (!sHunDarkTextFlag.get()) return chain.proceed();
+                                    // 2) 系统已走 with_bg_dark（透明背景）分支 → 无需干预
+                                    if (Boolean.TRUE.equals(chain.getArg(1))) return chain.proceed();
+                                    // 3) 深色模式：系统 night 资源本就是白字，透传不干预
+                                    if (isNightUiMode()) return chain.proceed();
+                                    // 4) 亮色模式 + Z=false（黑字叠玻璃不可见）→ 强制 Z=true
+                                    if (LogUtil.hitOnce("hun-dark-text")) {
+                                        LogUtil.logAlways("[悬浮通知暗字] 亮色模式 HUN 内容 → "
+                                                + "强制 with_bg_dark 暗色白字资源组");
+                                    }
+                                    return chain.proceed(new Object[]{chain.getArg(0), Boolean.TRUE});
+                                } catch (Throwable ignored) {
+                                    // 任何异常都不破坏原调用
+                                }
+                                return chain.proceed();
+                            }
+                        });
+                LogUtil.logAlways("[悬浮通知暗字] 已挂钩 " + clsName + "."
+                        + Constants.HUN_TEXT_COLOR_METHOD);
+            } catch (Throwable t) {
+                LogUtil.logAlways("[悬浮通知暗字] 挂钩失败（" + clsName + "）: " + t);
+            }
+        }
+    }
+
+    /** 系统当前是否深色模式（uiMode night）。取不到配置时返回 false（按亮色处理，
+     *  宁多强制不少——修复方向优先）。 */
+    private static boolean isNightUiMode() {
+        try {
+            Object app = currentApplication();
+            if (app instanceof android.content.Context) {
+                android.content.res.Configuration cfg =
+                        ((android.content.Context) app).getResources().getConfiguration();
+                return (cfg.uiMode & android.content.res.Configuration.UI_MODE_NIGHT_MASK)
+                        == android.content.res.Configuration.UI_MODE_NIGHT_YES;
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
     }
 
     // ============================================================
