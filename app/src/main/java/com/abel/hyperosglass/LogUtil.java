@@ -12,6 +12,9 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import io.github.libxposed.api.XposedModule;
 
@@ -55,6 +58,13 @@ public final class LogUtil {
     private static final ArrayDeque<String> sQueue = new ArrayDeque<String>();
     private static volatile Thread sWorker;
 
+    /** v3.3.11：Xposed 日志总量上限（防日志风暴持续 Binder + daemon 端累积）。
+     *  正常安装期约 20~30 行，留 300 行余量。 */
+    private static final int MAX_XPOSED_LINES = 300;
+    private static final AtomicInteger sXposedLines = new AtomicInteger();
+    /** v3.3.11：once 键集合（数量有界，等于代码里 logAlwaysOnce 的调用点数量） */
+    private static final Set<String> sOnceKeys = ConcurrentHashMap.newKeySet();
+
     public static void attach(XposedModule module) {
         sLogger = module;
     }
@@ -67,33 +77,60 @@ public final class LogUtil {
         return sEnabled;
     }
 
-    /** 业务日志：受「日志记录」开关控制 */
+    /** 业务日志：受「日志记录」开关控制（噪音级：跳过/未找到/每次命中） */
     public static void log(String msg) {
         if (!sEnabled) return;
         write(msg);
     }
 
-    /** 常开日志（排障）：不依赖「日志记录」开关，仅低频点调用（加载/挂钩/设置/命中） */
+    /** 常开日志（排障）：不依赖「日志记录」开关，仅用于「失败/异常」这类必须看见的
+     *  信息。调用次数必须是有界的（加载期一次或极低频）。 */
     public static void logAlways(String msg) {
         write(msg);
     }
 
+    /**
+     * v3.3.11：常开 + 同一 key 全进程只记一次。
+     * 用于「已挂钩 X」「热路径命中 X」——排障价值是「证明钩子真的生效」，
+     * 记 1 条足矣；以前用散落各处的「前 3/5/8 次」计数器，既重复刷屏又要
+     * 逐处维护计数。现在统一走这里：常开（默认日志关闭时也能在 LSPosed
+     * 日志里看到），但每种事件只有 1 条。
+     */
+    public static void logAlwaysOnce(String key, String msg) {
+        if (sOnceKeys.add(key)) write(msg);
+    }
+
+    /**
+     * v3.3.11：热路径版 once —— 只判断，不拼接。用法：
+     *   if (LogUtil.hitOnce("miblur")) LogUtil.logAlways("[玻璃] " + x + "...");
+     * 为什么必须这样写：Java 的字符串拼接发生在【调用之前】，写成
+     * logAlwaysOnce(key, "a" + x + "b") 时，即便这条日志只输出一次，拼接也会在
+     * 每次调用时执行 → 热路径上白白分配字符串。用 hitOnce 先判（key 用字面量，
+     * 零分配），只有真的要输出时才拼接。
+     * Set.add 本身是 O(1) 且对已存在的常量 key 不产生分配。
+     */
+    public static boolean hitOnce(String key) {
+        return sOnceKeys.add(key);
+    }
+
     private static void write(String msg) {
-        final String line = ts() + " " + Constants.LOG_TAG + " " + msg;
-        // 1) Xposed 日志（LSPosed Manager 里能看，始终记录）
+        // 1) Xposed 日志（LSPosed Manager 里能看）。v3.3.11：加总量上限，
+        //    任何未知路径的日志风暴到此为止（每次 log 是一次 Binder 到
+        //    LSPosed daemon，无限刷会持续耗电并在 daemon 端无限累积）。
         XposedModule m = sLogger;
-        if (m != null) {
+        if (m != null && sXposedLines.get() < MAX_XPOSED_LINES) {
             try {
                 m.log(Log.INFO, Constants.LOG_TAG, msg);
+                sXposedLines.incrementAndGet();
             } catch (Throwable ignored) {
             }
         }
         // 2) 单 worker 后台推送（串行队列，不阻塞主线程；队列清空即退出，
         //    不留下任何后台常驻线程——v3.3.2 功耗控制）
-        //    v3.3.2 功耗控制：跨进程落盘推送仅在「日志记录」开启时进行——
-        //    关闭时只写 Xposed 日志，避免开机阶段每行日志唤醒模块 App 进程。
+        //    落盘推送仅在「日志记录」开启时进行——关闭时只写 Xposed 日志，
+        //    避免开机阶段每行日志唤醒模块 App 进程。
         if (!sEnabled) return;
-        enqueue(line + "\n");
+        enqueue(ts() + " " + Constants.LOG_TAG + " " + msg + "\n");
     }
 
     /** 入队并确保有 worker 在跑；队列清空后 worker 自动退出（不留后台线程） */
@@ -182,7 +219,18 @@ public final class LogUtil {
         }
     }
 
+    /** v3.3.11：SimpleDateFormat 构造要解析 pattern（不便宜），原来每行日志都 new 一个。
+     *  改为 ThreadLocal 复用——推送线程只有一个，实际只构造一次。
+     *  时间戳只给落盘用（Xposed 日志自带时间），日志关闭时本方法根本不被调用。 */
+    private static final ThreadLocal<SimpleDateFormat> sTsFmt =
+            new ThreadLocal<SimpleDateFormat>() {
+                @Override
+                protected SimpleDateFormat initialValue() {
+                    return new SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US);
+                }
+            };
+
     private static String ts() {
-        return new SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US).format(new Date());
+        return sTsFmt.get().format(new Date());
     }
 }

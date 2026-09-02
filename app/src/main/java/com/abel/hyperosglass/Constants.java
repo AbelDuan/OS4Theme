@@ -9,17 +9,10 @@ package com.abel.hyperosglass;
  *   method public final boolean getDefaultPluginTheme() // ()Z
  * 两者强制返回 true，等价于直接修改 smali，使应用第三方主题后仍保留液态玻璃模糊。
  *
- * v3.0 完全重构（用户要求只保留两个功能，其余全部取消）：
- *   1) 三方主题液态玻璃通知（强制 ThemeUtils 两个 getter）；
- *   2) 锁屏通知下沉（启用/不启用）。
- *   已移除：指纹图标隐藏/显示、展开按钮药丸修复、媒体岛 attach 防御
- *   （后两者曾导致音乐通知卡片圆角变方、音乐胶囊弹窗只剩进度条）。
- *
- * v3.3.0（当前）：
+ * v3.3.x（当前）：功能清单与原理见 README（本文件只放常量与其生效依据）。
  *   - 放弃「隐藏桌面多任务清理任务按钮」（v3.2.1）：Rust 启动器（hyos_spawner）
  *     进程无 ART/JVM、clearAnimView 非 Android View 节点，该方案不可行，整体移除；
- *   - 设置界面重构为两大类：功能启用（三方主题液态玻璃 / 焦点通知液态玻璃 /
- *     通知下沉）、功能隐藏（锁屏指纹图标 / 通知清除按钮），全界面可滚动。
+ *   - 设置界面两大类的开关见下方「设置项」小节，完整说明见 README。
  *
  * 关键修复（v3.0）：ThemeUtils 位于插件 APK（MIUISystemUIPlugin）的独立
  *   PathClassLoader 中，宿主 onPackageLoaded 的 Class.forName 必然失败
@@ -39,7 +32,7 @@ public final class Constants {
     public static final String TARGET_PKG = "com.android.systemui";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.3.9";
+    public static final String VERSION = "3.3.11";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";

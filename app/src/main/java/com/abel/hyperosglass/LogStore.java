@@ -25,6 +25,12 @@ public final class LogStore {
         return new File(c.getFilesDir(), Constants.LOG_FILE);
     }
 
+    /** v3.3.11：每 32 行才做一次截断检查。
+     *  原来每行都 trim() → 每行多一次 f.length()（stat）+ 超限时的半文件读写。
+     *  32 行的溢出量（几 KB）相对 512KB 上限完全无害。 */
+    private static int sAppendCount = 0;
+    private static final int TRIM_EVERY = 32;
+
     public static synchronized void append(Context c, String text) {
         if (text == null || text.length() == 0) return;
         FileOutputStream fos = null;
@@ -38,9 +44,12 @@ public final class LogStore {
         } finally {
             close(fos);
         }
-        try {
-            trim(c);
-        } catch (Throwable ignored) {
+        if (++sAppendCount >= TRIM_EVERY) {
+            sAppendCount = 0;
+            try {
+                trim(c);
+            } catch (Throwable ignored) {
+            }
         }
     }
 

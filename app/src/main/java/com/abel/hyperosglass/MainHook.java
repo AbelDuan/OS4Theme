@@ -87,28 +87,10 @@ public class MainHook extends XposedModule {
     /** 液态玻璃焦点通知开关（AtomicBoolean） */
     private static final java.util.concurrent.atomic.AtomicBoolean sFocusGlassFlag =
             new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_FOCUS_GLASS);
-    /** 锁屏指纹隐藏命中计数（前 3 次记日志） */
-    private static int sHideLockFodLogs = 0;
-    /** 通知清除按钮命中计数（前 3 次记日志） */
-    private static int sDismissBtnLogs = 0;
-
-            /** flow 诊断计数（前 5 次调用记日志，确认锁屏时是否真的被调用） */
-            private static int sFlow1Logs = 0;
-            private static int sFlow2Logs = 0;
-            /** 玻璃 setter 强制 true 计数（前 3 次记日志，证明字段被强制置 true） */
-            private static int sGlassSetLogs = 0;
-            /** 记录 updateDefault* 跳过的日志条数（最多 3 条） */
-            private static int sGlassUpdLogs = 0;
-            /** 记录字段置 true 的日志条数（最多 4 条） */
-            private static int sPokeLogs = 0;
-    /** 插件 classloader 补挂计数（前 3 次记日志） */
-    private static int sPluginClLogs = 0;
-    /** 媒体岛防御命中计数（前 3 次记日志） */
-    private static int sIslandDefLogs = 0;
-    /** 展开按钮药丸命中计数（前 3 次记日志） */
-    private static int sExpandFixLogs = 0;
-    /** v3.3.9：MiBlurCompat 总闸门挂钩命中计数（前 3 次记日志） */
-    private static int sMiBlurLogs = 0;
+    // v3.3.11 日志精简：删除此处原有的 10 个「前 N 次记日志」计数器
+    // （flow1/flow2/glassSet/glassUpd/poke/pluginCl/islandDef/expandFix/miBlur/hideFod/dismiss）。
+    // 统一改用 LogUtil.logAlwaysOnce(key, msg)：常开、但每种事件全进程只记 1 条。
+    // 收益：热路径命中日志从「配额 3~5 条」降到 1 条，且不再需要逐处维护计数。
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
@@ -330,7 +312,7 @@ public class MainHook extends XposedModule {
                             return loader;
                         }
                     });
-            LogUtil.logAlways("[玻璃] 已挂钩 PluginFactory.createClassLoader（插件加载时补挂 ThemeUtils + MiBlurCompat + MiuiDefaultThemeControllerImpl）");
+            LogUtil.logAlways("[玻璃] 已挂钩 PluginFactory.createClassLoader（插件加载时补挂 ThemeUtils + MiBlurCompat）");
         } catch (Throwable t) {
             LogUtil.logAlways("[玻璃] 插件工厂挂钩失败: " + t);
         }
@@ -346,23 +328,18 @@ public class MainHook extends XposedModule {
             if (c == null) return;
             synchronized (glassHooked) {
                 if (glassHooked.contains(c)) {
-                    if (sPluginClLogs < 8) {
-                        sPluginClLogs++;
-                        LogUtil.logAlways("[玻璃] ThemeUtils 副本已挂钩，跳过: " + loader);
-                    }
+                    LogUtil.log("[玻璃] ThemeUtils 副本已挂钩，跳过: " + loader);
                     return;
                 }
                 glassHooked.add(c);
             }
-            if (sPluginClLogs < 3) {
-                sPluginClLogs++;
-                LogUtil.logAlways("[玻璃] 已从插件 loader 拿到 ThemeUtils: " + loader);
-            }
+            LogUtil.logAlwaysOnce("tu-loader",
+                    "[玻璃] 已从插件 loader 拿到 ThemeUtils: " + loader);
             for (String name : Constants.TARGET_METHODS) {
                 try {
                     Method m = findBooleanMethod(c, name);
                     if (m == null) {
-                        LogUtil.logAlways("[玻璃] ThemeUtils." + name + " 未找到（跳过）");
+                        LogUtil.log("[玻璃] ThemeUtils." + name + " 未找到（跳过）");
                         continue;
                     }
                     hook(m)
@@ -377,7 +354,8 @@ public class MainHook extends XposedModule {
                                     return chain.proceed();
                                 }
                             });
-                    LogUtil.logAlways("[玻璃] 已挂钩 ThemeUtils." + name + "（玻璃开启时强制 true）");
+                    LogUtil.logAlwaysOnce("tu-get-" + name,
+                            "[玻璃] 已挂钩 ThemeUtils." + name + "（玻璃开启时强制 true）");
                 } catch (Throwable t) {
                     LogUtil.logAlways("[玻璃] ThemeUtils." + name + " 挂钩失败: " + t);
                 }
@@ -387,7 +365,7 @@ public class MainHook extends XposedModule {
                 try {
                     Method m = findVoidBooleanMethod(c, name);
                     if (m == null) {
-                        LogUtil.logAlways("[玻璃] ThemeUtils." + name + " 未找到（跳过）");
+                        LogUtil.log("[玻璃] ThemeUtils." + name + " 未找到（跳过）");
                         continue;
                     }
                     hook(m)
@@ -397,17 +375,17 @@ public class MainHook extends XposedModule {
                                 @Override
                                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
                                     if (sGlassEnabled) {
-                                        if (sGlassSetLogs < 3) {
-                                            sGlassSetLogs++;
-                                            LogUtil.logAlways("[玻璃] setDefault*Theme 强制 true（保留液态玻璃，"
-                                                    + "原入参被覆盖）");
+                                        if (LogUtil.hitOnce("glass-set")) {
+                                            LogUtil.logAlways("[玻璃] setDefault*Theme 强制 true"
+                                                    + "（保留液态玻璃，原入参被覆盖）");
                                         }
                                         return chain.proceed(new Object[]{true});
                                     }
                                     return chain.proceed();
                                 }
                             });
-                    LogUtil.logAlways("[玻璃] 已挂钩 ThemeUtils." + name + "（玻璃开启时强制 true）");
+                    LogUtil.logAlwaysOnce("tu-set-" + name,
+                            "[玻璃] 已挂钩 ThemeUtils." + name + "（玻璃开启时强制 true）");
                 } catch (Throwable t) {
                     LogUtil.logAlways("[玻璃] ThemeUtils." + name + " 挂钩失败: " + t);
                 }
@@ -422,7 +400,7 @@ public class MainHook extends XposedModule {
                 try {
                     Method m = findVoidNoArgMethod(c, name);
                     if (m == null) {
-                        LogUtil.logAlways("[玻璃] ThemeUtils." + name + " 未找到（跳过）");
+                        LogUtil.log("[玻璃] ThemeUtils." + name + " 未找到（跳过）");
                         continue;
                     }
                     hook(m)
@@ -432,8 +410,7 @@ public class MainHook extends XposedModule {
                                 @Override
                                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
                                     if (sGlassEnabled) {
-                                        if (sGlassUpdLogs < 3) {
-                                            sGlassUpdLogs++;
+                                        if (LogUtil.hitOnce("glass-upd")) {
                                             LogUtil.logAlways("[玻璃] " + name
                                                     + " 已跳过（第三方主题不得把默认主题置 false）");
                                         }
@@ -445,7 +422,8 @@ public class MainHook extends XposedModule {
                                     return chain.proceed();
                                 }
                             });
-                    LogUtil.logAlways("[玻璃] 已挂钩 ThemeUtils." + name + "（玻璃开启时跳过）");
+                    LogUtil.logAlwaysOnce("tu-upd-" + name,
+                            "[玻璃] 已挂钩 ThemeUtils." + name + "（玻璃开启时跳过）");
                 } catch (Throwable t) {
                     LogUtil.logAlways("[玻璃] ThemeUtils." + name + " 挂钩失败: " + t);
                 }
@@ -459,6 +437,34 @@ public class MainHook extends XposedModule {
         } catch (Throwable t) {
             // 类不在本 loader（正常：插件 loader 尚未就绪），静默等待 createClassLoader 回调
         }
+    }
+
+    /** material_style 缓存（v3.3.10 功耗）。合法值含 -1（关闭），故用 ts==0 判未初始化。 */
+    private static volatile int sMaterialStyle = 0;
+    private static volatile long sMaterialStyleTs = 0L;
+
+    /**
+     * 读 Settings.Secure material_style，带 2 秒 TTL 缓存。
+     * v3.3.10：本方法是材质总闸门，控制中心/通知渲染时会被反复调用；原来每次都
+     * Settings.Secure.getInt 走一次 Binder 到 SettingsProvider。切换材质是分钟级
+     * 低频操作，TTL 缓存足够，省掉热路径上的全部 IPC。
+     * ponytail: TTL 缓存，切材质后最多 2s 生效；要「切完立刻生效」就改成注册
+     * ContentObserver 失效缓存（多 ~10 行 + 生命周期管理，当前没必要）。
+     */
+    private static int materialStyle(android.content.Context ctx) {
+        long now = android.os.SystemClock.elapsedRealtime();
+        long ts = sMaterialStyleTs;
+        int v = sMaterialStyle;
+        if (ts == 0L || now - ts > 2000L) {
+            try {
+                v = Settings.Secure.getInt(ctx.getContentResolver(), "material_style", 0);
+            } catch (Throwable t) {
+                v = 0;
+            }
+            sMaterialStyle = v;
+            sMaterialStyleTs = now;
+        }
+        return v;
     }
 
     /** v3.3.9：钩 MiBlurCompat.getBackgroundMaterialOpenedInDefaultTheme（线 A 总闸门）。
@@ -475,13 +481,14 @@ public class MainHook extends XposedModule {
                 if (miBlurCompatHooked.contains(c)) return;
                 miBlurCompatHooked.add(c);
             }
-            LogUtil.logAlways("[玻璃] 已从插件 loader 拿到 MiBlurCompat: " + loader);
+            LogUtil.logAlwaysOnce("miblur-loader",
+                    "[玻璃] 已从插件 loader 拿到 MiBlurCompat: " + loader);
             for (String name : Constants.TARGET_MI_BLUR_COMPAT_METHODS) {
                 try {
                     // 找 PUBLIC STATIC + (Context)Z + 返回 boolean 的方法
                     Method m = findStaticBooleanMethodWithContextParam(c, name);
                     if (m == null) {
-                        LogUtil.logAlways("[玻璃] MiBlurCompat." + name + " 未找到（跳过）");
+                        LogUtil.log("[玻璃] MiBlurCompat." + name + " 未找到（跳过）");
                         continue;
                     }
                     hook(m)
@@ -494,14 +501,11 @@ public class MainHook extends XposedModule {
                                         try {
                                             Object arg0 = chain.getArg(0);
                                             if (arg0 instanceof android.content.Context) {
-                                                int style = Settings.Secure.getInt(
-                                                        ((android.content.Context) arg0).getContentResolver(),
-                                                        "material_style", 0);
-                                                if (style == 1) {
-                                                    if (sMiBlurLogs < 3) {
-                                                        sMiBlurLogs++;
-                                                        LogUtil.logAlways("[玻璃] MiBlurCompat." + name
-                                                                + " 液态模式强制 true（第三方主题不得关玻璃）");
+                                                if (materialStyle((android.content.Context) arg0) == 1) {
+                                                    if (LogUtil.hitOnce("miblur-hit")) {
+                                                        LogUtil.logAlways("[玻璃] MiBlurCompat."
+                                                                + name + " 液态模式强制 true"
+                                                                + "（第三方主题不得关玻璃）");
                                                     }
                                                     return Boolean.TRUE;
                                                 }
@@ -513,7 +517,8 @@ public class MainHook extends XposedModule {
                                     return chain.proceed();
                                 }
                             });
-                    LogUtil.logAlways("[玻璃] 已挂钩 MiBlurCompat." + name + "（仅液态模式强制 true）");
+                    LogUtil.logAlwaysOnce("miblur-" + name,
+                            "[玻璃] 已挂钩 MiBlurCompat." + name + "（仅液态模式强制 true）");
                 } catch (Throwable t) {
                     LogUtil.logAlways("[玻璃] MiBlurCompat." + name + " 挂钩失败: " + t);
                 }
@@ -603,13 +608,11 @@ public class MainHook extends XposedModule {
                 f.setAccessible(true);
                 if (f.getBoolean(null)) continue; // 已是 true，不打扰
                 f.setBoolean(null, true);
-                if (sPokeLogs < 4) {
-                    sPokeLogs++;
+                if (LogUtil.hitOnce("poke-ok")) {
                     LogUtil.logAlways("[玻璃] 字段 " + fn + " 已置 true（防御 ART 内联副本）");
                 }
             } catch (Throwable t) {
-                if (sPokeLogs < 4) {
-                    sPokeLogs++;
+                if (LogUtil.hitOnce("poke-fail")) {
                     LogUtil.logAlways("[玻璃] 字段 " + fn + " 置 true 失败: " + t);
                 }
             }
@@ -673,10 +676,10 @@ public class MainHook extends XposedModule {
                                 try {
                                     return chain.proceed();
                                 } catch (Throwable t) {
-                                    if (sIslandDefLogs < 3) {
-                                        sIslandDefLogs++;
-                                        LogUtil.logAlways("[防御] attach 内崩溃已吞掉（MiPalette）: "
-                                                + t);
+                                    // 系统 bug 每次播放媒体都会崩 → 必须 hitOnce，
+                                    // 否则每次崩溃都拼字符串 + 写日志
+                                    if (LogUtil.hitOnce("island-attach")) {
+                                        LogUtil.logAlways("[防御] attach 内崩溃已吞掉（MiPalette）: " + t);
                                     }
                                     return null;
                                 }
@@ -691,7 +694,7 @@ public class MainHook extends XposedModule {
             try {
                 final Method shader = findTwoArgMethod(binder, "setMusicBgShader");
                 if (shader == null) {
-                    LogUtil.logAlways("[防御] setMusicBgShader 未找到（跳过）");
+                    LogUtil.log("[防御] setMusicBgShader 未找到（跳过）");
                 } else {
                     shader.setAccessible(true);
                     hook(shader)
@@ -700,16 +703,15 @@ public class MainHook extends XposedModule {
                             .intercept(new XposedInterface.Hooker() {
                                 @Override
                                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                                    try {
-                                        return chain.proceed();
-                                    } catch (Throwable t) {
-                                        if (sIslandDefLogs < 6) {
-                                            sIslandDefLogs++;
-                                            LogUtil.logAlways("[防御] setMusicBgShader 内崩溃已吞掉"
-                                                    + "（MiPalette）: " + t);
-                                        }
-                                        return null;
+                                try {
+                                    return chain.proceed();
+                                } catch (Throwable t) {
+                                    if (LogUtil.hitOnce("island-shader")) {
+                                        LogUtil.logAlways("[防御] setMusicBgShader 内崩溃已吞掉"
+                                                + "（MiPalette）: " + t);
                                     }
+                                    return null;
+                                }
                                 }
                             });
                     LogUtil.logAlways("[防御] 已挂钩 setMusicBgShader（吞异常版）");
@@ -772,11 +774,10 @@ public class MainHook extends XposedModule {
                                         // 组装新参数数组 proceed（LibXposed 正确姿势）
                                         Object[] newArgs = new Object[]{
                                                 makeGlassPill(v.getResources())};
-                                        if (sExpandFixLogs < 3) {
-                                            sExpandFixLogs++;
+                                        if (LogUtil.hitOnce("expand-bg")) {
                                             LogUtil.logAlways("[展开按钮] setBackground 拦截替换为白透 类="
-                                                    + v.getClass().getName() + " id="
-                                                    + viewIdName(v));
+                                                    + v.getClass().getName() + " id=0x"
+                                                    + Integer.toHexString(v.getId()));
                                         }
                                         return chain.proceed(newArgs);
                                     }
@@ -804,11 +805,10 @@ public class MainHook extends XposedModule {
                                     View v = (View) self;
                                     if (isExpandView(v)) {
                                         Object[] newArgs = new Object[]{null}; // 清 tint
-                                        if (sExpandFixLogs < 3) {
-                                            sExpandFixLogs++;
+                                        if (LogUtil.hitOnce("expand-tint")) {
                                             LogUtil.logAlways("[展开按钮] setBackgroundTintList 拦截清 tint 类="
-                                                    + v.getClass().getName() + " id="
-                                                    + viewIdName(v));
+                                                    + v.getClass().getName() + " id=0x"
+                                                    + Integer.toHexString(v.getId()));
                                         }
                                         return chain.proceed(newArgs);
                                     }
@@ -825,41 +825,82 @@ public class MainHook extends XposedModule {
         }
     }
 
-    /** 已确认「展开按钮」的类名（命中后记住，同类不再查资源名）。
-     *  并发安全：setBackground 回调可能从主线程/Binder 线程并发进入，
-     *  普通 HashSet 并发读写会损坏 → 用 ConcurrentHashMap.newKeySet()。 */
-    private static final Set<String> sConfirmedViewClass =
-            java.util.concurrent.ConcurrentHashMap.newKeySet();
-    /** 已确认「非展开按钮」的类名（快路径缓存，≤300 防膨胀） */
-    private static final Set<String> sNonExpandClasses =
-            java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** 展开按钮的资源 id 缓存。0=未解析，-1=解析失败（走 id 名兜底），>0=目标 id。
+     *  解析一次后全局复用，之后判命中只需一次 int 比较。 */
+    private static volatile int sExpandPillId = 0;
+    /** 展开按钮的 View 类缓存（命中 id 后再比对类，避免 getName 字符串比较） */
+    private static volatile Class<?> sExpandViewClass = null;
 
     /** v3.3.6：判断 View 是否「通知栏展开按钮」。
      *  旧版用关键词宽泛匹配（expandbutton / expandicon / chevron / arrowbutton），
      *  会误命中控制中心的 chevron 箭头等图标 → 背景被替换成白透药丸 → 出现
      *  「方底 / 圆底混杂、颜色不一致」（快速切换材质时控制中心重建即触发）。
-     *  改为「类名 + id 名」双条件精确匹配，实测命中
+     *  改为「类名 + id」双条件精确匹配，实测命中
      *  com.android.internal.widget.NotificationOptimizedLinearLayout + expand_button_pill。
-     *  性能：本方法在每次 View.setBackground 时被调用（全局 hook），先查两个 O(1)
-     *  缓存 Set（已确认展开类 / 已确认无关类），字符串分析每类仅首次执行。 */
+     *
+     *  v3.3.11 常驻开销（本方法跑在 View.setBackground / setBackgroundTintList 全局
+     *  钩子里，SystemUI 内每次给 View 设背景都会进来）：
+     *   旧实现为做缓存，每次调用都拼一次键字符串（类名 + "#" + id）→ 每次分配
+     *   StringBuilder + String，再两次 Set 查找。滚动通知栏时是每秒几百次级别的
+     *   分配，纯属 GC 压力。
+     *   新实现先把目标 id 解析成一个 int（只解析一次），之后 99.9% 的 View 在
+     *   「id != 目标」这一次 int 比较上就退出——零分配、O(1)，连 Set 都不需要，
+     *   两个缓存集合一并删掉。
+     *   只有 id 解析失败的 ROM 才回退到旧的「id 名反查」慢路径（功能不丢）。 */
     private static boolean isExpandView(View v) {
         try {
-            String cls = v.getClass().getName();
-            // 快路径 O(1)：两类缓存 Set 优先（已确认的类不再做字符串分析）
-            if (sConfirmedViewClass.contains(cls)) return true;
-            if (sNonExpandClasses.contains(cls)) return false;
-            // 慢路径（每类仅首次）：类名 + id 名双条件精确匹配
-            boolean hit = Constants.EXPAND_BUTTON_VIEW_CLASS.equals(cls)
-                    && Constants.EXPAND_BUTTON_PILL_ID_NAME.equals(viewIdName(v));
-            if (hit) {
-                sConfirmedViewClass.add(cls);
+            int id = v.getId();
+            if (id == View.NO_ID) return false;
+            int target = sExpandPillId;
+            if (target == 0) {
+                target = resolveExpandPillId(v);
+                if (target == 0) return false; // 连兜底都没解析到，本次放行
+            }
+            if (target < 0) {
+                // id 解析失败：回退到「id 名反查」慢路径（每种 View 只走一次后即被
+                // 上面的 int 快路径取代；ROM 上 id 名与 getIdentifier 都失败时才会
+                // 反复走这里，属异常 ROM，保功能优先）
+                return matchExpandByResourceName(v);
+            }
+            if (id != target) return false;          // ← 快路径：零分配，绝大多数在这里返回
+            Class<?> cached = sExpandViewClass;
+            if (cached != null) return v.getClass() == cached;
+            if (Constants.EXPAND_BUTTON_VIEW_CLASS.equals(v.getClass().getName())) {
+                sExpandViewClass = v.getClass();
                 return true;
             }
-            if (sNonExpandClasses.size() < 300) sNonExpandClasses.add(cls);
             return false;
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    /** 解析 expand_button_pill 的资源 id（只解析一次）。返回 0=完全失败走兜底，
+     *  -1=id 解析失败（ROM 差异），>0=目标 id。 */
+    private static int resolveExpandPillId(View v) {
+        try {
+            android.content.Context ctx = v.getContext();
+            int id = ctx.getResources().getIdentifier(
+                    Constants.EXPAND_BUTTON_PILL_ID_NAME, "id", ctx.getPackageName());
+            if (id == 0) {
+                // 兜底：按宿主包名再试一次（插件 Context 的 packageName 可能不同）
+                id = ctx.getResources().getIdentifier(
+                        Constants.EXPAND_BUTTON_PILL_ID_NAME, "id", Constants.TARGET_PKG);
+            }
+            sExpandPillId = (id == 0 ? -1 : id);
+            LogUtil.log("[展开按钮] 目标 id 解析: " + Constants.EXPAND_BUTTON_PILL_ID_NAME
+                    + " = " + (id == 0 ? "失败，走 id 名兜底" : ("0x" + Integer.toHexString(id))));
+            return sExpandPillId;
+        } catch (Throwable t) {
+            sExpandPillId = -1;
+            return -1;
+        }
+    }
+
+    /** 兜底判定：类名 + id 资源名双条件匹配（getIdentifier 不可用时使用） */
+    private static boolean matchExpandByResourceName(View v) {
+        return Constants.EXPAND_BUTTON_VIEW_CLASS.equals(v.getClass().getName())
+                && Constants.EXPAND_BUTTON_PILL_ID_NAME.equals(viewIdName(v));
     }
 
     /** 取 View 的 id 资源名（失败返回十六进制兜底） */
@@ -921,10 +962,9 @@ public class MainHook extends XposedModule {
                                 // 运行时验证隐藏资源可解析（ROM 兜底）；Context 取 mContext 字段
                                 android.content.Context ctx = lockFodContext(chain.getThisObject());
                                 if (ctx != null && isHideResValid(ctx)) {
-                                    if (sHideLockFodLogs < 3) {
-                                        sHideLockFodLogs++;
-                                        LogUtil.logAlways("[锁屏指纹] getFingerIconResource 命中（mKeyguardAuthen=true）"
-                                                + " → 返回隐藏资源 0x7f080000");
+                                    if (LogUtil.hitOnce("fod-icon")) {
+                                        LogUtil.logAlways("[锁屏指纹] getFingerIconResource 命中"
+                                                + "（mKeyguardAuthen=true）→ 返回隐藏资源 0x7f080000");
                                     }
                                     return Integer.valueOf(Constants.FOD_HIDE_RES_ID);
                                 }
@@ -948,10 +988,10 @@ public class MainHook extends XposedModule {
                                 if (!sHideLockFodFlag.get()) return chain.proceed();
                                 if (!isLockFodAuthen(chain.getThisObject())) return chain.proceed();
                                 Object item = lockFodAnimZeroItem(chain.getThisObject());
-                                if (sHideLockFodLogs < 3) {
-                                    sHideLockFodLogs++;
-                                    LogUtil.logAlways("[锁屏指纹] getRecognizingAnimItem 命中（mKeyguardAuthen=true）"
-                                            + " → 返回空动画条目 " + (item == null ? "null" : item.getClass().getName()));
+                                if (LogUtil.hitOnce("fod-anim")) {
+                                    LogUtil.logAlways("[锁屏指纹] getRecognizingAnimItem 命中"
+                                            + "（mKeyguardAuthen=true）→ 返回空动画条目 "
+                                            + (item == null ? "null" : item.getClass().getName()));
                                 }
                                 return item; // 可能为 null：无动画
                             }
@@ -1106,8 +1146,7 @@ public class MainHook extends XposedModule {
                                     targetV.setTranslationX(0f);
                                     targetV.setTranslationY(screenH + 20f * density);
                                     v.setVisibility(View.INVISIBLE);
-                                    if (sDismissBtnLogs < 3) {
-                                        sDismissBtnLogs++;
+                                    if (LogUtil.hitOnce("dismiss-hide")) {
                                         LogUtil.logAlways("[清除按钮] 已隐藏：图标 INVISIBLE + 容器下移到屏底之外（+"
                                                 + screenH + "px）按钮类=" + v.getClass().getName()
                                                 + " 容器类=" + targetV.getClass().getName());
@@ -1195,7 +1234,10 @@ public class MainHook extends XposedModule {
 
                                 @Override
                                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                                    if (!sFilled && sFocusGlassFlag.get()) {
+                                    // v3.3.11：填过之后就只剩一次非 volatile 布尔读，
+                                    // 不再每次都读 AtomicBoolean（apply 随通知渲染高频调用）
+                                    if (sFilled) return chain.proceed();
+                                    if (sFocusGlassFlag.get()) {
                                         sFilled = true;
                                         Object ctx0 = chain.getArg(1);
                                         if (ctx0 instanceof android.content.Context) {
@@ -1274,8 +1316,7 @@ public class MainHook extends XposedModule {
                             public Object intercept(XposedInterface.Chain chain) throws Throwable {
                                 // 与 HyperChanger 一致：开启下沉 -> 返回 false 短路
                                 if (sSinkEnabled) {
-                                    if (sFlow1Logs < 5) {
-                                        sFlow1Logs++;
+                                    if (LogUtil.hitOnce("sink-flow1")) {
                                         LogUtil.logAlways("[下沉] flow1 被调用，sink=" + sSinkEnabled
                                                 + " -> 返回 false（下沉）");
                                     }
@@ -1318,8 +1359,7 @@ public class MainHook extends XposedModule {
                                         Object vals = f.get(chain.getThisObject());
                                         if (vals instanceof Object[]) {
                                             Object[] arr = (Object[]) vals;
-                                            if (sFlow2Logs < 5) {
-                                                sFlow2Logs++;
+                                            if (LogUtil.hitOnce("sink-flow2")) {
                                                 LogUtil.logAlways("[下沉] flow2 被调用，sink="
                                                         + sSinkEnabled + "，L$1=Object[] len="
                                                         + arr.length);
@@ -1327,13 +1367,20 @@ public class MainHook extends XposedModule {
                                             if (arr.length > Constants.FOD_FLOW_HAS_ENROLLED_INDEX) {
                                                 arr[Constants.FOD_FLOW_HAS_ENROLLED_INDEX] = false;
                                             }
-                                        } else {
+                                        } else if (LogUtil.hitOnce("sink-flow2-nonarray")) {
+                                            // v3.3.11：flow2 是锁屏通知位置计算，刷新时高频
+                                            // 调用；三个分支都必须限流，否则 ROM 上 L$1 不是
+                                            // 数组时每次调用一条日志（Binder + 落盘），锁屏
+                                            // 期间持续耗电。统一用 hitOnce：字面量 key 零分配，
+                                            // 且字符串拼接只在真输出时发生。
                                             LogUtil.logAlways("[下沉] flow2 L$1 非数组: "
                                                     + (vals == null ? "null"
                                                     : vals.getClass().getName()));
                                         }
                                     } catch (Throwable t) {
-                                        LogUtil.logAlways("[下沉] flow2 改 L$1 失败: " + t);
+                                        if (LogUtil.hitOnce("sink-flow2-fail")) {
+                                            LogUtil.logAlways("[下沉] flow2 改 L$1 失败: " + t);
+                                        }
                                     }
                                 }
                                 return chain.proceed();

@@ -343,23 +343,48 @@ public class SettingsActivity extends Activity {
 
     // ────────────────────────────── 动作 ──────────────────────────────
 
-    /** 用 root 权限重启 SystemUI：发送崩溃信号后系统自动重启该进程 */
+    /** 用 root 权限重启 SystemUI。
+     *  不用 am crash：它会向 system_server 写 dropbox 崩溃记录（system_app_crash）、
+     *  在 logcat 留整段崩溃栈，既污染稳定性统计又可能被诊断云上报。
+     *  直接杀进程即可：SystemUI 是 persistent 进程，死亡后 AMS 立即拉起，全程
+     *  无崩溃记录、logcat 干净。SIGTERM 优先（进程可自行收尾），失败再 SIGKILL。 */
     private void restartSystemUi() {
         try {
-            Process p = Runtime.getRuntime().exec("su");
-            try (java.io.DataOutputStream os = new java.io.DataOutputStream(p.getOutputStream())) {
-                os.writeBytes("am crash com.android.systemui\n");
-                os.writeBytes("exit\n");
-                os.flush();
+            int code = suCmd("killall com.android.systemui");
+            if (code != 0) {
+                // 兜底：SIGTERM 未投递（进程名不匹配等），强制 SIGKILL
+                code = suCmd("killall -9 com.android.systemui");
             }
-            int code = p.waitFor();
             if (code == 0) {
-                toast("已发送重启系统界面指令");
+                toast("已重启系统界面");
             } else {
-                toast("root 指令返回码 " + code);
+                toast("重启失败（killall 返回 " + code + "，需要 root 授权）");
             }
         } catch (Throwable t) {
             toast("重启失败（需要 root）：" + t.getMessage());
+        }
+    }
+
+    /** 以 root 执行单条命令并返回退出码（KernelSU / Magisk 均支持 stdin 管道）。
+     *  -1 表示 su 不可用 / IO 异常，由调用方提示用户。 */
+    private int suCmd(String cmd) {
+        Process p = null;
+        try {
+            p = Runtime.getRuntime().exec("su");
+            java.io.DataOutputStream os = new java.io.DataOutputStream(p.getOutputStream());
+            try {
+                os.writeBytes(cmd + "\n");
+                os.writeBytes("exit\n");
+                os.flush();
+            } finally {
+                try {
+                    os.close();
+                } catch (java.io.IOException ignored) {
+                }
+            }
+            return p.waitFor();
+        } catch (Throwable t) {
+            return -1;
         }
     }
 
