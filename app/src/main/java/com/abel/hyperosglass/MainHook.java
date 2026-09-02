@@ -1420,19 +1420,17 @@ public class MainHook extends XposedModule {
      *  ① combine：AOD 下把 fullAod 置 true，使 keyguard_status_bar 整体 isVisible=true
      *     （否则系统原生 AOD 把整个状态栏含电池都隐藏）；
      *  ② 电池 toggleAodMode：进入 AOD 时把 true 强制 false，电池呈系统状态栏内显样式；
-     *  ③ animateFullAod：a=false→AOD、a=true→锁屏/亮屏，最可靠的「锁屏 vs AOD」判据；
-     *  ④ 可见性强制：控制器 attach 时挂布局监听，sDozing 时把运营商(left_side)、
-     *     信号/WiFi(statusIcons) 持续 GONE；锁屏电池（含百分比）完全跟随系统状态栏，
-     *     模块不触碰、不隐藏；锁屏态 sDozing=false 不干预。
-     * 锁屏安全：sDozing 由 ①②③ 共同维护，任一表明「非 AOD」即置 false，
-     * 可见性监听绝不会在锁屏触发；全部受 sAodBatterySyncFlag 门控，关闭即完全透传。
+     *  ③ animateFullAod：a=false→AOD、a=true→锁屏/亮屏，维护 sDozing 状态。
+     * 设计：本模块仅对电池做样式驱动（toggleAodMode→跟随系统状态栏样式），
+     * 不隐藏/不干预运营商(left_side)、信号/WiFi(statusIcons) 等任何状态栏元素；
+     * AOD 与锁屏状态栏完全跟随系统原生，模块零干预。
+     * 全部受 sAodBatterySyncFlag 门控，关闭即完全透传。
      */
     private void installAodBatteryHooks(ClassLoader cl) {
         LogUtil.logAlways("[息屏电池] installAodBatteryHooks 调用, flag=" + sAodBatterySyncFlag.get());
         installAodCombineHook(cl);
         installAodBatteryModeHook(cl);
         installAodFullAodHook(cl);
-        installAodVisibilityHook(cl);
     }
 
     /** ① AOD 下 fullAod=true 使状态栏可见；记录 dozing。受开关门控。 */
@@ -1534,56 +1532,8 @@ public class MainHook extends XposedModule {
         }
     }
 
-    /** ④ 控制器 attach 时挂布局监听，sDozing 时强制 left_side/statusIcons GONE。 */
-    private void installAodVisibilityHook(ClassLoader cl) {
-        try {
-            Class<?> c = Class.forName(Constants.AOD_KSVC_CLASS, false, cl);
-            Method m = c.getDeclaredMethod("onViewAttached");
-            m.setAccessible(true);
-            hook(m)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("aod-battery-visibility")
-                    .intercept(chain -> {
-                        if (!sAodBatterySyncFlag.get()) return chain.proceed();
-                        Object ret = chain.proceed();
-                        try {
-                            Object ctrl = chain.getThisObject();
-                            Object view = getFieldReflect(ctrl, "mView");
-                            if (view instanceof View) {
-                                Object left = getFieldReflect(view, "mKeyguardLeftSide");
-                                Object sic = getFieldReflect(view, "mStatusIconContainer");
-                                if (left instanceof View) {
-                                    final View ls = (View) left;
-                                    ls.getViewTreeObserver().addOnGlobalLayoutListener(
-                                            () -> {
-                                                if (sAodBatterySyncFlag.get() && sAodDozing
-                                                        && ls.getVisibility() != View.GONE) {
-                                                    ls.setVisibility(View.GONE);
-                                                    LogUtil.log("[息屏电池] 隐藏 left_side（运营商）");
-                                                }
-                                            });
-                                }
-                                if (sic instanceof View) {
-                                    final View cs = (View) sic;
-                                    cs.getViewTreeObserver().addOnGlobalLayoutListener(
-                                            () -> {
-                                                if (sAodBatterySyncFlag.get() && sAodDozing
-                                                        && cs.getVisibility() != View.GONE) {
-                                                    cs.setVisibility(View.GONE);
-                                                    LogUtil.log("[息屏电池] 隐藏 statusIcons（信号/WiFi）");
-                                                }
-                                            });
-                                }
-                            }
-                        } catch (Throwable ignored) {
-                        }
-                        return ret;
-                    });
-            LogUtil.logAlways("[息屏电池] 已挂钩 " + Constants.AOD_KSVC_CLASS + ".onViewAttached");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[息屏电池] onViewAttached 挂钩失败: " + t);
-        }
-    }
+    // ④ 可见性隐藏已取消：AOD/锁屏状态栏完全跟随系统原生，模块不隐藏运营商/信号/WiFi。
+    //   电池仍由 ①②③ 驱动为系统状态栏同款样式（toggleAodMode→系统样式）。
 
     /** 跨父类链读取字段（替代 XposedHelpers.getObjectField，避免额外依赖） */
     private static Object getFieldReflect(Object obj, String name) throws NoSuchFieldException {
