@@ -342,8 +342,7 @@ public class MainHook extends XposedModule {
             if (c == null) return;
             synchronized (glassHooked) {
                 if (glassHooked.contains(c)) {
-                    LogUtil.log("[玻璃] ThemeUtils 副本已挂钩，跳过: " + loader);
-                    return;
+                    return; // 已挂过，幂等跳过；不再为每次插件 loader 复用重复打日志（避免日志风暴 + 跨进程推送耗电）
                 }
                 glassHooked.add(c);
             }

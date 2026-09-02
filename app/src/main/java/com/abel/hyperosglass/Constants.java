@@ -196,7 +196,7 @@ public final class Constants {
      *  锁屏（亮屏）状态栏的所有图标保持系统原生，模块不触碰。
      *  整合自「锁屏状态栏调整」任务（独立模块 AodStatusBar）。 */
     public static final String PREFS_AOD_BATTERY_SYNC = "aod_battery_sync";
-    public static final boolean DEFAULT_AOD_BATTERY_SYNC = false;
+    public static final boolean DEFAULT_AOD_BATTERY_SYNC = true;
 
     // ── 息屏电池状态同步（v3.4，整合自 AodStatusBar）常驻类/索引常量 ──
     /** isVisible 的 combine 变换（Kotlin 内联 lambda） */
