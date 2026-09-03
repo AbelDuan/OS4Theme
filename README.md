@@ -2,7 +2,7 @@
 
 澎湃OS 4 / HyperOS 4 主题增强 **LSPosed 模块**。应用第三方主题后保留系统界面的「液态玻璃」模糊，并提供通知、锁屏等多项体验增强。
 
-- 当前版本：**v3.7**（`versionCode` 77）
+- 当前版本：**v3.8**（`versionCode` 78）
 - 包名：`com.abel.hyperosglass`
 - 框架：LibXposed API **102**（`minApiVersion=100`、`targetApiVersion=102`）
 
@@ -28,7 +28,7 @@
 6. **息屏电池状态同步**（v3.4）— AOD / 息屏场景下，状态栏电池完全同步系统状态栏：图标与百分比均按系统设置显示，模块零干预。
 7. **锁屏密码柔光玻璃**（v3.5）— 锁屏数字键盘圆形柔光玻璃：hook `KeyguardPINView.onFinishInflate`，调用系统 `MiGlassCompat` 接口（`setMiGlassBlurRadius` / `setMiViewMaterialTypeCompat(type=1)` / `setMiGlassCompat`）为 `key0..key9` 插入柔光材质层；仅用系统开放接口，非私有实现。
 8. **手势导航白条**（v3.6）— 手势导航提示线（底部小白条）不可见，但底栏抬高与手势区照常保留：hook `NavigationHandle.onDraw` 与 `QuickswitchOrientedNavHandle.onDraw`（`com.android.systemui.navigationbar.gestural`），开启时直接跳过绘制 → 小白条不画，视图仍占位。
-9. **控制中心编辑**（v3.7）— 下拉控制中心底栏的「编辑」按钮视觉隐藏，但点击区域与编辑入口保留：hook `miui.systemui.controlcenter.panel.main.qs.EditButtonController.onBindViewHolder`（位于 `MIUISystemUIPlugin` 插件 APK 的独立 ClassLoader，经 `PluginFactory.createClassLoader` 拿到插件 loader 后补挂）。`onBindViewHolder` 内已把编辑点击设到 `binding.touchContainer`（LinearLayout），故执行原绑定后对该 View `setVisibility(INVISIBLE)`——INVISIBLE 保留布局占位与指针命中（GONE 才移除点击），实现「隐藏但保留编辑功能」，其余按钮不受影响。
+9. **控制中心编辑**（v3.7 / 修复于 v3.8）— 下拉控制中心底栏的「编辑」按钮视觉隐藏，但点击区域与编辑入口保留：hook `miui.systemui.controlcenter.panel.main.qs.EditButtonController.onBindViewHolder`（位于 `MIUISystemUIPlugin` 插件 APK 的独立 ClassLoader，经 `PluginFactory.createClassLoader` 拿到插件 loader 后补挂）。`onBindViewHolder` 内已把编辑点击设到 `binding.touchContainer`（LinearLayout），故执行原绑定后对该 View `setAlpha(0f)`——alpha 只影响绘制、不改 `VISIBILITY` 标志位，View 仍是 `VISIBLE`、仍接收触摸事件，因此「完全透明但点击命中保留」（v3.7 初版误用 `INVISIBLE`，框架 `canViewReceivePointerEvents` 要求 `VISIBILITY==VISIBLE` 才派发触摸，导致按钮隐了但点不动，v3.8 修正），其余按钮不受影响。
 
 ### 内置功能（无独立开关）
 
@@ -60,7 +60,7 @@
 2. 打开模块设置，按需开关各项功能（默认全开）。
 3. 重启「系统界面 (SystemUI)」使设置生效——设置页提供「重启系统界面」按钮（需 root）。
 
-> 下载已签名 APK：`app/build/outputs/apk/release/app-release.apk`；GitHub Releases 提供按版本命名的产物（如 `OS4Themer-v3.7.apk`）：<https://github.com/AbelDuan/OS4Theme/releases>
+> 下载已签名 APK：`app/build/outputs/apk/release/app-release.apk`；GitHub Releases 提供按版本命名的产物（如 `OS4Themer-v3.8.apk`）：<https://github.com/AbelDuan/OS4Theme/releases>
 
 ## 设置说明
 

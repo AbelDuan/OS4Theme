@@ -299,8 +299,11 @@ public class MainHook extends XposedModule {
      * 该控制器位于插件 APK（miui.systemui.controlcenter 包）的独立 ClassLoader，
      * 故 loader 参数来自 PluginFactory.createClassLoader 回调。
      * onBindViewHolder() 内已把编辑点击设到 binding.touchContainer（LinearLayout），
-     * 故执行原逻辑后把该 View setVisibility(INVISIBLE) —— INVISIBLE 保留布局占位与
-     * 点击命中（GONE 才会移除点击），实现「隐藏但保留编辑功能」。
+     * 故执行原逻辑后把该 View setAlpha(0f) —— alpha 只影响绘制、不改 VISIBILITY 标志位，
+     * View 仍是 VISIBLE、仍接收触摸事件，因此「完全透明但点击命中保留」，实现「隐藏但
+     * 保留编辑功能」。注意：必须用 alpha(0f) 而非 INVISIBLE —— Android 的
+     * ViewGroup.canViewReceivePointerEvents 要求 VISIBILITY_MASK==VISIBLE 才分发触摸，
+     * INVISIBLE/GONE 都会让按钮收不到点击（v3.7 初版踩坑：按钮隐了但点不动）。
      */
     private void tryHookQsEditIn(ClassLoader loader) {
         if (loader == null) return;
@@ -321,14 +324,15 @@ public class MainHook extends XposedModule {
                         if (!sQsEditHideFlag.get()) return null;
                         try {
                             Object controller = chain.getThisObject();
-                            // getEditButton() 是 private final，内部返回 binding.touchContainer（LinearLayout）
+                            // getEditButton() 是 private final，内部返回 binding.touchContainer（LinearLayout，点击监听挂这里）
                             Method getEditButton = c.getDeclaredMethod("getEditButton");
                             getEditButton.setAccessible(true);
                             View v = (View) getEditButton.invoke(controller);
-                            if (v != null && v.getVisibility() != View.INVISIBLE) {
-                                v.setVisibility(View.INVISIBLE);
+                            if (v != null && v.getAlpha() != 0f) {
+                                // alpha(0f)：透明但不改 VISIBILITY，仍 VISIBLE → 仍收触摸，点击命中保留
+                                v.setAlpha(0f);
                                 LogUtil.logAlwaysOnce("qs-edit-hide",
-                                        "[控制中心编辑] 已对「编辑」按钮设 INVISIBLE（隐藏但保留点击）");
+                                        "[控制中心编辑] 已对「编辑」按钮设 alpha(0f)（完全透明但保留点击）");
                             }
                         } catch (Throwable t) {
                             LogUtil.logAlways("[控制中心编辑] 命中处理异常: " + t);
