@@ -31,8 +31,8 @@
 
 ### 内置功能（无独立开关）
 
-8. **通知展开按钮白透** — 跟随「三方主题液态玻璃」开关。把展开按钮的染色替换为白透药丸 / 清 tint，避免第三方主题把按钮染成深色。
-9. **媒体岛崩溃防御** — 无开关，系统 bug 必要保护。捕获播放媒体时 `MiPalette` 加载库失败导致的 `UnsatisfiedLinkError`，避免 SystemUI 主线程崩溃循环（系统原版即崩，与模块功能无关）。
+9. **通知展开按钮白透** — 跟随「三方主题液态玻璃」开关。把展开按钮的染色替换为白透药丸 / 清 tint，避免第三方主题把按钮染成深色。
+10. **媒体岛崩溃防御** — 无开关，系统 bug 必要保护。捕获播放媒体时 `MiPalette` 加载库失败导致的 `UnsatisfiedLinkError`，避免 SystemUI 主线程崩溃循环（系统原版即崩，与模块功能无关）。
 
 ## 工作原理（简要）
 
@@ -59,7 +59,8 @@
 2. 打开模块设置，按需开关各项功能（默认全开）。
 3. 重启「系统界面 (SystemUI)」使设置生效——设置页提供「重启系统界面」按钮（需 root）。
 
-> 下载已签名 APK：`app/build/outputs/apk/release/app-release.apk`；GitHub Releases 提供按版本命名的产物（如 `OS4Themer-v3.6.apk`）：<https://github.com/AbelDuan/OS4Theme/releases>
+> **下载最新版 v3.6**：[`OS4Themer-v3.6.apk`](https://github.com/AbelDuan/OS4Theme/releases/download/v3.6/OS4Themer-v3.6.apk)
+> 所有历史版本与变更说明见 [GitHub Releases](https://github.com/AbelDuan/OS4Theme/releases)。本地构建产物：`app/build/outputs/apk/release/app-release.apk`。
 
 ## 设置说明
 
