@@ -2,7 +2,7 @@
 
 澎湃OS 4 / HyperOS 4 主题增强 **LSPosed 模块**。应用第三方主题后保留系统界面的「液态玻璃」模糊，并提供通知、锁屏等多项体验增强。
 
-- 当前版本：**v3.3.11**（`versionCode` 61）
+- 当前版本：**v3.5**（`versionCode` 75）
 - 包名：`com.abel.hyperosglass`
 - 框架：LibXposed API **102**（`minApiVersion=100`、`targetApiVersion=102`）
 
@@ -25,11 +25,13 @@
 3. **通知下沉** — 关闭锁屏「指纹让位」额外 shelf 空间，通知铺满下沉，不再被指纹图标顶到上方。
 4. **锁屏指纹图标 / 动画隐藏** — 仅锁屏（解锁）场景生效；支付、应用内指纹完全不受影响。
 5. **通知清除按钮隐藏** — 隐藏通知面板的「清除通知」按钮（图标置不可见 + 容器移出屏外，不拦截触摸）。
+6. **息屏电池状态同步**（v3.4）— AOD / 息屏场景下，状态栏电池完全同步系统状态栏：图标与百分比均按系统设置显示，模块零干预。
+7. **锁屏密码柔光玻璃**（v3.5）— 锁屏数字键盘圆形柔光玻璃：hook `KeyguardPINView.onFinishInflate`，调用系统 `MiGlassCompat` 接口（`setMiGlassBlurRadius` / `setMiViewMaterialTypeCompat(type=1)` / `setMiGlassCompat`）为 `key0..key9` 插入柔光材质层；仅用系统开放接口，非私有实现。
 
 ### 内置功能（无独立开关）
 
-6. **通知展开按钮白透** — 跟随「三方主题液态玻璃」开关。把展开按钮的染色替换为白透药丸 / 清 tint，避免第三方主题把按钮染成深色。
-7. **媒体岛崩溃防御** — 无开关，系统 bug 必要保护。捕获播放媒体时 `MiPalette` 加载库失败导致的 `UnsatisfiedLinkError`，避免 SystemUI 主线程崩溃循环（系统原版即崩，与模块功能无关）。
+8. **通知展开按钮白透** — 跟随「三方主题液态玻璃」开关。把展开按钮的染色替换为白透药丸 / 清 tint，避免第三方主题把按钮染成深色。
+9. **媒体岛崩溃防御** — 无开关，系统 bug 必要保护。捕获播放媒体时 `MiPalette` 加载库失败导致的 `UnsatisfiedLinkError`，避免 SystemUI 主线程崩溃循环（系统原版即崩，与模块功能无关）。
 
 ## 工作原理（简要）
 
@@ -56,7 +58,7 @@
 2. 打开模块设置，按需开关各项功能（默认全开）。
 3. 重启「系统界面 (SystemUI)」使设置生效——设置页提供「重启系统界面」按钮（需 root）。
 
-> 下载已签名 APK：`app/build/outputs/apk/release/app-release.apk`，或前往 GitHub Releases：<https://github.com/AbelDuan/OS4Theme/releases>
+> 下载已签名 APK：`app/build/outputs/apk/release/app-release.apk`；GitHub Releases 提供按版本命名的产物（如 `OS4Themer-v3.5.apk`）：<https://github.com/AbelDuan/OS4Theme/releases>
 
 ## 设置说明
 
