@@ -3,6 +3,7 @@ package com.abel.hyperosglass;
 import android.content.SharedPreferences;
 import android.provider.Settings;
 import android.content.res.ColorStateList;
+import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Outline;
 import android.graphics.drawable.GradientDrawable;
@@ -108,6 +109,12 @@ public class MainHook extends XposedModule {
     /** 锁屏密码键盘柔光玻璃开关（AtomicBoolean） */
     private static final java.util.concurrent.atomic.AtomicBoolean sPinGlassFlag =
             new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_PIN_GLASS);
+    /** 隐藏手势导航小白条开关（AtomicBoolean，供热路径拦截器读取） */
+    private static final java.util.concurrent.atomic.AtomicBoolean sNavHandleHideFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_NAV_HANDLE_HIDE);
+    /** 一次性重绘守卫（避免 invalidate 重入循环）：记录已触发清空旧画面的手柄 View */
+    private static final java.util.WeakHashMap<View, Boolean> sNavHandleCleared =
+            new java.util.WeakHashMap<>();
     // v3.3.11 日志精简：删除此处原有的 10 个「前 N 次记日志」计数器
     // （flow1/flow2/glassSet/glassUpd/poke/pluginCl/islandDef/expandFix/miBlur/hideFod/dismiss）。
     // 统一改用 LogUtil.logAlwaysOnce(key, msg)：常开、但每种事件全进程只记 1 条。
@@ -155,6 +162,7 @@ public class MainHook extends XposedModule {
             installFocusGlassHooks(cl);
             installAodBatteryHooks(cl);
             installPinGlassHook(cl);
+            installNavHandleHideHook(cl);
         } catch (Throwable t) {
             LogUtil.logAlways("onPackageLoaded 异常: " + t);
         }
@@ -195,6 +203,64 @@ public class MainHook extends XposedModule {
             LogUtil.logAlways("[密码玻璃] 已挂钩 " + Constants.PIN_VIEW_CLASS + ".onFinishInflate");
         } catch (Throwable t) {
             LogUtil.logAlways("[密码玻璃] 挂钩失败: " + t);
+        }
+    }
+
+    // ============================================================
+    // 隐藏手势导航小白条（v3.6）
+    //
+    // 原理：手势提示线（小白条）由 NavigationHandle / QuickswitchOrientedNavHandle
+    //  的 onDraw(Canvas) 绘制白色药丸。开启时**直接跳过 onDraw** → 不绘制 →
+    //  小白条不可见；但视图本身仍按原尺寸占位（measure/layout/insets 不变），
+    //  手势区与底栏抬高（系统 window insets）照常保留——即「隐藏小白条但保留底栏」。
+    //  两类的 onDraw 均为各自 override（dexdump 实证：protected onDraw(Canvas)V），
+    //  分别 hook 覆盖 主屏/home 与 多任务(quickswitch) 场景。
+    // ============================================================
+
+    /** 拦截两个导航手柄的 onDraw；开启隐藏时跳过绘制（小白条不可见，底栏保留） */
+    private void installNavHandleHideHook(ClassLoader cl) {
+        boolean any = false;
+        if (hookNavHandleOnDraw(cl, Constants.NAV_HANDLE_CLASS, "nav-handle-hide")) any = true;
+        if (hookNavHandleOnDraw(cl, Constants.QUICKSWITCH_NAV_HANDLE_CLASS,
+                "nav-handle-hide-quickswitch")) any = true;
+        if (any) {
+            LogUtil.logAlways("[小白条] 已挂钩导航手柄 onDraw（隐藏小白条，保留底栏抬高）");
+        } else {
+            LogUtil.logAlways("[小白条] 未找到任一导航手柄类，跳过");
+        }
+    }
+
+    /** 对指定类 hook onDraw(Canvas)：开启隐藏时直接 return 跳过绘制 */
+    private boolean hookNavHandleOnDraw(ClassLoader cl, String className, String id) {
+        try {
+            Class<?> c = Class.forName(className, false, cl);
+            Method m = c.getDeclaredMethod("onDraw", Canvas.class);
+            m.setAccessible(true);
+            hook(m)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId(id)
+                    .intercept(chain -> {
+                        if (sNavHandleHideFlag.get()) {
+                            // 跳过绘制：小白条不可见；视图仍占位 → 手势区/底栏抬高保留
+                            Object thisObj = chain.getThisObject();
+                            if (thisObj instanceof View) {
+                                View v = (View) thisObj;
+                                // 仅首次跳过时触发一次重绘，清空框架残存的旧小白条
+                                // （重启 SystemUI 后手柄是新建的，本就首帧即清空；
+                                //  运行时切开关则需主动 invalidate 一次）
+                                if (!sNavHandleCleared.containsKey(v)) {
+                                    sNavHandleCleared.put(v, Boolean.TRUE);
+                                    v.post(v::invalidate);
+                                }
+                            }
+                            return null;
+                        }
+                        return chain.proceed();
+                    });
+            return true;
+        } catch (Throwable t) {
+            LogUtil.logAlways("[小白条] 挂钩失败 " + className + ": " + t);
+            return false;
         }
     }
 
@@ -386,6 +452,8 @@ public class MainHook extends XposedModule {
                     Constants.DEFAULT_AOD_BATTERY_SYNC);
             boolean newPinGlass = sPrefs.getBoolean(Constants.PREFS_PIN_GLASS,
                     Constants.DEFAULT_PIN_GLASS);
+            boolean newNavHandleHide = sPrefs.getBoolean(Constants.PREFS_NAV_HANDLE_HIDE,
+                    Constants.DEFAULT_NAV_HANDLE_HIDE);
             boolean log = sPrefs.getBoolean(Constants.PREFS_ENABLE_LOG,
                     Constants.DEFAULT_ENABLE_LOG);
             sSinkEnabled = newSink;
@@ -400,11 +468,13 @@ public class MainHook extends XposedModule {
             sFocusGlassFlag.set(newFocusGlass);
             sAodBatterySyncFlag.set(newAod);
             sPinGlassFlag.set(newPinGlass);
+            sNavHandleHideFlag.set(newNavHandleHide);
             LogUtil.setEnabled(log);
             LogUtil.logAlways("设置(框架)：sink=" + sSinkEnabled + "，glass=" + sGlassEnabled
                     + "，hideLockFod=" + sHideLockFod + "，hideDismiss=" + sHideDismissBtn
                     + "，focusGlass=" + sFocusGlass + "，aodBattery=" + newAod
-                    + "，pinGlass=" + newPinGlass + "，日志=" + log);
+                    + "，pinGlass=" + newPinGlass + "，navHandleHide=" + newNavHandleHide
+                    + "，日志=" + log);
         } catch (Throwable t) {
             LogUtil.logAlways("读取设置失败: " + t);
         }
@@ -471,6 +541,8 @@ public class MainHook extends XposedModule {
                     Constants.DEFAULT_AOD_BATTERY_SYNC);
             boolean pinGlass = out.getBoolean(Constants.PREFS_PIN_GLASS,
                     Constants.DEFAULT_PIN_GLASS);
+            boolean navHandleHide = out.getBoolean(Constants.PREFS_NAV_HANDLE_HIDE,
+                    Constants.DEFAULT_NAV_HANDLE_HIDE);
             boolean log = out.getBoolean(Constants.PREFS_ENABLE_LOG,
                     Constants.DEFAULT_ENABLE_LOG);
             sSinkEnabled = sink;
@@ -485,11 +557,13 @@ public class MainHook extends XposedModule {
             sFocusGlassFlag.set(focus);
             sAodBatterySyncFlag.set(aod);
             sPinGlassFlag.set(pinGlass);
+            sNavHandleHideFlag.set(navHandleHide);
             LogUtil.setEnabled(log);
             LogUtil.logAlways("设置(真实值同步)：sink=" + sink + "，glass=" + glass
                     + "，hideLockFod=" + fod + "，hideDismiss=" + dismiss
                     + "，focusGlass=" + focus + "，aodBattery=" + aod
-                    + "，pinGlass=" + pinGlass + "，日志=" + log);
+                    + "，pinGlass=" + pinGlass + "，navHandleHide=" + navHandleHide
+                    + "，日志=" + log);
         } catch (Throwable t) {
             LogUtil.logAlways("设置(真实值同步) 应用失败: " + t);
         }

@@ -32,7 +32,7 @@ public final class Constants {
     public static final String TARGET_PKG = "com.android.systemui";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.5";
+    public static final String VERSION = "3.6";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -202,6 +202,12 @@ public final class Constants {
     public static final String PREFS_PIN_GLASS = "pin_glass";
     public static final boolean DEFAULT_PIN_GLASS = true;
 
+    /** 隐藏手势导航小白条（v3.6，默认开启）：拦截 NavigationHandle /
+     *  QuickswitchOrientedNavHandle 的 onDraw，开启时跳过绘制 → 手势提示线
+     *  （小白条）不可见，但视图仍占位、手势区与底栏抬高（insets）保留。 */
+    public static final String PREFS_NAV_HANDLE_HIDE = "nav_handle_hide";
+    public static final boolean DEFAULT_NAV_HANDLE_HIDE = true;
+
     // ── 息屏电池状态同步（v3.4，整合自 AodStatusBar）常驻类/索引常量 ──
     /** isVisible 的 combine 变换（Kotlin 内联 lambda） */
     public static final String AOD_COMBINE_CLASS =
@@ -259,6 +265,17 @@ public final class Constants {
             1.2f, 1f, -0.4f, 0.6f, -0.8f, 1.4f, 0.7f, 0.8f, 1.15f, 4f, 2f,
             0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f,
     };
+
+    // ── 隐藏手势导航小白条（v3.6）──
+    /** 手势导航手柄（home/后台/返回 三键合一小白条所在 View；onDraw 绘制白色药丸） */
+    public static final String NAV_HANDLE_CLASS =
+            "com.android.systemui.navigationbar.gestural.NavigationHandle";
+    /** 多任务/快速切换（quickswitch）场景下的定向手柄（继承 NavigationHandle，
+     *  同样 override onDraw 绘制小白条） */
+    public static final String QUICKSWITCH_NAV_HANDLE_CLASS =
+            "com.android.systemui.navigationbar.gestural.QuickswitchOrientedNavHandle";
+    /** onDraw 的 Canvas 参数类型 */
+    public static final String CANVAS_CLASS = "android.graphics.Canvas";
 
     // ── 通知清除按钮图标隐藏（v3.3.2：原位置不动，仅图标 INVISIBLE）──
     /** 按钮 View 的 id 资源名（aapt2 确认 0x7f0b0865；CircleAndTickAnimView） */
