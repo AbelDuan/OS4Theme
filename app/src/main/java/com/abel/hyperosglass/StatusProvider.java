@@ -64,6 +64,8 @@ public class StatusProvider extends ContentProvider {
                             Constants.PREFS_PIN_GLASS, Constants.DEFAULT_PIN_GLASS))
                     .putBoolean(Constants.PREFS_NAV_HANDLE_HIDE, sp.getBoolean(
                             Constants.PREFS_NAV_HANDLE_HIDE, Constants.DEFAULT_NAV_HANDLE_HIDE))
+                    .putBoolean(Constants.PREFS_QS_EDIT_HIDE, sp.getBoolean(
+                            Constants.PREFS_QS_EDIT_HIDE, Constants.DEFAULT_QS_EDIT_HIDE))
                     .putBoolean(Constants.PREFS_ENABLE_LOG, sp.getBoolean(
                             Constants.PREFS_ENABLE_LOG, Constants.DEFAULT_ENABLE_LOG))
                     .commit();
@@ -87,6 +89,8 @@ public class StatusProvider extends ContentProvider {
                 sp.getBoolean(Constants.PREFS_PIN_GLASS, Constants.DEFAULT_PIN_GLASS));
         out.putBoolean(Constants.PREFS_NAV_HANDLE_HIDE,
                 sp.getBoolean(Constants.PREFS_NAV_HANDLE_HIDE, Constants.DEFAULT_NAV_HANDLE_HIDE));
+        out.putBoolean(Constants.PREFS_QS_EDIT_HIDE,
+                sp.getBoolean(Constants.PREFS_QS_EDIT_HIDE, Constants.DEFAULT_QS_EDIT_HIDE));
         out.putBoolean(Constants.PREFS_ENABLE_LOG,
                 sp.getBoolean(Constants.PREFS_ENABLE_LOG, Constants.DEFAULT_ENABLE_LOG));
         out.putBoolean("ok", true);

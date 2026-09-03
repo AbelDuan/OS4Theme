@@ -112,7 +112,10 @@ public class SettingsActivity extends Activity {
             boolean navHandle = de.contains(Constants.PREFS_NAV_HANDLE_HIDE)
                     ? de.getBoolean(Constants.PREFS_NAV_HANDLE_HIDE, Constants.DEFAULT_NAV_HANDLE_HIDE)
                     : ce.getBoolean(Constants.PREFS_NAV_HANDLE_HIDE, Constants.DEFAULT_NAV_HANDLE_HIDE);
-            writeAllPrefs(glass, sink, fod, dismiss, focus, aod, pinGlass, navHandle, log);
+            boolean qsEditHide = de.contains(Constants.PREFS_QS_EDIT_HIDE)
+                    ? de.getBoolean(Constants.PREFS_QS_EDIT_HIDE, Constants.DEFAULT_QS_EDIT_HIDE)
+                    : ce.getBoolean(Constants.PREFS_QS_EDIT_HIDE, Constants.DEFAULT_QS_EDIT_HIDE);
+            writeAllPrefs(glass, sink, fod, dismiss, focus, aod, pinGlass, navHandle, qsEditHide, log);
         } catch (Throwable ignored) {
         }
     }
@@ -130,6 +133,7 @@ public class SettingsActivity extends Activity {
                     sp.getBoolean(Constants.PREFS_AOD_BATTERY_SYNC, Constants.DEFAULT_AOD_BATTERY_SYNC),
                     sp.getBoolean(Constants.PREFS_PIN_GLASS, Constants.DEFAULT_PIN_GLASS),
                     sp.getBoolean(Constants.PREFS_NAV_HANDLE_HIDE, Constants.DEFAULT_NAV_HANDLE_HIDE),
+                    sp.getBoolean(Constants.PREFS_QS_EDIT_HIDE, Constants.DEFAULT_QS_EDIT_HIDE),
                     sp.getBoolean(Constants.PREFS_ENABLE_LOG, Constants.DEFAULT_ENABLE_LOG));
         } catch (Throwable ignored) {
         }
@@ -148,7 +152,8 @@ public class SettingsActivity extends Activity {
     /** 双写全部开关到 DE + CE（v3.3.4：CE 让框架同步路径生效，DE 供直启读取） */
     private void writeAllPrefs(boolean glass, boolean sink, boolean fod,
                                boolean dismiss, boolean focus, boolean aod,
-                               boolean pinGlass, boolean navHandle, boolean log) {
+                               boolean pinGlass, boolean navHandle,
+                               boolean qsEditHide, boolean log) {
         try {
             sp().edit()
                     .putBoolean(Constants.PREFS_GLASS_ENABLED, glass)
@@ -159,6 +164,7 @@ public class SettingsActivity extends Activity {
                     .putBoolean(Constants.PREFS_AOD_BATTERY_SYNC, aod)
                     .putBoolean(Constants.PREFS_PIN_GLASS, pinGlass)
                     .putBoolean(Constants.PREFS_NAV_HANDLE_HIDE, navHandle)
+                    .putBoolean(Constants.PREFS_QS_EDIT_HIDE, qsEditHide)
                     .putBoolean(Constants.PREFS_ENABLE_LOG, log)
                     .commit();
             ceSp().edit()
@@ -170,6 +176,7 @@ public class SettingsActivity extends Activity {
                     .putBoolean(Constants.PREFS_AOD_BATTERY_SYNC, aod)
                     .putBoolean(Constants.PREFS_PIN_GLASS, pinGlass)
                     .putBoolean(Constants.PREFS_NAV_HANDLE_HIDE, navHandle)
+                    .putBoolean(Constants.PREFS_QS_EDIT_HIDE, qsEditHide)
                     .putBoolean(Constants.PREFS_ENABLE_LOG, log)
                     .commit();
         } catch (Throwable ignored) {
@@ -233,7 +240,9 @@ public class SettingsActivity extends Activity {
                 Constants.DEFAULT_HIDE_LOCK_FOD);
         addSwitch(cardHide, "通知清除按钮", Constants.PREFS_HIDE_DISMISS_BTN,
                 Constants.DEFAULT_HIDE_DISMISS_BTN);
-        addSwitch(cardHide, "手势小白条", Constants.PREFS_NAV_HANDLE_HIDE,
+        addSwitch(cardHide, "控制中心编辑", Constants.PREFS_QS_EDIT_HIDE,
+                Constants.DEFAULT_QS_EDIT_HIDE);
+        addSwitch(cardHide, "手势导航白条", Constants.PREFS_NAV_HANDLE_HIDE,
                 Constants.DEFAULT_NAV_HANDLE_HIDE);
         root.addView(cardHide, cardLp());
 

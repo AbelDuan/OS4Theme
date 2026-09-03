@@ -84,6 +84,9 @@ public class MainHook extends XposedModule {
             Collections.newSetFromMap(new WeakHashMap<Class<?>, Boolean>());
     /** 已挂钩的通知下沉目标类（每个类独立去重） */
     private static final Set<String> sinkHooked = new HashSet<String>();
+    /** 已挂钩的控制中心「编辑」按钮控制器类（插件 loader，按 Class 身份去重） */
+    private static final Set<Class<?>> qsEditHooked =
+            Collections.newSetFromMap(new WeakHashMap<Class<?>, Boolean>());
 
     // ---- 设置（LibXposed 框架直供 getRemotePreferences）----
     private volatile SharedPreferences sPrefs;
@@ -112,6 +115,9 @@ public class MainHook extends XposedModule {
     /** 隐藏手势导航小白条开关（AtomicBoolean，供热路径拦截器读取） */
     private static final java.util.concurrent.atomic.AtomicBoolean sNavHandleHideFlag =
             new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_NAV_HANDLE_HIDE);
+    /** 隐藏控制中心「编辑」按钮开关（v3.7，默认开：隐藏但保留点击进入编辑） */
+    private static final java.util.concurrent.atomic.AtomicBoolean sQsEditHideFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_QS_EDIT_HIDE);
     /** 一次性重绘守卫（避免 invalidate 重入循环）：记录已触发清空旧画面的手柄 View */
     private static final java.util.WeakHashMap<View, Boolean> sNavHandleCleared =
             new java.util.WeakHashMap<>();
@@ -163,6 +169,7 @@ public class MainHook extends XposedModule {
             installAodBatteryHooks(cl);
             installPinGlassHook(cl);
             installNavHandleHideHook(cl);
+            installQsEditHideHook(cl);
         } catch (Throwable t) {
             LogUtil.logAlways("onPackageLoaded 异常: " + t);
         }
@@ -261,6 +268,80 @@ public class MainHook extends XposedModule {
         } catch (Throwable t) {
             LogUtil.logAlways("[小白条] 挂钩失败 " + className + ": " + t);
             return false;
+        }
+    }
+
+    // ============================================================
+    // 隐藏控制中心「编辑」按钮（v3.7）
+    //
+    // 需求：隐藏下拉控制中心底栏的「编辑」按钮，但点击仍能进入磁贴编辑
+    // （保留实际功能，参考 HyperCeiler 思路但适配 HyperOS 4 的 Compose footer）。
+    //
+    // 实现：HyperOS 4 控制中心底栏是 Compose（FooterActionsKt.AnimatedFooterTextButton
+    //  渲染每个 footer 文本按钮，含「编辑」）。每个按钮自带 onClick，故只需对
+    //  「编辑」按钮的 Modifier 追加 alpha(0f)——alpha 只影响绘制、不改指针命中区域，
+    //  视觉透明但点击区域与 onClick 不变 → 「隐藏但保留功能」。其余文本按钮
+    //  （如「设置」）不受影响。全程 PROTECTIVE + 全 catch，类名/字段不符即放行原逻辑。
+    // ============================================================
+
+    /**
+     * 隐藏控制中心「编辑」按钮（v3.7）。
+     * 入口：在 onPackageLoaded 用宿主 cl 先试一次（少数 ROM 插件类并入宿主 dex），
+     * 真正的目标在 MiuiSystemUIPlugin 插件 ClassLoader，由 installGlassHooks 的
+     * PluginFactory.createClassLoader 回调统一补挂（见 tryHookQsEditIn）。
+     */
+    private void installQsEditHideHook(ClassLoader cl) {
+        tryHookQsEditIn(cl); // 宿主 loader 试探（不存在则静默）
+    }
+
+    /**
+     * 用指定 ClassLoader 找 EditButtonController 并挂 onBindViewHolder（幂等，成功一次即止）。
+     * 该控制器位于插件 APK（miui.systemui.controlcenter 包）的独立 ClassLoader，
+     * 故 loader 参数来自 PluginFactory.createClassLoader 回调。
+     * onBindViewHolder() 内已把编辑点击设到 binding.touchContainer（LinearLayout），
+     * 故执行原逻辑后把该 View setVisibility(INVISIBLE) —— INVISIBLE 保留布局占位与
+     * 点击命中（GONE 才会移除点击），实现「隐藏但保留编辑功能」。
+     */
+    private void tryHookQsEditIn(ClassLoader loader) {
+        if (loader == null) return;
+        try {
+            final Class<?> c = Class.forName(Constants.QS_EDIT_CONTROLLER_CLASS, false, loader);
+            if (c == null) return;
+            synchronized (qsEditHooked) {
+                if (qsEditHooked.contains(c)) return; // 幂等，避免插件 loader 复用重复打日志
+                qsEditHooked.add(c);
+            }
+            final Method onBind = c.getDeclaredMethod("onBindViewHolder"); // ()V，无参
+            onBind.setAccessible(true);
+            hook(onBind)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("qs-edit-hide")
+                    .intercept(chain -> {
+                        chain.proceed(); // 先完成绑定 + 挂好点击监听
+                        if (!sQsEditHideFlag.get()) return null;
+                        try {
+                            Object controller = chain.getThisObject();
+                            // getEditButton() 是 private final，内部返回 binding.touchContainer（LinearLayout）
+                            Method getEditButton = c.getDeclaredMethod("getEditButton");
+                            getEditButton.setAccessible(true);
+                            View v = (View) getEditButton.invoke(controller);
+                            if (v != null && v.getVisibility() != View.INVISIBLE) {
+                                v.setVisibility(View.INVISIBLE);
+                                LogUtil.logAlwaysOnce("qs-edit-hide",
+                                        "[控制中心编辑] 已对「编辑」按钮设 INVISIBLE（隐藏但保留点击）");
+                            }
+                        } catch (Throwable t) {
+                            LogUtil.logAlways("[控制中心编辑] 命中处理异常: " + t);
+                        }
+                        return null;
+                    });
+            LogUtil.logAlways("[控制中心编辑] 已挂钩 EditButtonController.onBindViewHolder（插件 loader）");
+        } catch (Throwable t) {
+            // ClassNotFoundException 属预期（宿主 loader / 其他插件 loader 不含此类），不刷误报；
+            // 仅记录真正的异常，避免对其他插件 pop 出「失败」字样。
+            if (!(t instanceof ClassNotFoundException)) {
+                LogUtil.logAlways("[控制中心编辑] 挂钩失败: " + t);
+            }
         }
     }
 
@@ -454,6 +535,8 @@ public class MainHook extends XposedModule {
                     Constants.DEFAULT_PIN_GLASS);
             boolean newNavHandleHide = sPrefs.getBoolean(Constants.PREFS_NAV_HANDLE_HIDE,
                     Constants.DEFAULT_NAV_HANDLE_HIDE);
+            boolean newQsEditHide = sPrefs.getBoolean(Constants.PREFS_QS_EDIT_HIDE,
+                    Constants.DEFAULT_QS_EDIT_HIDE);
             boolean log = sPrefs.getBoolean(Constants.PREFS_ENABLE_LOG,
                     Constants.DEFAULT_ENABLE_LOG);
             sSinkEnabled = newSink;
@@ -469,11 +552,13 @@ public class MainHook extends XposedModule {
             sAodBatterySyncFlag.set(newAod);
             sPinGlassFlag.set(newPinGlass);
             sNavHandleHideFlag.set(newNavHandleHide);
+            sQsEditHideFlag.set(newQsEditHide);
             LogUtil.setEnabled(log);
             LogUtil.logAlways("设置(框架)：sink=" + sSinkEnabled + "，glass=" + sGlassEnabled
                     + "，hideLockFod=" + sHideLockFod + "，hideDismiss=" + sHideDismissBtn
                     + "，focusGlass=" + sFocusGlass + "，aodBattery=" + newAod
                     + "，pinGlass=" + newPinGlass + "，navHandleHide=" + newNavHandleHide
+                    + "，qsEditHide=" + newQsEditHide
                     + "，日志=" + log);
         } catch (Throwable t) {
             LogUtil.logAlways("读取设置失败: " + t);
@@ -543,6 +628,8 @@ public class MainHook extends XposedModule {
                     Constants.DEFAULT_PIN_GLASS);
             boolean navHandleHide = out.getBoolean(Constants.PREFS_NAV_HANDLE_HIDE,
                     Constants.DEFAULT_NAV_HANDLE_HIDE);
+            boolean qsEditHide = out.getBoolean(Constants.PREFS_QS_EDIT_HIDE,
+                    Constants.DEFAULT_QS_EDIT_HIDE);
             boolean log = out.getBoolean(Constants.PREFS_ENABLE_LOG,
                     Constants.DEFAULT_ENABLE_LOG);
             sSinkEnabled = sink;
@@ -558,11 +645,13 @@ public class MainHook extends XposedModule {
             sAodBatterySyncFlag.set(aod);
             sPinGlassFlag.set(pinGlass);
             sNavHandleHideFlag.set(navHandleHide);
+            sQsEditHideFlag.set(qsEditHide);
             LogUtil.setEnabled(log);
             LogUtil.logAlways("设置(真实值同步)：sink=" + sink + "，glass=" + glass
                     + "，hideLockFod=" + fod + "，hideDismiss=" + dismiss
                     + "，focusGlass=" + focus + "，aodBattery=" + aod
                     + "，pinGlass=" + pinGlass + "，navHandleHide=" + navHandleHide
+                    + "，qsEditHide=" + qsEditHide
                     + "，日志=" + log);
         } catch (Throwable t) {
             LogUtil.logAlways("设置(真实值同步) 应用失败: " + t);
@@ -615,6 +704,8 @@ public class MainHook extends XposedModule {
                                 tryHookThemeUtilsIn((ClassLoader) loader);
                                 // v3.3.9：补挂 MiBlurCompat（线 A 总闸门，仅液态模式强制 true）。
                                 tryHookMiBlurCompatIn((ClassLoader) loader);
+                                // v3.7：补挂控制中心「编辑」按钮隐藏（插件 loader）
+                                tryHookQsEditIn((ClassLoader) loader);
                             }
                             return loader;
                         }

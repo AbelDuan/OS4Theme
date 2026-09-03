@@ -32,7 +32,7 @@ public final class Constants {
     public static final String TARGET_PKG = "com.android.systemui";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.6";
+    public static final String VERSION = "3.7";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -276,6 +276,22 @@ public final class Constants {
             "com.android.systemui.navigationbar.gestural.QuickswitchOrientedNavHandle";
     /** onDraw 的 Canvas 参数类型 */
     public static final String CANVAS_CLASS = "android.graphics.Canvas";
+
+    // ── 隐藏控制中心「编辑」按钮（v3.7，默认开启）──
+    /**
+     * 控制中心（下拉快捷设置）的「编辑」按钮控制器（dexdump 实证）。
+     * 位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk 的
+     * miui.systemui.controlcenter 包 —— 即插件独立 ClassLoader，必须借
+     * PluginFactory.createClassLoader() 拿插件 loader 才能 Class.forName。
+     * onBindViewHolder() 内会 setOnClickListenerEx 把编辑点击设到
+     * binding.touchContainer（LinearLayout），故在 bind 之后把该 View
+     * setVisibility(INVISIBLE) 即可「隐藏但保留点击进入编辑」。
+     */
+    public static final String QS_EDIT_CONTROLLER_CLASS =
+            "miui.systemui.controlcenter.panel.main.qs.EditButtonController";
+    /** 隐藏开关 key（默认开：隐藏但保留编辑功能） */
+    public static final String PREFS_QS_EDIT_HIDE = "qs_edit_hide";
+    public static final boolean DEFAULT_QS_EDIT_HIDE = true;
 
     // ── 通知清除按钮图标隐藏（v3.3.2：原位置不动，仅图标 INVISIBLE）──
     /** 按钮 View 的 id 资源名（aapt2 确认 0x7f0b0865；CircleAndTickAnimView） */
