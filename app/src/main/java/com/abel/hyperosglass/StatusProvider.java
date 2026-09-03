@@ -60,6 +60,8 @@ public class StatusProvider extends ContentProvider {
                             Constants.PREFS_FOCUS_GLASS, Constants.DEFAULT_FOCUS_GLASS))
                     .putBoolean(Constants.PREFS_AOD_BATTERY_SYNC, sp.getBoolean(
                             Constants.PREFS_AOD_BATTERY_SYNC, Constants.DEFAULT_AOD_BATTERY_SYNC))
+                    .putBoolean(Constants.PREFS_PIN_GLASS, sp.getBoolean(
+                            Constants.PREFS_PIN_GLASS, Constants.DEFAULT_PIN_GLASS))
                     .putBoolean(Constants.PREFS_ENABLE_LOG, sp.getBoolean(
                             Constants.PREFS_ENABLE_LOG, Constants.DEFAULT_ENABLE_LOG))
                     .commit();
@@ -79,6 +81,8 @@ public class StatusProvider extends ContentProvider {
                 sp.getBoolean(Constants.PREFS_FOCUS_GLASS, Constants.DEFAULT_FOCUS_GLASS));
         out.putBoolean(Constants.PREFS_AOD_BATTERY_SYNC,
                 sp.getBoolean(Constants.PREFS_AOD_BATTERY_SYNC, Constants.DEFAULT_AOD_BATTERY_SYNC));
+        out.putBoolean(Constants.PREFS_PIN_GLASS,
+                sp.getBoolean(Constants.PREFS_PIN_GLASS, Constants.DEFAULT_PIN_GLASS));
         out.putBoolean(Constants.PREFS_ENABLE_LOG,
                 sp.getBoolean(Constants.PREFS_ENABLE_LOG, Constants.DEFAULT_ENABLE_LOG));
         out.putBoolean("ok", true);

@@ -32,7 +32,7 @@ public final class Constants {
     public static final String TARGET_PKG = "com.android.systemui";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.4";
+    public static final String VERSION = "3.5";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -198,6 +198,10 @@ public final class Constants {
     public static final String PREFS_AOD_BATTERY_SYNC = "aod_battery_sync";
     public static final boolean DEFAULT_AOD_BATTERY_SYNC = true;
 
+    /** 锁屏密码键盘柔光玻璃（v3.5）：数字键加圆形柔光液态玻璃背景 */
+    public static final String PREFS_PIN_GLASS = "pin_glass";
+    public static final boolean DEFAULT_PIN_GLASS = true;
+
     // ── 息屏电池状态同步（v3.4，整合自 AodStatusBar）常驻类/索引常量 ──
     /** isVisible 的 combine 变换（Kotlin 内联 lambda） */
     public static final String AOD_COMBINE_CLASS =
@@ -215,6 +219,46 @@ public final class Constants {
     public static final int AOD_IDX_DOZING = 3;
     public static final int AOD_IDX_FULL_AOD = 6;
     public static final int AOD_ARR_LEN = 9;
+
+    // ── 锁屏密码键盘柔光玻璃（v3.5，移植自 HyperChanger，MIT）──
+    /** 锁屏数字密码界面 */
+    public static final String PIN_VIEW_CLASS = "com.android.keyguard.KeyguardPINView";
+    /** 数字键资源 id 名（已在 HyperOS 4.0.0.17 / nezha 上核验存在） */
+    public static final String[] PIN_KEY_IDS = {
+            "key0", "key1", "key2", "key3", "key4",
+            "key5", "key6", "key7", "key8", "key9",
+    };
+    /** 数字键上的字母副标（klondike 样式） */
+    public static final String PIN_LABEL_ID = "klondike_text";
+    /** 材质层 view tag，用于幂等重建 */
+    public static final String PIN_MATERIAL_TAG = "hyperosglass.lockscreen.pin.material";
+    /** HyperOS 4 柔光玻璃兼容类（系统接口，非私有实现） */
+    public static final String MI_GLASS_COMPAT_CLASS = "com.miui.systemui.util.MiGlassCompat";
+    /** 柔光材质类型（1 = 柔光玻璃） */
+    public static final int PIN_GLASS_MATERIAL_TYPE = 1;
+    /** 模糊模式（1 = 背景模糊） */
+    public static final int PIN_GLASS_BLUR_MODE = 1;
+    /** 混合模式（101 = 柔光叠加） */
+    public static final int PIN_GLASS_BLEND_MODE = 101;
+    public static final int PIN_MAX_BLUR_RADIUS = 100;
+    public static final int PIN_MAX_LARGE_BLUR_RADIUS = 500;
+    public static final float PIN_MAX_LUMINANCE = 0.4f;
+    public static final int PIN_DEFAULT_BLUR_RADIUS = 36;
+    public static final float PIN_DEFAULT_LUMINANCE = 0.14f;
+    /** setMiGlassCompat 参数数组中「亮度」的下标 */
+    public static final int PIN_LUMINANCE_INDEX = 4;
+    /** backdrop 合成器参数（必须先于 MiGlassCompat 调用，否则视图不注册进窗口模糊） */
+    public static final int PIN_BACKDROP_OPACITY = 14;
+    public static final int PIN_BACKDROP_BLUR_RADIUS = 80;
+    public static final int PIN_MAX_BACKDROP_BLUR_RADIUS = 120;
+    public static final int PIN_BACKDROP_COLOR = 0xFFFFFFFF;
+    /** HyperOS 4 柔光玻璃参数表（index 4 = luminance，运行时用默认值覆写） */
+    public static final float[] PIN_GLASS_PARAMS = {
+            0.67f, 0.16f, 0.09f, 0f, 0.24f, 1.4f, -0.02f, 0.3f, 0.6f, 1f,
+            0.03f, 1f, 1f, 1f, 0.1f, 0.2f, 0.3f, 1f, 1f, 72f, 3.8f, 80f, 800f,
+            1.2f, 1f, -0.4f, 0.6f, -0.8f, 1.4f, 0.7f, 0.8f, 1.15f, 4f, 2f,
+            0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f,
+    };
 
     // ── 通知清除按钮图标隐藏（v3.3.2：原位置不动，仅图标 INVISIBLE）──
     /** 按钮 View 的 id 资源名（aapt2 确认 0x7f0b0865；CircleAndTickAnimView） */

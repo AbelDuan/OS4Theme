@@ -33,7 +33,8 @@ import java.util.Locale;
  *
  * v3.3.0 界面重构（用户要求）：
  *   - 功能分两大类展示，整体可滚动（ScrollView），任何机型都不遮挡；
- *     1) 功能启用：三方主题液态玻璃 / 焦点通知液态玻璃 / 息屏电池状态同步 / 锁屏通知下沉；
+ *     1) 功能启用：三方主题液态玻璃 / 焦点通知液态玻璃 / 息屏电池状态同步
+ *        / 锁屏密码柔光玻璃 / 锁屏通知下沉；
  *     2) 功能隐藏：锁屏指纹图标 / 通知清除按钮；
  *     3) 应用工具：日志记录 / 重启系统界面 / 清空日志 / 分享日志。
  *   - 控件由 RadioGroup 改为 Switch（开=启用/隐藏，关=停用），一行一个，布局清爽。
@@ -105,7 +106,10 @@ public class SettingsActivity extends Activity {
             boolean aod = de.contains(Constants.PREFS_AOD_BATTERY_SYNC)
                     ? de.getBoolean(Constants.PREFS_AOD_BATTERY_SYNC, Constants.DEFAULT_AOD_BATTERY_SYNC)
                     : ce.getBoolean(Constants.PREFS_AOD_BATTERY_SYNC, Constants.DEFAULT_AOD_BATTERY_SYNC);
-            writeAllPrefs(glass, sink, fod, dismiss, focus, aod, log);
+            boolean pinGlass = de.contains(Constants.PREFS_PIN_GLASS)
+                    ? de.getBoolean(Constants.PREFS_PIN_GLASS, Constants.DEFAULT_PIN_GLASS)
+                    : ce.getBoolean(Constants.PREFS_PIN_GLASS, Constants.DEFAULT_PIN_GLASS);
+            writeAllPrefs(glass, sink, fod, dismiss, focus, aod, pinGlass, log);
         } catch (Throwable ignored) {
         }
     }
@@ -121,6 +125,7 @@ public class SettingsActivity extends Activity {
                     sp.getBoolean(Constants.PREFS_HIDE_DISMISS_BTN, Constants.DEFAULT_HIDE_DISMISS_BTN),
                     sp.getBoolean(Constants.PREFS_FOCUS_GLASS, Constants.DEFAULT_FOCUS_GLASS),
                     sp.getBoolean(Constants.PREFS_AOD_BATTERY_SYNC, Constants.DEFAULT_AOD_BATTERY_SYNC),
+                    sp.getBoolean(Constants.PREFS_PIN_GLASS, Constants.DEFAULT_PIN_GLASS),
                     sp.getBoolean(Constants.PREFS_ENABLE_LOG, Constants.DEFAULT_ENABLE_LOG));
         } catch (Throwable ignored) {
         }
@@ -136,9 +141,10 @@ public class SettingsActivity extends Activity {
         return getSharedPreferences(Constants.PREFS, MODE_PRIVATE);
     }
 
-    /** 双写 6 个开关到 DE + CE（v3.3.4：CE 让框架同步路径生效，DE 供直启读取） */
+    /** 双写全部开关到 DE + CE（v3.3.4：CE 让框架同步路径生效，DE 供直启读取） */
     private void writeAllPrefs(boolean glass, boolean sink, boolean fod,
-                               boolean dismiss, boolean focus, boolean aod, boolean log) {
+                               boolean dismiss, boolean focus, boolean aod,
+                               boolean pinGlass, boolean log) {
         try {
             sp().edit()
                     .putBoolean(Constants.PREFS_GLASS_ENABLED, glass)
@@ -147,6 +153,7 @@ public class SettingsActivity extends Activity {
                     .putBoolean(Constants.PREFS_HIDE_DISMISS_BTN, dismiss)
                     .putBoolean(Constants.PREFS_FOCUS_GLASS, focus)
                     .putBoolean(Constants.PREFS_AOD_BATTERY_SYNC, aod)
+                    .putBoolean(Constants.PREFS_PIN_GLASS, pinGlass)
                     .putBoolean(Constants.PREFS_ENABLE_LOG, log)
                     .commit();
             ceSp().edit()
@@ -156,6 +163,7 @@ public class SettingsActivity extends Activity {
                     .putBoolean(Constants.PREFS_HIDE_DISMISS_BTN, dismiss)
                     .putBoolean(Constants.PREFS_FOCUS_GLASS, focus)
                     .putBoolean(Constants.PREFS_AOD_BATTERY_SYNC, aod)
+                    .putBoolean(Constants.PREFS_PIN_GLASS, pinGlass)
                     .putBoolean(Constants.PREFS_ENABLE_LOG, log)
                     .commit();
         } catch (Throwable ignored) {
@@ -206,6 +214,8 @@ public class SettingsActivity extends Activity {
                 Constants.DEFAULT_FOCUS_GLASS);
         addSwitch(cardEnable, "息屏电池状态同步", Constants.PREFS_AOD_BATTERY_SYNC,
                 Constants.DEFAULT_AOD_BATTERY_SYNC);
+        addSwitch(cardEnable, "锁屏密码柔光玻璃", Constants.PREFS_PIN_GLASS,
+                Constants.DEFAULT_PIN_GLASS);
         addSwitch(cardEnable, "锁屏通知下沉", Constants.PREFS_SINK_ENABLED,
                 Constants.DEFAULT_SINK_ENABLED);
         root.addView(cardEnable, cardLp());

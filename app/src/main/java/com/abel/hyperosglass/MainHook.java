@@ -2,13 +2,25 @@ package com.abel.hyperosglass;
 
 import android.content.SharedPreferences;
 import android.provider.Settings;
+import android.content.res.ColorStateList;
+import android.graphics.Color;
+import android.graphics.Outline;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
+import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
+import android.widget.ImageView;
+import android.widget.TextView;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.WeakHashMap;
 
@@ -93,6 +105,9 @@ public class MainHook extends XposedModule {
             new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_AOD_BATTERY_SYNC);
     /** 当前是否处于 AOD 息屏态（combine / animateFullAod / 电池 toggleAodMode 共同维护） */
     private static volatile boolean sAodDozing = false;
+    /** 锁屏密码键盘柔光玻璃开关（AtomicBoolean） */
+    private static final java.util.concurrent.atomic.AtomicBoolean sPinGlassFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_PIN_GLASS);
     // v3.3.11 日志精简：删除此处原有的 10 个「前 N 次记日志」计数器
     // （flow1/flow2/glassSet/glassUpd/poke/pluginCl/islandDef/expandFix/miBlur/hideFod/dismiss）。
     // 统一改用 LogUtil.logAlwaysOnce(key, msg)：常开、但每种事件全进程只记 1 条。
@@ -139,8 +154,205 @@ public class MainHook extends XposedModule {
             installHideDismissButtonHook(cl);
             installFocusGlassHooks(cl);
             installAodBatteryHooks(cl);
+            installPinGlassHook(cl);
         } catch (Throwable t) {
             LogUtil.logAlways("onPackageLoaded 异常: " + t);
+        }
+    }
+
+    // ============================================================
+    // 锁屏密码键盘柔光玻璃（v3.5，移植自 HyperChanger / MIT）
+    //
+    // 实现原理：HyperOS 4 的柔光液态玻璃是**系统接口**，非私有实现——
+    //  com.miui.systemui.util.MiGlassCompat：
+    //    setMiGlassBlurRadius(view, small, large)  设置模糊半径
+    //    setMiViewMaterialTypeCompat(type, view)   指定材质类型（1=柔光玻璃）
+    //    setMiGlassCompat(view, float[])           下发扬光参数表
+    //  View 的 MIUI 扩展（背景合成器，必须先于 MiGlassCompat 调用）：
+    //    setPassWindowBlurEnabled / setMiViewBlurMode / setMiBackgroundBlurMode
+    //    / setMiBackgroundBlurRadius / addMiBackgroundBlendColor
+    // 数字键（key0..key9）原生无背景，因此额外插入一层圆形 ImageView
+    // 作为材质载体（椭圆裁剪 + 圆形水波纹），并把按压态转发给它。
+    // ============================================================
+
+    /** 挂钩 KeyguardPINView.onFinishInflate，布局完成后给每个数字键加柔光材质 */
+    private void installPinGlassHook(ClassLoader cl) {
+        try {
+            Class<?> c = Class.forName(Constants.PIN_VIEW_CLASS, false, cl);
+            Method m = c.getDeclaredMethod("onFinishInflate");
+            m.setAccessible(true);
+            hook(m)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("pin-glass")
+                    .intercept(chain -> {
+                        Object ret = chain.proceed();
+                        if (sPinGlassFlag.get() && chain.getThisObject() instanceof View) {
+                            final View pinView = (View) chain.getThisObject();
+                            pinView.post(() -> applyPinGlass(pinView, cl));
+                        }
+                        return ret;
+                    });
+            LogUtil.logAlways("[密码玻璃] 已挂钩 " + Constants.PIN_VIEW_CLASS + ".onFinishInflate");
+        } catch (Throwable t) {
+            LogUtil.logAlways("[密码玻璃] 挂钩失败: " + t);
+        }
+    }
+
+    /** 遍历数字键并逐个应用材质（post 到布局完成后再量尺寸） */
+    private void applyPinGlass(View root, ClassLoader cl) {
+        try {
+            List<View> keys = new ArrayList<>(Constants.PIN_KEY_IDS.length);
+            collectPinKeys(root, keys);
+            for (View key : keys) {
+                key.post(() -> applyPinKeyMaterial(key, cl));
+            }
+            LogUtil.logAlways("[密码玻璃] 数字键匹配 " + keys.size()
+                    + "/" + Constants.PIN_KEY_IDS.length);
+        } catch (Throwable t) {
+            LogUtil.logAlways("[密码玻璃] 应用失败: " + t);
+        }
+    }
+
+    private void collectPinKeys(View v, List<View> out) {
+        String name = resName(v);
+        if (name != null && Arrays.asList(Constants.PIN_KEY_IDS).contains(name)) out.add(v);
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) collectPinKeys(g.getChildAt(i), out);
+        }
+    }
+
+    private String resName(View v) {
+        try {
+            int id = v.getId();
+            return (id != View.NO_ID && id != -1) ? v.getResources().getResourceEntryName(id) : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 给单个数字键插入圆形柔光材质层 */
+    private void applyPinKeyMaterial(View key, ClassLoader cl) {
+        try {
+            if (!(key instanceof ViewGroup)) return;
+            ViewGroup keyGroup = (ViewGroup) key;
+            int diameter = Math.min(key.getWidth(), key.getHeight());
+            if (diameter <= 0) return;
+            // 幂等：视图重建时先移除旧材质层
+            for (int i = keyGroup.getChildCount() - 1; i >= 0; i--) {
+                if (Constants.PIN_MATERIAL_TAG.equals(keyGroup.getChildAt(i).getTag())) {
+                    keyGroup.removeViewAt(i);
+                }
+            }
+            final ImageView material = new ImageView(key.getContext());
+            material.setTag(Constants.PIN_MATERIAL_TAG);
+            material.setClickable(false);
+            material.setFocusable(false);
+            material.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+            // 背景合成器要求视图先有 drawable 内容才会注册
+            GradientDrawable tint = new GradientDrawable();
+            tint.setColor(Color.argb(1, 255, 255, 255));
+            material.setImageDrawable(tint);
+            GradientDrawable mask = new GradientDrawable();
+            mask.setShape(GradientDrawable.OVAL);
+            mask.setColor(Color.WHITE);
+            material.setForeground(new RippleDrawable(
+                    ColorStateList.valueOf(0x40FFFFFF), null, mask));
+            material.setClipToOutline(true);
+            material.setOutlineProvider(new android.view.ViewOutlineProvider() {
+                @Override
+                public void getOutline(View target, Outline outline) {
+                    outline.setOval(0, 0, target.getWidth(), target.getHeight());
+                }
+            });
+            keyGroup.addView(material, 0, new ViewGroup.LayoutParams(diameter, diameter));
+            // NumPadKey 原生背景自带按压放大动画，移除后只保留材质层的圆形水波纹
+            key.setBackground(null);
+            placePinMaterial(key, material);
+            key.addOnLayoutChangeListener(
+                    (v, l, t, r, b, ol, ot, or, ob) -> placePinMaterial(key, material));
+            key.setOnTouchListener((v, event) -> {
+                material.setPressed(event.getActionMasked() == MotionEvent.ACTION_DOWN
+                        || event.getActionMasked() == MotionEvent.ACTION_MOVE);
+                return false;
+            });
+            configurePinLabel(keyGroup);
+            applyPinBackdropMaterial(material, Constants.PIN_BACKDROP_OPACITY,
+                    Constants.PIN_BACKDROP_BLUR_RADIUS, Constants.PIN_BACKDROP_COLOR);
+            applyPinGlassMaterial(material, cl, Constants.PIN_DEFAULT_BLUR_RADIUS,
+                    Constants.PIN_DEFAULT_LUMINANCE);
+        } catch (Throwable t) {
+            LogUtil.logAlways("[密码玻璃] 单键材质失败: " + t);
+        }
+    }
+
+    private void placePinMaterial(View key, View material) {
+        int size = Math.min(key.getWidth(), key.getHeight());
+        if (size <= 0) return;
+        ViewGroup.LayoutParams lp = material.getLayoutParams();
+        lp.width = size;
+        lp.height = size;
+        material.setLayoutParams(lp);
+        int left = (key.getWidth() - size) / 2;
+        int top = (key.getHeight() - size) / 2;
+        material.layout(left, top, left + size, top + size);
+        material.invalidateOutline();
+    }
+
+    /** 数字键字母副标：缩小一点，避免溢出圆形材质 */
+    private void configurePinLabel(View v) {
+        if (v instanceof TextView && Constants.PIN_LABEL_ID.equals(resName(v))) {
+            TextView tv = (TextView) v;
+            tv.setEllipsize(null);
+            tv.setSingleLine(false);
+            tv.setMaxLines(1);
+            tv.setHorizontallyScrolling(false);
+            tv.setTextScaleX(0.86f);
+            tv.setIncludeFontPadding(false);
+        }
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) configurePinLabel(g.getChildAt(i));
+        }
+    }
+
+    /** 窗口背景合成器（HyperOS 平台接口，必须早于 MiGlassCompat 调用） */
+    private void applyPinBackdropMaterial(View v, int opacity, int blurRadius, int color) {
+        try {
+            Class<?> vc = View.class;
+            vc.getMethod("clearMiBackgroundBlendColor").invoke(v);
+            vc.getMethod("setPassWindowBlurEnabled", boolean.class).invoke(v, true);
+            vc.getMethod("setMiViewBlurMode", int.class).invoke(v, Constants.PIN_GLASS_BLUR_MODE);
+            vc.getMethod("setMiBackgroundBlurMode", int.class)
+                    .invoke(v, Constants.PIN_GLASS_BLUR_MODE);
+            vc.getMethod("setMiBackgroundBlurRadius", int.class).invoke(v,
+                    Math.min(blurRadius, Constants.PIN_MAX_BACKDROP_BLUR_RADIUS));
+            vc.getMethod("addMiBackgroundBlendColor", int.class, int.class).invoke(v,
+                    Color.argb(opacity * 255 / 100, Color.red(color), Color.green(color),
+                            Color.blue(color)),
+                    Constants.PIN_GLASS_BLEND_MODE);
+        } catch (Throwable t) {
+            LogUtil.logAlways("[密码玻璃] backdrop 材质失败: " + t);
+        }
+    }
+
+    /** HyperOS 4 柔光玻璃：MiGlassCompat 三件套 */
+    private void applyPinGlassMaterial(View v, ClassLoader cl, int blurRadius, float luminance) {
+        try {
+            Class<?> glass = Class.forName(Constants.MI_GLASS_COMPAT_CLASS, false, cl);
+            int small = Math.max(0, Math.min(blurRadius, Constants.PIN_MAX_BLUR_RADIUS));
+            float[] params = Constants.PIN_GLASS_PARAMS.clone();
+            params[Constants.PIN_LUMINANCE_INDEX] =
+                    Math.max(0f, Math.min(luminance, Constants.PIN_MAX_LUMINANCE));
+            glass.getMethod("setMiGlassBlurRadius", View.class, int.class, int.class)
+                    .invoke(null, v, small,
+                            Math.min(small * 2, Constants.PIN_MAX_LARGE_BLUR_RADIUS));
+            glass.getMethod("setMiViewMaterialTypeCompat", int.class, View.class)
+                    .invoke(null, Constants.PIN_GLASS_MATERIAL_TYPE, v);
+            glass.getMethod("setMiGlassCompat", View.class, float[].class)
+                    .invoke(null, v, params);
+        } catch (Throwable t) {
+            LogUtil.logAlways("[密码玻璃] 柔光材质失败: " + t);
         }
     }
 
@@ -172,6 +384,8 @@ public class MainHook extends XposedModule {
                     Constants.DEFAULT_FOCUS_GLASS);
             boolean newAod = sPrefs.getBoolean(Constants.PREFS_AOD_BATTERY_SYNC,
                     Constants.DEFAULT_AOD_BATTERY_SYNC);
+            boolean newPinGlass = sPrefs.getBoolean(Constants.PREFS_PIN_GLASS,
+                    Constants.DEFAULT_PIN_GLASS);
             boolean log = sPrefs.getBoolean(Constants.PREFS_ENABLE_LOG,
                     Constants.DEFAULT_ENABLE_LOG);
             sSinkEnabled = newSink;
@@ -185,11 +399,12 @@ public class MainHook extends XposedModule {
             sFocusGlass = newFocusGlass;
             sFocusGlassFlag.set(newFocusGlass);
             sAodBatterySyncFlag.set(newAod);
+            sPinGlassFlag.set(newPinGlass);
             LogUtil.setEnabled(log);
             LogUtil.logAlways("设置(框架)：sink=" + sSinkEnabled + "，glass=" + sGlassEnabled
                     + "，hideLockFod=" + sHideLockFod + "，hideDismiss=" + sHideDismissBtn
                     + "，focusGlass=" + sFocusGlass + "，aodBattery=" + newAod
-                    + "，日志=" + log);
+                    + "，pinGlass=" + newPinGlass + "，日志=" + log);
         } catch (Throwable t) {
             LogUtil.logAlways("读取设置失败: " + t);
         }
@@ -254,6 +469,8 @@ public class MainHook extends XposedModule {
                     Constants.DEFAULT_FOCUS_GLASS);
             boolean aod = out.getBoolean(Constants.PREFS_AOD_BATTERY_SYNC,
                     Constants.DEFAULT_AOD_BATTERY_SYNC);
+            boolean pinGlass = out.getBoolean(Constants.PREFS_PIN_GLASS,
+                    Constants.DEFAULT_PIN_GLASS);
             boolean log = out.getBoolean(Constants.PREFS_ENABLE_LOG,
                     Constants.DEFAULT_ENABLE_LOG);
             sSinkEnabled = sink;
@@ -267,10 +484,12 @@ public class MainHook extends XposedModule {
             sFocusGlass = focus;
             sFocusGlassFlag.set(focus);
             sAodBatterySyncFlag.set(aod);
+            sPinGlassFlag.set(pinGlass);
             LogUtil.setEnabled(log);
             LogUtil.logAlways("设置(真实值同步)：sink=" + sink + "，glass=" + glass
                     + "，hideLockFod=" + fod + "，hideDismiss=" + dismiss
-                    + "，focusGlass=" + focus + "，aodBattery=" + aod + "，日志=" + log);
+                    + "，focusGlass=" + focus + "，aodBattery=" + aod
+                    + "，pinGlass=" + pinGlass + "，日志=" + log);
         } catch (Throwable t) {
             LogUtil.logAlways("设置(真实值同步) 应用失败: " + t);
         }
