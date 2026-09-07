@@ -28,7 +28,7 @@
         android:strokeWidth="1.2"
         android:fillColor="#00000000" />
 
-    <!-- 顶部对角高光：液态玻璃标志性反光 -->
+    <!-- 顶部对角高光：柔光玻璃标志性反光 -->
     <path
         android:pathData="M30,34 L86,34 L86,42 L42,82 L30,82 L30,74 Z"
         android:fillAlpha="0.35">

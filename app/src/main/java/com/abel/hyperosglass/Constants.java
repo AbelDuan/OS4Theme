@@ -7,7 +7,7 @@ package com.abel.hyperosglass;
  *   class  miui.systemui.util.ThemeUtils（插件 APK 独立 classloader，宿主 dex 无此类）
  *   method public final boolean getDefaultSysUiTheme()  // ()Z
  *   method public final boolean getDefaultPluginTheme() // ()Z
- * 两者强制返回 true，等价于直接修改 smali，使应用第三方主题后仍保留液态玻璃模糊。
+ * 两者强制返回 true，等价于直接修改 smali，使应用第三方主题后仍保留柔光玻璃模糊。
  *
  * v3.3.x（当前）：功能清单与原理见 README（本文件只放常量与其生效依据）。
  *   - 放弃「隐藏桌面多任务清理任务按钮」（v3.2.1）：Rust 启动器（hyos_spawner）
@@ -30,16 +30,20 @@ public final class Constants {
 
     /** 作用域：系统界面组件所在进程（MIUISystemUIPlugin 是被它动态加载的插件，不占独立进程） */
     public static final String TARGET_PKG = "com.android.systemui";
+    /** 作用域：小米服务框架（焦点通知白名单签名校验所在进程） */
+    public static final String PKG_XMSF = "com.xiaomi.xmsf";
+    /** 作用域：小米运动健康（允许所有应用转发焦点通知到手表/手环） */
+    public static final String PKG_HEALTH = "com.mi.health";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.8";
+    public static final String VERSION = "3.13";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
 
     /**
      * 需要强制返回 true 的方法（两者皆强制，等价于直接改 smali，使第三方主题下
-     * 仍保留液态玻璃模糊）。
+     * 仍保留柔光玻璃模糊）。
      *   - getDefaultSysUiTheme：系统界面（含状态栏/控制中心）走默认玻璃主题；
      *   - getDefaultPluginTheme：通知面板由 MIUISystemUIPlugin 以「插件主题」渲染，
      *     三方主题会把它设成非默认 → 通知玻璃丢失。强制 true 才能保留「液态通知」。
@@ -118,7 +122,7 @@ public final class Constants {
      *         && ThemeUtils.getDefaultPluginTheme()
      *         && ThemeUtils.getDefaultSysUiTheme()
      *   v3.3.8 直接强制 true 覆盖整个 AND，导致"关闭/磨砂"模式也被强制玻璃、磁贴形状/背景错乱。
-     *   v3.3.9 改为仅当系统设置 material_style == 1（Bionics / 液态玻璃）时才强制 true，
+     *   v3.3.9 改为仅当系统设置 material_style == 1（Bionics / 柔光玻璃）时才强制 true，
      *   其余模式调用原逻辑，避免破坏三模式切换。
      *   该方法静态、体积 46 code units，不会被 ART 内联。
      */
@@ -127,7 +131,7 @@ public final class Constants {
             "getBackgroundMaterialOpenedInDefaultTheme",
     };
 
-    // ── 插件 classloader 获取（v3.0 液态玻璃修复的关键）──
+    // ── 插件 classloader 获取（v3.0 柔光玻璃修复的关键）──
     /** 宿主侧插件工厂（AOSP 插件框架，宿主 classes2.dex） */
     public static final String PLUGIN_FACTORY_CLASS =
             "com.android.systemui.shared.plugins.PluginInstance$PluginFactory";
@@ -165,7 +169,7 @@ public final class Constants {
     public static final String PREFS = "hyperosglass";
 
     // ── 设置项（由 StatusProvider 下发）──
-    /** 液态玻璃启用开关（默认开：第三方主题上保留玻璃模糊） */
+    /** 柔光玻璃启用开关（默认开：第三方主题上保留玻璃模糊） */
     public static final String PREFS_GLASS_ENABLED = "glass_enabled";
     public static final boolean DEFAULT_GLASS_ENABLED = true;
 
@@ -186,19 +190,19 @@ public final class Constants {
     public static final String PREFS_HIDE_DISMISS_BTN = "hide_dismiss_btn";
     public static final boolean DEFAULT_HIDE_DISMISS_BTN = true;
 
-    /** 液态玻璃焦点通知（v3.2.0，默认启用）：焦点通知玻璃效果改用普通通知
+    /** 柔光玻璃焦点通知（v3.2.0，默认启用）：焦点通知玻璃效果改用普通通知
      *  的 blur（NotificationRowBlurEffect）与玻璃参数（notification_glass_params_normal） */
     public static final String PREFS_FOCUS_GLASS = "focus_glass";
     public static final boolean DEFAULT_FOCUS_GLASS = true;
 
-    /** 息屏电池状态同步（v3.4，默认关闭）：AOD 息屏下把电池停在「系统状态栏同款」内显
+    /** 息屏电池状态同步（v3.4，默认开启）：AOD 息屏下把电池停在「系统状态栏同款」内显
      *  样式（跟随系统设置），并隐藏运营商/信号/WiFi，仅保留电池；
      *  锁屏（亮屏）状态栏的所有图标保持系统原生，模块不触碰。
      *  整合自「锁屏状态栏调整」任务（独立模块 AodStatusBar）。 */
     public static final String PREFS_AOD_BATTERY_SYNC = "aod_battery_sync";
     public static final boolean DEFAULT_AOD_BATTERY_SYNC = true;
 
-    /** 锁屏密码键盘柔光玻璃（v3.5）：数字键加圆形柔光液态玻璃背景 */
+    /** 锁屏密码键盘柔光玻璃（v3.5）：数字键加圆形柔光柔光玻璃背景 */
     public static final String PREFS_PIN_GLASS = "pin_glass";
     public static final boolean DEFAULT_PIN_GLASS = true;
 
@@ -207,6 +211,162 @@ public final class Constants {
      *  （小白条）不可见，但视图仍占位、手势区与底栏抬高（insets）保留。 */
     public static final String PREFS_NAV_HANDLE_HIDE = "nav_handle_hide";
     public static final boolean DEFAULT_NAV_HANDLE_HIDE = true;
+
+    // ── v3.9 新增开关 ──
+    /** 禁止折叠历史通知（v3.9，默认开）：拦截 FoldNotifControllerImpl.sendFoldNotification，
+     *  历史通知不再被收纳为「折叠」单条，逐条独立显示。 */
+    public static final String PREFS_NO_FOLD_HISTORY = "no_fold_history";
+    public static final boolean DEFAULT_NO_FOLD_HISTORY = true;
+
+    /** 禁止收纳通知为组（v3.9，默认开）：拦截 GroupMemberManagerLegacy 的
+     *  getGroupSummary / isGroupSummary 与 ExpandableNotificationRow.isChildInGroup，
+     *  同一应用多条通知不再折叠为一个分组。 */
+    public static final String PREFS_NO_GROUP = "no_group";
+    public static final boolean DEFAULT_NO_GROUP = true;
+
+    // 注：v3.9 曾有过「桌面手势白条」（仅桌面隐藏）开关，已按用户要求删除；
+    // 现只保留一个「手势小白条」（全局隐藏）。
+
+    // ── v3.9 移植 HyperCeiler（开源参考 https://github.com/ReChronoRain/HyperCeiler）──
+    /** 解除通知数量限制（默认开）：跳过 CountLimitCoordinator 注册的数量上限折叠逻辑 */
+    public static final String PREFS_NO_NOTIF_LIMIT = "no_notif_limit";
+    public static final boolean DEFAULT_NO_NOTIF_LIMIT = true;
+
+    /** 解锁后保留锁屏通知（默认开）：解锁瞬间把通知重置为「解锁后未展示过」 */
+    public static final String PREFS_KEEP_NOTIF = "keep_notif";
+    public static final boolean DEFAULT_KEEP_NOTIF = true;
+
+    /** 隐藏「已通过蓝牙设备解锁」Toast（默认开）。
+     *  对应 HyperCeiler DisableUnlockByBleToast：比对系统资源
+     *  com.android.systemui:string/miui_keyguard_ble_unlock_succeed_msg 后吞掉该 Toast。
+     *  ⚠️ 注意：这是 **Toast**，不是通知——此前按「通知」理解是错的，已按上游修正。 */
+    public static final String PREFS_HIDE_BT_UNLOCK = "hide_bt_unlock";
+    public static final boolean DEFAULT_HIDE_BT_UNLOCK = true;
+
+    /** 亮屏时静音（默认开）：屏幕点亮时不再响铃/震动，仅熄屏提醒 */
+    public static final String PREFS_MUTE_SCREEN_ON = "mute_screen_on";
+    public static final boolean DEFAULT_MUTE_SCREEN_ON = true;
+
+    /** 亮屏时取消通知震动（默认开）：屏幕点亮时仅屏蔽震动，保留响铃与闪烁 */
+    public static final String PREFS_CANCEL_VIBRATE_SCREEN_ON = "cancel_vibrate_screen_on";
+    public static final boolean DEFAULT_CANCEL_VIBRATE_SCREEN_ON = true;
+
+    /** 通知设置重定向到渠道设置（默认开）：长按需设置/通知设置按钮直达渠道页 */
+    public static final String PREFS_REDIRECT_NOTIF_SET = "redirect_notif_set";
+    public static final boolean DEFAULT_REDIRECT_NOTIF_SET = true;
+
+    /** 允许管理所有通知（默认开）：NotificationChannel 一律视为可屏蔽 */
+    public static final String PREFS_ALLOW_MANAGE_ALL = "allow_manage_all";
+    public static final boolean DEFAULT_ALLOW_MANAGE_ALL = true;
+
+    /** 移除焦点通知白名单（默认开，HyperCeiler UnlockFocus）：
+     *  HyperOS 默认只允许白名单应用显示为焦点通知（小米健康、小米服务框架等）；
+     *  开启后任意应用均可显示为焦点通知。 */
+    public static final String PREFS_UNLOCK_ALL_FOCUS = "unlock_all_focus";
+    public static final boolean DEFAULT_UNLOCK_ALL_FOCUS = true;
+
+    /** 小米服务框架：解锁焦点通知白名单签名验证（默认开）。
+     *  对应 HyperCeiler xmsf/UnlockFoucsAuth：拦截 AuthSession.getAuthError，
+     *  将错误码清零并强制返回成功，解除白名单应用的签名校验。 */
+    public static final String PREFS_XMSF_FOCUS_SIGN = "xmsf_focus_sign";
+    public static final boolean DEFAULT_XMSF_FOCUS_SIGN = true;
+
+    /** 小米运动健康：允许所有应用发送焦点通知到手表/手环（默认开）。
+     *  对应 HyperCeiler health/UnlockFoucsAuth：
+     *  NotificationFilterHelper.isNotificationSpotlightAppInWhiteList 返回 true。 */
+    public static final String PREFS_HEALTH_FOCUS_ALLOW_ALL = "health_focus_allow_all";
+    public static final boolean DEFAULT_HEALTH_FOCUS_ALLOW_ALL = true;
+
+    // ── 禁止折叠历史通知（v3.9，main SystemUI loader）──
+    public static final String FOLD_NOTIF_CONTROLLER_CLASS =
+            "com.android.systemui.statusbar.notification.history.FoldNotifControllerImpl";
+    public static final String FOLD_NOTIF_REASON_CLASS =
+            "com.android.systemui.statusbar.notification.history.FoldNotifControllerImpl$CreateFoldNotifReason";
+    public static final String FOLD_SEND_METHOD = "sendFoldNotification";
+
+    // ── 禁止收纳通知为组（v3.9，main SystemUI loader）──
+    public static final String GROUP_MEMBER_MANAGER_CLASS =
+            "com.android.systemui.statusbar.notification.utils.GroupMemberManagerLegacy";
+    public static final String EXPANDABLE_NOTIF_ROW_CLASS =
+            "com.android.systemui.statusbar.notification.row.ExpandableNotificationRow";
+    public static final String GROUP_GET_SUMMARY_METHOD = "getGroupSummary";
+    public static final String GROUP_IS_SUMMARY_METHOD = "isGroupSummary";
+    public static final String ROW_IS_CHILD_METHOD = "isChildInGroup";
+
+    // ── v3.9 HyperCeiler 移植：ROM 目标（签名均经 dexdump 在 nezha / OS4.0.0.17 核准）──
+    /** 通知条目（多处反射取包名的载体） */
+    public static final String NOTIF_ENTRY_CLASS =
+            "com.android.systemui.statusbar.notification.collection.NotificationEntry";
+    /** 通知流水线（CountLimitCoordinator.attach 的入参类型） */
+    public static final String NOTIF_PIPELINE_CLASS =
+            "com.android.systemui.statusbar.notification.collection.NotifPipeline";
+
+    /** 解除通知数量限制：attach(NotifPipeline)V，PUBLIC FINAL */
+    public static final String NOTIF_LIMIT_CLASS =
+            "com.android.systemui.statusbar.notification.collection.coordinator.CountLimitCoordinator";
+    public static final String NOTIF_LIMIT_ATTACH_METHOD = "attach";
+    /** 数量上限提示条的绑定 lambda：onViewBound$1(NotificationEntry)V */
+    public static final String NOTIF_LIMIT_LAMBDA_CLASS = NOTIF_LIMIT_CLASS
+            + "$$ExternalSyntheticLambda0";
+    public static final String NOTIF_LIMIT_ONVIEWBOUND_METHOD = "onViewBound$1";
+
+    /** 解锁保留通知：shouldHideNotification(NotificationEntry)Z（另有一个 Z 重载） */
+    public static final String KEEP_NOTIF_CLASS =
+            "com.android.systemui.statusbar.notification.interruption."
+                    + "KeyguardNotificationVisibilityProviderImpl";
+    public static final String KEEP_NOTIF_METHOD = "shouldHideNotification";
+    /** NotificationEntry.mSbn → StatusBarNotification.mHasShownAfterUnlock */
+    public static final String ENTRY_SBN_FIELD = "mSbn";
+    public static final String SBN_SHOWN_AFTER_UNLOCK_FIELD = "mHasShownAfterUnlock";
+
+    /** 隐藏「已通过蓝牙设备解锁」Toast：目标系统资源的完整名（HyperCeiler 原版比对） */
+    public static final String BLE_UNLOCK_RES_NAME =
+            "com.android.systemui:string/miui_keyguard_ble_unlock_succeed_msg";
+    /** 兜底：资源 entry name（getResourceEntryName 返回，不含包名前缀） */
+    public static final String BLE_UNLOCK_RES_ENTRY = "miui_keyguard_ble_unlock_succeed_msg";
+    /** 兜底文本判定（资源名对不上时按内容匹配，小写比较需同时命中两组关键词） */
+    /** 注意：不要放 "ble" 这类短词，会误命中 possible / table 等常见单词 */
+    public static final String[] BLE_UNLOCK_TEXT_BT = {"蓝牙", "bluetooth"};
+    public static final String[] BLE_UNLOCK_TEXT_UNLOCK = {"解锁", "unlock"};
+
+    /** 亮屏时静音：MiuiAlertManager.buzzBeepBlink(NotificationEntry)V */
+    public static final String MUTE_ALERT_CLASS =
+            "com.android.systemui.statusbar.notification.policy.MiuiAlertManager";
+    public static final String MUTE_ALERT_METHOD = "buzzBeepBlink";
+    public static final String MUTE_ALERT_CONTEXT_FIELD = "mContext";
+
+    /** 重定向通知设置：
+     *  startAppNotificationSettings(Context,String,String,I,String)V —— classes3.dex，PUBLIC STATIC。
+     *  注意：HyperCeiler 用的是 com.android.systemui.statusbar.notification.NotificationSettingsHelper，
+     *  nezha ROM 无该类，实际在 com.miui.systemui.notification 下。 */
+    public static final String NOTIF_SETTINGS_HELPER_CLASS =
+            "com.miui.systemui.notification.NotificationSettingsHelper";
+    public static final String NOTIF_SETTINGS_START_METHOD = "startAppNotificationSettings";
+
+    /** 允许管理所有通知：framework 类 android.app.NotificationChannel */
+    public static final String NOTIF_CHANNEL_CLASS = "android.app.NotificationChannel";
+    public static final String CHANNEL_IS_BLOCKABLE_METHOD = "isBlockable";
+    public static final String CHANNEL_SET_BLOCKABLE_METHOD = "setBlockable";
+    public static final String CHANNEL_BLOCKABLE_FIELD = "mBlockable";
+
+    /** 蓝牙解锁提示的**源头**（classes.dex 反汇编实证）：
+     *  com.android.keyguard.MiuiBleUnlockHelper.tryUnlockByBle()V 内直接调用
+     *  Toast.makeText(...).show() —— 所以提示确实是 Toast，且只在蓝牙解锁流程内产生。
+     *  在该方法执行期间置位即可精准吞掉，不依赖文本/资源匹配。 */
+    public static final String BLE_UNLOCK_HELPER_CLASS =
+            "com.android.keyguard.MiuiBleUnlockHelper";
+    public static final String BLE_TRY_UNLOCK_METHOD = "tryUnlockByBle";
+
+    /** 移除焦点通知白名单：com.miui.systemui.notification.NotificationSettingsManager
+     *  （classes3.dex 实证）。两个判定方法签名均为 (Context,String)I，arg[1] = 包名，
+     *  返回 1 = 允许展示焦点态。同类的 isInSupportBlockFocusXmsList(String)Z 即
+     *  「支持屏蔽焦点的小米服务框架名单」，本模块不强改它（语义不明，交由前两者覆盖）。 */
+    public static final String FOCUS_MANAGER_CLASS =
+            "com.miui.systemui.notification.NotificationSettingsManager";
+    public static final String[] FOCUS_CAN_SHOW_METHODS = {
+            "canShowFocusState",
+            "canShowFocusStateApp",
+    };
 
     // ── 息屏电池状态同步（v3.4，整合自 AodStatusBar）常驻类/索引常量 ──
     /** isVisible 的 combine 变换（Kotlin 内联 lambda） */
@@ -297,7 +457,7 @@ public final class Constants {
     /** 按钮 View 的 id 资源名（aapt2 确认 0x7f0b0865；CircleAndTickAnimView） */
     public static final String NOTIF_DISMISS_VIEW_ID_NAME = "notification_dismiss_view";
 
-    // ── 液态玻璃焦点通知（v3.2.0，用户 smali 方案：Focus→NotificationRow）──
+    // ── 柔光玻璃焦点通知（v3.2.0，用户 smali 方案：Focus→NotificationRow）──
     /** 4 个焦点通知玻璃效果类（sysui classes2.dex 确认） */
     public static final String[] FOCUS_GLASS_CLASSES = {
             "com.android.systemui.statusbar.notification.style.vieweffect.FocusNotificationGlassEffect",
@@ -328,6 +488,8 @@ public final class Constants {
     public static final String STATUS_AUTHORITY = "com.abel.hyperosglass.status";
     public static final String STATUS_URI = "content://" + STATUS_AUTHORITY;
     public static final String METHOD_GET_PREFS = "get_prefs";
+    /** 设置变化后由模块 App 发送的广播：触发各进程 reloadPrefs() 实时生效 */
+    public static final String ACTION_RELOAD_PREFS = "com.abel.hyperosglass.action.RELOAD_PREFS";
     public static final String METHOD_APPEND_LOG = "append_log";
     /** append_log 时携带的日志行 key */
     public static final String KEY_LOG_LINE = "line";
@@ -396,4 +558,32 @@ public final class Constants {
      */
     public static final int EXPAND_PILL_BG_LIGHT = 0x1FFFFFFF;
     public static final int EXPAND_PILL_BG_DARK = 0x26FFFFFF;
+
+    // ── 全量开关键表（v3.9）──
+    /** 模块全部开关 key。SettingsActivity 与 StatusProvider 共用此表遍历，
+     *  杜绝「新增开关漏写某一处导致设置不生效」这一历史 bug 类型。
+     *  顺序 = 设置页展示顺序（含 legacy 迁移顺序）。 */
+    public static final String[] ALL_PREF_KEYS = {
+            PREFS_GLASS_ENABLED, PREFS_FOCUS_GLASS, PREFS_AOD_BATTERY_SYNC, PREFS_PIN_GLASS,
+            PREFS_NO_FOLD_HISTORY, PREFS_NO_GROUP, PREFS_SINK_ENABLED,
+            PREFS_NO_NOTIF_LIMIT, PREFS_KEEP_NOTIF, PREFS_HIDE_BT_UNLOCK,
+            PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_UNLOCK_ALL_FOCUS, PREFS_REDIRECT_NOTIF_SET,
+            PREFS_ALLOW_MANAGE_ALL,
+            PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE,
+            PREFS_NAV_HANDLE_HIDE,
+            PREFS_XMSF_FOCUS_SIGN, PREFS_HEALTH_FOCUS_ALLOW_ALL,
+            PREFS_ENABLE_LOG,
+    };
+    /** 与 ALL_PREF_KEYS 一一对应的默认值 */
+    public static final boolean[] ALL_PREF_DEFAULTS = {
+            DEFAULT_GLASS_ENABLED, DEFAULT_FOCUS_GLASS, DEFAULT_AOD_BATTERY_SYNC, DEFAULT_PIN_GLASS,
+            DEFAULT_NO_FOLD_HISTORY, DEFAULT_NO_GROUP, DEFAULT_SINK_ENABLED,
+            DEFAULT_NO_NOTIF_LIMIT, DEFAULT_KEEP_NOTIF, DEFAULT_HIDE_BT_UNLOCK,
+            DEFAULT_MUTE_SCREEN_ON, DEFAULT_CANCEL_VIBRATE_SCREEN_ON, DEFAULT_UNLOCK_ALL_FOCUS, DEFAULT_REDIRECT_NOTIF_SET,
+            DEFAULT_ALLOW_MANAGE_ALL,
+            DEFAULT_HIDE_LOCK_FOD, DEFAULT_HIDE_DISMISS_BTN, DEFAULT_QS_EDIT_HIDE,
+            DEFAULT_NAV_HANDLE_HIDE,
+            DEFAULT_XMSF_FOCUS_SIGN, DEFAULT_HEALTH_FOCUS_ALLOW_ALL,
+            DEFAULT_ENABLE_LOG,
+    };
 }

@@ -4,3 +4,23 @@ build/
 local.properties
 captures/
 .externalNativeBuild/
+
+# 构建日志与临时输出
+build_log*.txt
+stdout_*.txt
+stderr_*.txt
+
+# 构建产物：只走 GitHub Release，不入库
+*.apk
+apks/
+
+# 反编译 / 参考产物（体积大，不入库）
+dex/
+refs/
+
+# 调试截图（仅根目录，避免误伤 res/ 下的 png 资源）
+/settings_*.png
+/test_*.png
+
+# 一次性修复脚本
+fix_nav_pref.py

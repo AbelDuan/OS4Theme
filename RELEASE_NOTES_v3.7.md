@@ -7,7 +7,7 @@
 - 实现：hook 插件 APK（`/product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk`）中的
   `miui.systemui.controlcenter.panel.main.qs.EditButtonController.onBindViewHolder()`。
   该控制器位于插件独立 ClassLoader，借 `PluginInstance$PluginFactory.createClassLoader()`
-  回调拿到插件 loader 后补挂（同液态玻璃 ThemeUtils 机制）。
+  回调拿到插件 loader 后补挂（同柔光玻璃 ThemeUtils 机制）。
 - 在 `onBindViewHolder` 完成原绑定（点击监听已挂好）后，对编辑按钮 View
  （`binding.touchContainer`，LinearLayout）设 `INVISIBLE`：**INVISIBLE 保留布局占位与指针命中，
   GONE 才会移除点击**，故隐藏但不影响功能，其余按钮（如「设置」）不受影响。

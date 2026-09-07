@@ -1,6 +1,14 @@
 package com.abel.hyperosglass;
 
+import android.app.ActivityManager;
+import android.app.Notification;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.os.PowerManager;
+import android.os.UserHandle;
 import android.provider.Settings;
 import android.content.res.ColorStateList;
 import android.graphics.Canvas;
@@ -33,7 +41,7 @@ import io.github.libxposed.api.XposedModuleInterface;
  * OS4 Themer —— HyperOS 4 主题增强模块（LibXposed API 102 版）。
  *
  * v3.0 完全重构：只保留两个功能，其余全部取消（用户要求，确认无 bug 后再逐步加回）：
- *   1) 三方主题液态玻璃通知：挂钩 miui.systemui.util.ThemeUtils 的
+ *   1) 三方主题柔光玻璃通知：挂钩 miui.systemui.util.ThemeUtils 的
  *      getDefaultSysUiTheme / getDefaultPluginTheme 强制返回 true。
  *      关键修复：ThemeUtils 在插件 APK（MIUISystemUIPlugin）的独立 classloader，
  *      宿主 onPackageLoaded 的 Class.forName 必然失败（v2.1.x 移除 loadClass 拦截
@@ -74,7 +82,7 @@ public class MainHook extends XposedModule {
     /** 已挂钩的 ThemeUtils 类对象（v3.3.6：按 Class 身份去重，不再按类名）
      *  ThemeUtils 在宿主与 MIUISystemUIPlugin 插件中各有独立 ClassLoader 副本，
      *  旧版用「类名字符串」去重 → 首个副本挂钩后，其余副本被误判为已挂钩而直接
-     *  return 跳过；控制中心所在的插件副本因此从未挂钩 → 液态玻璃丢失。
+     *  return 跳过；控制中心所在的插件副本因此从未挂钩 → 柔光玻璃丢失。
      *  这是 v3.3.5 丢玻璃的真实根因（此前误判为 ART 内联）。
      *  改按 Class 对象身份去重后每个副本各自挂钩；弱引用避免持有 loader 造成泄漏。 */
     private static final Set<Class<?>> glassHooked =
@@ -101,7 +109,7 @@ public class MainHook extends XposedModule {
     /** 隐藏通知清除按钮开关（AtomicBoolean） */
     private static final java.util.concurrent.atomic.AtomicBoolean sHideDismissFlag =
             new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HIDE_DISMISS_BTN);
-    /** 液态玻璃焦点通知开关（AtomicBoolean） */
+    /** 柔光玻璃焦点通知开关（AtomicBoolean） */
     private static final java.util.concurrent.atomic.AtomicBoolean sFocusGlassFlag =
             new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_FOCUS_GLASS);
     /** 息屏电池状态同步开关（AtomicBoolean，供热路径拦截器读取） */
@@ -118,6 +126,54 @@ public class MainHook extends XposedModule {
     /** 隐藏控制中心「编辑」按钮开关（v3.7，默认开：隐藏但保留点击进入编辑） */
     private static final java.util.concurrent.atomic.AtomicBoolean sQsEditHideFlag =
             new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_QS_EDIT_HIDE);
+    /** 禁止折叠历史通知开关（v3.9，默认关） */
+    private static final java.util.concurrent.atomic.AtomicBoolean sNoFoldHistoryFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_NO_FOLD_HISTORY);
+    /** 禁止收纳通知为组开关（v3.9，默认关） */
+    private static final java.util.concurrent.atomic.AtomicBoolean sNoGroupFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_NO_GROUP);
+    /** 解除通知数量限制（v3.9 移植 HyperCeiler，默认关） */
+    private static final java.util.concurrent.atomic.AtomicBoolean sNoNotifLimitFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_NO_NOTIF_LIMIT);
+    /** 解锁保留通知（v3.9 移植 HyperCeiler，默认关） */
+    private static final java.util.concurrent.atomic.AtomicBoolean sKeepNotifFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_KEEP_NOTIF);
+    /** 隐藏蓝牙解锁通知（v3.11 移植 HyperCeiler DisableUnlockByBleToast，默认关） */
+    private static final java.util.concurrent.atomic.AtomicBoolean sHideBtUnlockFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HIDE_BT_UNLOCK);
+    /** 小米服务框架：解锁焦点通知白名单签名验证（默认关） */
+    private static final java.util.concurrent.atomic.AtomicBoolean sXmsfFocusSignFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_XMSF_FOCUS_SIGN);
+    /** 小米运动健康：允许所有应用转发焦点通知到手表/手环（默认关） */
+    private static final java.util.concurrent.atomic.AtomicBoolean sHealthFocusAllowAllFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HEALTH_FOCUS_ALLOW_ALL);
+    /** 亮屏时静音（v3.9 移植 HyperCeiler，默认关） */
+    private static final java.util.concurrent.atomic.AtomicBoolean sMuteScreenOnFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_MUTE_SCREEN_ON);
+    /** 亮屏时取消通知震动（v3.9 新增，默认关）：仅屏蔽震动，保留响铃与闪烁 */
+    private static final java.util.concurrent.atomic.AtomicBoolean sCancelVibrateScreenOnFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_CANCEL_VIBRATE_SCREEN_ON);
+    /** 通知设置重定向到渠道设置（v3.9 移植 HyperCeiler，默认关） */
+    private static final java.util.concurrent.atomic.AtomicBoolean sRedirectNotifSetFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_REDIRECT_NOTIF_SET);
+    /** 允许管理所有通知（v3.9 移植 HyperCeiler，默认关） */
+    private static final java.util.concurrent.atomic.AtomicBoolean sAllowManageAllFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_ALLOW_MANAGE_ALL);
+    /** 移除焦点通知白名单（v3.9 移植 HyperCeiler UnlockFocus，默认关） */
+    private static final java.util.concurrent.atomic.AtomicBoolean sUnlockAllFocusFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_UNLOCK_ALL_FOCUS);
+    /** 被判定为「蓝牙解锁 Toast」的 Toast 实例（show 时据此吞掉；弱引用，不泄漏） */
+    private static final Set<Object> sBleUnlockToasts =
+            Collections.newSetFromMap(new WeakHashMap<Object, Boolean>());
+    /** 是否正处于 MiuiBleUnlockHelper.tryUnlockByBle() 执行期间（HyperCeiler 同思路）：
+     *  该期间产生的 Toast 必然就是「已通过蓝牙设备解锁」，直接吞掉，
+     *  不依赖资源 id / 文本匹配，最稳。 */
+    private static final ThreadLocal<Boolean> sInBleUnlock = new ThreadLocal<Boolean>() {
+        @Override
+        protected Boolean initialValue() {
+            return Boolean.FALSE;
+        }
+    };
     /** 一次性重绘守卫（避免 invalidate 重入循环）：记录已触发清空旧画面的手柄 View */
     private static final java.util.WeakHashMap<View, Boolean> sNavHandleCleared =
             new java.util.WeakHashMap<>();
@@ -151,6 +207,18 @@ public class MainHook extends XposedModule {
             LogUtil.logAlways("onPackageLoaded: " + pkg);
 
             reloadPrefs();
+            registerPrefsReloadReceiver();
+
+            // ── com.xiaomi.xmsf：解锁焦点通知白名单签名验证 ──
+            if (Constants.PKG_XMSF.equals(pkg)) {
+                installXmsfFocusHooks(cl);
+                return;
+            }
+            // ── com.mi.health：允许所有应用转发焦点通知到手表/手环 ──
+            if (Constants.PKG_HEALTH.equals(pkg)) {
+                installHealthFocusHooks(cl);
+                return;
+            }
 
             // ── com.android.systemui：全部功能 ──
             if (!Constants.TARGET_PKG.equals(pkg)) return;
@@ -170,15 +238,45 @@ public class MainHook extends XposedModule {
             installPinGlassHook(cl);
             installNavHandleHideHook(cl);
             installQsEditHideHook(cl);
+            installNotifEnhanceHooks(cl);
         } catch (Throwable t) {
             LogUtil.logAlways("onPackageLoaded 异常: " + t);
         }
     }
 
     // ============================================================
+    // 实时重载：设置开关变化后，模块 App 发广播，各注入进程重新读取 pref，
+    // 无需重启对应作用域即可生效（修复「拨开关要重启 SystemUI 才生效」的历史问题）。
+    // ============================================================
+    private static volatile boolean sReloadReceiverRegistered = false;
+
+    private void registerPrefsReloadReceiver() {
+        if (sReloadReceiverRegistered) return;
+        try {
+            Object app = currentApplication();
+            if (!(app instanceof Context)) return;
+            Context ctx = (Context) app;
+            ctx.registerReceiver(new android.content.BroadcastReceiver() {
+                @Override
+                public void onReceive(Context c, android.content.Intent i) {
+                    try {
+                        reloadPrefs();
+                        LogUtil.logAlways("收到重载广播，设置已刷新");
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }, new android.content.IntentFilter(Constants.ACTION_RELOAD_PREFS));
+            sReloadReceiverRegistered = true;
+            LogUtil.logAlways("[重载] 已注册实时重载广播接收器");
+        } catch (Throwable t) {
+            LogUtil.logAlways("[重载] 注册失败: " + t);
+        }
+    }
+
+    // ============================================================
     // 锁屏密码键盘柔光玻璃（v3.5，移植自 HyperChanger / MIT）
     //
-    // 实现原理：HyperOS 4 的柔光液态玻璃是**系统接口**，非私有实现——
+    // 实现原理：HyperOS 4 的柔光柔光玻璃是**系统接口**，非私有实现——
     //  com.miui.systemui.util.MiGlassCompat：
     //    setMiGlassBlurRadius(view, small, large)  设置模糊半径
     //    setMiViewMaterialTypeCompat(type, view)   指定材质类型（1=柔光玻璃）
@@ -247,9 +345,10 @@ public class MainHook extends XposedModule {
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                     .setId(id)
                     .intercept(chain -> {
+                        Object thisObj = chain.getThisObject();
+                        // 隐藏手势小白条：跳过绘制
                         if (sNavHandleHideFlag.get()) {
                             // 跳过绘制：小白条不可见；视图仍占位 → 手势区/底栏抬高保留
-                            Object thisObj = chain.getThisObject();
                             if (thisObj instanceof View) {
                                 View v = (View) thisObj;
                                 // 仅首次跳过时触发一次重绘，清空框架残存的旧小白条
@@ -268,6 +367,583 @@ public class MainHook extends XposedModule {
         } catch (Throwable t) {
             LogUtil.logAlways("[小白条] 挂钩失败 " + className + ": " + t);
             return false;
+        }
+    }
+
+    // ============================================================
+    // v3.9 通知增强（6 项移植 HyperCeiler / 1 项自研 + 禁止折叠历史 + 禁止分组）
+    //
+    // 目标签名全部经 dexdump 在 nezha（HyperOS 4 / OS4.0.0.17.XPACNXM）核准：
+    //   CountLimitCoordinator.attach(NotifPipeline)V                        classes2
+    //   CountLimitCoordinator$$ExternalSyntheticLambda0
+    //       .onViewBound$1(NotificationEntry)V                              classes2
+    //   KeyguardNotificationVisibilityProviderImpl
+    //       .shouldHideNotification(NotificationEntry)Z                     classes2
+    //   MiuiAlertManager.buzzBeepBlink(NotificationEntry)V                  classes2
+    //   NotificationSettingsHelper
+    //       .startAppNotificationSettings(Context,String,String,I,String)V  classes3
+    //   FoldNotifControllerImpl.sendFoldNotification(UserHandle,Reason)V    classes2
+    //   GroupMemberManagerLegacy.isGroupSummary(Entry)Z                     classes2（static）
+    //   ExpandableNotificationRow.onNotificationUpdated()V / getEntry()     classes2
+    // 每项独立 try/catch + PROTECTIVE：任一目标缺失只记日志，不影响其余功能。
+    // ============================================================
+
+    /** v3.9 通知增强总入口（逐个独立安装，互不影响） */
+    private void installNotifEnhanceHooks(ClassLoader cl) {
+        installNoNotifLimitHook(cl);
+        installKeepNotifHook(cl);
+        installHideBtUnlockHook(cl);
+        installMuteScreenOnHook(cl);
+        installRedirectNotifSettingsHook(cl);
+        installAllowManageAllHook(cl);
+        installUnlockAllFocusHook(cl);
+        installFoldNotifHook(cl);
+        installNoGroupHook(cl);
+    }
+
+    /** 沿类继承链查找字段（含父类），找不到返回 null */
+    private static Field findField(Class<?> cls, String name) {
+        Class<?> c = cls;
+        while (c != null) {
+            try {
+                Field f = c.getDeclaredField(name);
+                f.setAccessible(true);
+                return f;
+            } catch (Throwable ignored) {
+                c = c.getSuperclass();
+            }
+        }
+        return null;
+    }
+
+    /** 取 NotificationEntry.mSbn（StatusBarNotification） */
+    private static Object entrySbn(Object entry) {
+        try {
+            if (entry == null) return null;
+            Field f = findField(entry.getClass(), Constants.ENTRY_SBN_FIELD);
+            return f == null ? null : f.get(entry);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /** 解除通知数量限制（HyperCeiler RemoveNotifNumLimit）：
+     *  跳过 CountLimitCoordinator.attach（不注册数量上限折叠逻辑），
+     *  并跳过提示条 lambda 的 onViewBound$1（不再生成「N 条通知已折叠」条）。 */
+    private void installNoNotifLimitHook(ClassLoader cl) {
+        try {
+            Class<?> c = Class.forName(Constants.NOTIF_LIMIT_CLASS, false, cl);
+            Class<?> pipe = Class.forName(Constants.NOTIF_PIPELINE_CLASS, false, cl);
+            Method m = c.getDeclaredMethod(Constants.NOTIF_LIMIT_ATTACH_METHOD, pipe);
+            m.setAccessible(true);
+            hook(m)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("no-notif-limit")
+                    .intercept(chain -> sNoNotifLimitFlag.get() ? null : chain.proceed());
+            LogUtil.logAlways("[解除通知限制] 已挂钩 " + Constants.NOTIF_LIMIT_CLASS + ".attach");
+        } catch (Throwable t) {
+            LogUtil.logAlways("[解除通知限制] 挂载失败: " + t);
+        }
+        // 提示条由编译期生成的 lambda 绑定，类名随 ROM 变，失败属正常（记录但不影响主逻辑）
+        try {
+            Class<?> lam = Class.forName(Constants.NOTIF_LIMIT_LAMBDA_CLASS, false, cl);
+            Class<?> entry = Class.forName(Constants.NOTIF_ENTRY_CLASS, false, cl);
+            Method lm = lam.getDeclaredMethod(Constants.NOTIF_LIMIT_ONVIEWBOUND_METHOD, entry);
+            lm.setAccessible(true);
+            hook(lm)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("no-notif-limit-lambda")
+                    .intercept(chain -> sNoNotifLimitFlag.get() ? null : chain.proceed());
+            LogUtil.logAlways("[解除通知限制] 已挂钩提示条 lambda");
+        } catch (Throwable t) {
+            LogUtil.logAlways("[解除通知限制] 提示条 lambda 未命中（ROM 差异，可忽略）: " + t);
+        }
+    }
+
+    /** 解锁保留通知（HyperCeiler KeepNotification）：解锁瞬间把通知重置为
+     *  「解锁后尚未展示过」→ 锁屏上出现过的通知不会在解锁后被收起。 */
+    private void installKeepNotifHook(ClassLoader cl) {
+        try {
+            Class<?> c = Class.forName(Constants.KEEP_NOTIF_CLASS, false, cl);
+            Class<?> entryCl = Class.forName(Constants.NOTIF_ENTRY_CLASS, false, cl);
+            int n = 0;
+            for (Method m : c.getDeclaredMethods()) {
+                if (!Constants.KEEP_NOTIF_METHOD.equals(m.getName())) continue;
+                if (m.getParameterCount() != 1 || m.getParameterTypes()[0] != entryCl) continue;
+                m.setAccessible(true);
+                hook(m)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .setId("keep-notif")
+                        .intercept(chain -> {
+                            if (sKeepNotifFlag.get()) forceNotShownAfterUnlock(chain.getArg(0));
+                            return chain.proceed();
+                        });
+                n++;
+            }
+            LogUtil.logAlways("[解锁保留通知] 已挂钩 shouldHideNotification ×" + n);
+        } catch (Throwable t) {
+            LogUtil.logAlways("[解锁保留通知] 挂载失败: " + t);
+        }
+    }
+
+    /** 取 NotificationEntry → StatusBarNotification → Notification（用于屏蔽震动字段） */
+    private static Object entryNotification(Object entry) {
+        try {
+            Object sbn = entrySbn(entry);
+            if (sbn == null) return null;
+            Field f = findField(sbn.getClass(), "mNotification");
+            return f == null ? null : f.get(sbn);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /** NotificationEntry.mSbn.mHasShownAfterUnlock = false */
+    private static void forceNotShownAfterUnlock(Object entry) {
+        try {
+            Object sbn = entrySbn(entry);
+            if (sbn == null) return;
+            Field f = findField(sbn.getClass(), Constants.SBN_SHOWN_AFTER_UNLOCK_FIELD);
+            if (f != null) f.setBoolean(sbn, false);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 隐藏「已通过蓝牙设备解锁」Toast（v3.9，移植 HyperCeiler DisableUnlockByBleToast）。
+     *
+     *  上游原实现：在 KeyguardSecurityContainerController$3.dismiss / MiuiBleUnlockHelper
+     *  .tryUnlockByBle 里**嵌套** hook Toast.makeText 比对资源名
+     *  com.android.systemui:string/miui_keyguard_ble_unlock_succeed_msg，命中再 hook show() 吞掉。
+     *  本模块改为等价但更稳的两段式（不需要嵌套、也不依赖那两个内部类）：
+     *   1) hook Toast.makeText(Context,int,int)：把 resId 解析成资源 entry name，
+     *      命中 miui_keyguard_ble_unlock_succeed_msg（或文本同时含「蓝牙」与「解锁」）
+     *      → 把返回的 Toast 实例记入弱集合；
+     *   2) hook Toast.show()：仅当 this 在该弱集合中才 return null 吞掉。
+     *  Toast 非热路径；资源名取不到时一律放行，绝不误吞其它 Toast。 */
+    private void installHideBtUnlockHook(ClassLoader cl) {
+        installBleUnlockSourceHook(cl); // 路径 0：源头标记（最可靠，HyperCeiler 思路）
+        installBleUnlockViewHide();     // 路径 1：锁屏自定义 TextView 兜底
+        installBleUnlockToastHide();    // 路径 2：Toast 文本 / 资源名兜底
+    }
+
+    /** 路径 0：hook 蓝牙解锁源头 MiuiBleUnlockHelper.tryUnlockByBle()，
+     *  在其执行期间把 sInBleUnlock 置位，Toast.show() 据此直接吞掉。
+     *  依据：反汇编 classes.dex 证实该方法内就是 Toast.makeText(…).show()。 */
+    private void installBleUnlockSourceHook(ClassLoader cl) {
+        try {
+            Class<?> c = Class.forName(Constants.BLE_UNLOCK_HELPER_CLASS, false, cl);
+            Method m = c.getDeclaredMethod(Constants.BLE_TRY_UNLOCK_METHOD);
+            m.setAccessible(true);
+            hook(m)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("ble-unlock-source")
+                    .intercept(chain -> {
+                        sInBleUnlock.set(Boolean.TRUE);
+                        try {
+                            return chain.proceed();
+                        } finally {
+                            sInBleUnlock.set(Boolean.FALSE);
+                        }
+                    });
+            LogUtil.logAlways("[蓝牙解锁提示] 已挂钩 "
+                    + Constants.BLE_UNLOCK_HELPER_CLASS + ".tryUnlockByBle");
+        } catch (Throwable t) {
+            LogUtil.logAlways("[蓝牙解锁提示] tryUnlockByBle 未命中: " + t);
+        }
+    }
+
+    /** 路径 1（本 ROM 实证路径，v3.9.1 修正）。
+     *
+     *  ⚠️ v3.9 首版按 HyperCeiler 当成 Toast 处理，**在 HyperOS 4 上打不中**——
+     *  反查资源引用（dexdump -d classes.dex）证实：
+     *    7f1409a7 (string/miui_keyguard_ble_unlock_succeed_msg) +
+     *    7f070524/7f070525 (dimen/keyguard_ble_unlock_text_size/_textview_margin_top)
+     *  被 com.android.keyguard.MiuiBleUnlockHelper.tryUnlockByBle 与
+     *  com.android.keyguard.KeyguardSecurityContainerController.showNextSecurityScreenOrFinish
+     *  引用 → 它是锁屏上**代码创建的 TextView**，并非 android.widget.Toast。
+     *
+     *  故改为 hook TextView.setText(CharSequence…)：命中「蓝牙 + 解锁」文案即把该
+     *  TextView 置 GONE。文案高度唯一（"已通过蓝牙设备解锁"），误伤概率极低；
+     *  开关默认关闭，关闭时拦截器只做一次 volatile 读即放行。 */
+    private void installBleUnlockViewHide() {
+        try {
+            int n = 0;
+            for (Method m : android.widget.TextView.class.getDeclaredMethods()) {
+                if (!"setText".equals(m.getName())) continue;
+                Class<?>[] ps = m.getParameterTypes();
+                if (ps.length == 0 || ps[0] != CharSequence.class) continue;
+                m.setAccessible(true);
+                hook(m)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .setId("ble-unlock-text")
+                        .intercept(chain -> {
+                            Object ret = chain.proceed();
+                            try {
+                                if (!sHideBtUnlockFlag.get()) return ret;
+                                Object thiz = chain.getThisObject();
+                                if (thiz instanceof View
+                                        && isBluetoothUnlockText((CharSequence) chain.getArg(0))) {
+                                    final View tv = (View) thiz;
+                                    tv.setVisibility(View.GONE);
+                                    // 再 post 一次：setText 之后业务代码通常还会
+                                    // setVisibility(VISIBLE) 重新显示，延到下一帧
+                                    // 收尾，确保最终保持隐藏。
+                                    tv.post(new Runnable() {
+                                        @Override
+                                        public void run() {
+                                            try {
+                                                tv.setVisibility(View.GONE);
+                                            } catch (Throwable ignored) {
+                                            }
+                                        }
+                                    });
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                            return ret;
+                        });
+                n++;
+            }
+            LogUtil.logAlways("[蓝牙解锁提示] 已挂钩 TextView.setText ×" + n);
+        } catch (Throwable t) {
+            LogUtil.logAlways("[蓝牙解锁提示] 挂载失败: " + t);
+        }
+    }
+
+    /** 路径 2：真 Toast（部分 ROM / 未来版本）；show 前按视图文本判定再吞掉 */
+    private void installBleUnlockToastHide() {
+        try {
+            Method mk = android.widget.Toast.class.getDeclaredMethod("makeText",
+                    Context.class, int.class, int.class);
+            mk.setAccessible(true);
+            hook(mk)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("ble-toast-make")
+                    .intercept(chain -> {
+                        Object ret = chain.proceed();
+                        try {
+                            if (sHideBtUnlockFlag.get() && ret != null
+                                    && isBleUnlockRes(chain.getArg(0), (Integer) chain.getArg(1))) {
+                                sBleUnlockToasts.add(ret);
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                        return ret;
+                    });
+            Method show = android.widget.Toast.class.getDeclaredMethod("show");
+            show.setAccessible(true);
+            hook(show)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("ble-toast-show")
+                    .intercept(chain -> {
+                        try {
+                            if (sHideBtUnlockFlag.get()) {
+                                // 最高优先：正处于蓝牙解锁流程内 → 必是该提示，直接吞
+                                if (sInBleUnlock.get()) return null;
+                                Object thiz = chain.getThisObject();
+                                if (sBleUnlockToasts.remove(thiz)) {
+                                    return null; // makeText 阶段已按资源名命中
+                                }
+                                if (thiz instanceof android.widget.Toast
+                                        && isBluetoothUnlockText(toastText(
+                                                ((android.widget.Toast) thiz).getView()))) {
+                                    return null; // 兜底：按 Toast 文本命中
+                                }
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                        return chain.proceed();
+                    });
+            LogUtil.logAlways("[蓝牙解锁Toast] 已挂钩 Toast.makeText/show");
+        } catch (Throwable t) {
+            LogUtil.logAlways("[蓝牙解锁Toast] 挂载失败: " + t);
+        }
+    }
+
+    /** 判定资源 id 是否为「蓝牙解锁成功」文案 */
+    private static boolean isBleUnlockRes(Object ctxObj, int resId) {
+        try {
+            if (!(ctxObj instanceof Context)) return false;
+            android.content.res.Resources res = ((Context) ctxObj).getResources();
+            if (Constants.BLE_UNLOCK_RES_ENTRY.equals(res.getResourceEntryName(resId))) {
+                return true;
+            }
+            String text = String.valueOf(res.getText(resId)).toLowerCase();
+            return matchBluetoothUnlock(text);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /** 文案判定：同时含「蓝牙/bluetooth」与「解锁/unlock」 */
+    private static boolean isBluetoothUnlockText(CharSequence cs) {
+        if (cs == null) return false;
+        return matchBluetoothUnlock(cs.toString().toLowerCase());
+    }
+
+    private static boolean matchBluetoothUnlock(String lower) {
+        if (lower == null || lower.length() == 0) return false;
+        boolean bt = false, unlock = false;
+        for (String k : Constants.BLE_UNLOCK_TEXT_BT) {
+            if (lower.contains(k)) { bt = true; break; }
+        }
+        if (!bt) return false;
+        for (String k : Constants.BLE_UNLOCK_TEXT_UNLOCK) {
+            if (lower.contains(k)) { unlock = true; break; }
+        }
+        return unlock;
+    }
+
+    /** 收集视图树内所有 TextView 文本（用于 Toast 兜底判定） */
+    private static String toastText(View v) {
+        StringBuilder sb = new StringBuilder();
+        collectText(v, sb);
+        return sb.toString();
+    }
+
+    private static void collectText(View v, StringBuilder sb) {
+        try {
+            if (v == null) return;
+            if (v instanceof TextView) sb.append(((TextView) v).getText()).append(' ');
+            if (v instanceof ViewGroup) {
+                ViewGroup g = (ViewGroup) v;
+                for (int i = 0; i < g.getChildCount(); i++) collectText(g.getChildAt(i), sb);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 亮屏时静音（HyperCeiler MuteVisibleNotifications）：
+     *  屏幕已点亮时直接跳过 buzzBeepBlink → 不响铃、不震动、不亮屏闪烁。 */
+    private void installMuteScreenOnHook(ClassLoader cl) {
+        try {
+            Class<?> c = Class.forName(Constants.MUTE_ALERT_CLASS, false, cl);
+            Class<?> entryCl = Class.forName(Constants.NOTIF_ENTRY_CLASS, false, cl);
+            Method m = c.getDeclaredMethod(Constants.MUTE_ALERT_METHOD, entryCl);
+            m.setAccessible(true);
+            hook(m)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("mute-screen-on")
+                    .intercept(chain -> {
+                        if (!isScreenInteractive(chain.getThisObject())) {
+                            return chain.proceed();
+                        }
+                        // 全静音：亮屏时直接跳过 buzzBeepBlink（不响铃/不震动/不闪烁）
+                        if (sMuteScreenOnFlag.get()) {
+                            return null;
+                        }
+                        // 仅取消震动：临时置空通知的 vibrate 字段与 DEFAULT_VIBRATE 位，调用后还原
+                        if (sCancelVibrateScreenOnFlag.get()) {
+                            Object entry = chain.getArg(0);
+                            Object notif = entry == null ? null : entryNotification(entry);
+                            Field vf = notif == null ? null : findField(notif.getClass(), "vibrate");
+                            Field df = notif == null ? null : findField(notif.getClass(), "defaults");
+                            Object oldVibrate = null;
+                            boolean stripped = false;
+                            int oldDefaults = 0;
+                            boolean defaultVibrate = false;
+                            try {
+                                if (vf != null) {
+                                    oldVibrate = vf.get(notif);
+                                    if (oldVibrate != null) {
+                                        vf.set(notif, null);
+                                        stripped = true;
+                                    }
+                                }
+                                if (df != null) {
+                                    oldDefaults = df.getInt(notif);
+                                    if ((oldDefaults & android.app.Notification.DEFAULT_VIBRATE) != 0) {
+                                        df.setInt(notif, oldDefaults & ~android.app.Notification.DEFAULT_VIBRATE);
+                                        defaultVibrate = true;
+                                    }
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                            try {
+                                return chain.proceed();
+                            } finally {
+                                try {
+                                    if (stripped && vf != null) vf.set(notif, oldVibrate);
+                                    if (defaultVibrate && df != null) df.setInt(notif, oldDefaults);
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                        }
+                        return chain.proceed();
+                    });
+            LogUtil.logAlways("[亮屏静音] 已挂钩 " + Constants.MUTE_ALERT_CLASS + ".buzzBeepBlink");
+        } catch (Throwable t) {
+            LogUtil.logAlways("[亮屏静音] 挂载失败: " + t);
+        }
+    }
+
+    /** 亮屏判定：PowerManager.isInteractive()。拿不到 Context 时按「亮屏」处理（保守静音）。 */
+    private static boolean isScreenInteractive(Object thisObj) {
+        try {
+            Field f = findField(thisObj.getClass(), Constants.MUTE_ALERT_CONTEXT_FIELD);
+            if (f == null) return true;
+            Object ctx = f.get(thisObj);
+            if (ctx instanceof Context) {
+                PowerManager pm = (PowerManager) ((Context) ctx).getSystemService(Context.POWER_SERVICE);
+                if (pm != null) return pm.isInteractive();
+            }
+        } catch (Throwable ignored) {
+        }
+        return true;
+    }
+
+    /** 重定向通知设置（HyperCeiler RedirectToNotificationChannelSetting）：
+     *  拦截 startAppNotificationSettings(Context,pkg,channel,uid,...) → 直接打开该
+     *  渠道的通知设置页，跳过应用级通知设置页。 */
+    private void installRedirectNotifSettingsHook(ClassLoader cl) {
+        try {
+            Class<?> helper = Class.forName(Constants.NOTIF_SETTINGS_HELPER_CLASS, false, cl);
+            Method m = helper.getDeclaredMethod(Constants.NOTIF_SETTINGS_START_METHOD,
+                    Context.class, String.class, String.class, int.class, String.class);
+            m.setAccessible(true);
+            hook(m)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("redirect-notif-settings")
+                    .intercept(chain -> {
+                        if (!sRedirectNotifSetFlag.get()) return chain.proceed();
+                        try {
+                            Object ctx0 = chain.getArg(0);
+                            String pkg = (String) chain.getArg(1);
+                            if (ctx0 instanceof Context && pkg != null) {
+                                Intent i = new Intent(
+                                        Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS);
+                                i.putExtra(Settings.EXTRA_APP_PACKAGE, pkg);
+                                Object ch = chain.getArg(2);
+                                if (ch instanceof String) {
+                                    i.putExtra(Settings.EXTRA_CHANNEL_ID, (String) ch);
+                                }
+                                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                                ((Context) ctx0).startActivity(i);
+                                return null;
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                        return chain.proceed();
+                    });
+            LogUtil.logAlways("[通知设置重定向] 已挂钩 "
+                    + Constants.NOTIF_SETTINGS_HELPER_CLASS + ".startAppNotificationSettings");
+        } catch (Throwable t) {
+            LogUtil.logAlways("[通知设置重定向] 挂载失败: " + t);
+        }
+    }
+
+    /** 允许管理所有通知（HyperCeiler AllowManageAllNotifications）：
+     *  NotificationChannel 一律视为可屏蔽（isBlockable → true），并把 blockable 字段写 true。 */
+    private void installAllowManageAllHook(ClassLoader cl) {
+        try {
+            Class<?> ch = Class.forName(Constants.NOTIF_CHANNEL_CLASS, false, cl);
+            Method isB = ch.getDeclaredMethod(Constants.CHANNEL_IS_BLOCKABLE_METHOD);
+            isB.setAccessible(true);
+            hook(isB)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("allow-manage-all-is")
+                    .intercept(chain ->
+                            sAllowManageAllFlag.get() ? Boolean.TRUE : chain.proceed());
+            Method setB = ch.getDeclaredMethod(Constants.CHANNEL_SET_BLOCKABLE_METHOD,
+                    boolean.class);
+            setB.setAccessible(true);
+            hook(setB)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("allow-manage-all-set")
+                    .intercept(chain -> {
+                        Object ret = chain.proceed();
+                        try {
+                            if (sAllowManageAllFlag.get()) {
+                                Field f = ch.getDeclaredField(Constants.CHANNEL_BLOCKABLE_FIELD);
+                                f.setAccessible(true);
+                                f.setBoolean(chain.getThisObject(), true);
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                        return ret;
+                    });
+            LogUtil.logAlways("[允许管理所有通知] 已挂钩 NotificationChannel.is/setBlockable");
+        } catch (Throwable t) {
+            LogUtil.logAlways("[允许管理所有通知] 挂载失败: " + t);
+        }
+    }
+
+    /** 移除焦点通知白名单（HyperCeiler UnlockFocus）：
+     *  NotificationSettingsManager.canShowFocusState / canShowFocusStateApp
+     *  (Context,String)I 一律返回 1 → 任意应用（含小米健康、小米服务框架等
+     *  原本不在白名单内的）都能显示为焦点通知。 */
+    private void installUnlockAllFocusHook(ClassLoader cl) {
+        try {
+            Class<?> c = Class.forName(Constants.FOCUS_MANAGER_CLASS, false, cl);
+            int n = 0;
+            for (String mname : Constants.FOCUS_CAN_SHOW_METHODS) {
+                try {
+                    Method m = c.getDeclaredMethod(mname, Context.class, String.class);
+                    m.setAccessible(true);
+                    hook(m)
+                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .setId("unlock-all-focus-" + mname)
+                            .intercept(chain -> sUnlockAllFocusFlag.get()
+                                    ? Integer.valueOf(1) : chain.proceed());
+                    n++;
+                } catch (Throwable ignored) {
+                }
+            }
+            LogUtil.logAlways("[焦点通知白名单] 已挂钩 canShowFocusState/App ×" + n);
+        } catch (Throwable t) {
+            LogUtil.logAlways("[焦点通知白名单] 挂载失败: " + t);
+        }
+    }
+
+    /** 禁止折叠历史通知：跳过 sendFoldNotification(UserHandle, CreateFoldNotifReason)，
+     *  历史/静音通知不再被收纳成一条「折叠」通知。 */
+    private void installFoldNotifHook(ClassLoader cl) {
+        try {
+            Class<?> c = Class.forName(Constants.FOLD_NOTIF_CONTROLLER_CLASS, false, cl);
+            Class<?> reason = Class.forName(Constants.FOLD_NOTIF_REASON_CLASS, false, cl);
+            Method m = c.getDeclaredMethod(Constants.FOLD_SEND_METHOD, UserHandle.class, reason);
+            m.setAccessible(true);
+            hook(m)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("no-fold-history")
+                    .intercept(chain -> sNoFoldHistoryFlag.get() ? null : chain.proceed());
+            LogUtil.logAlways("[禁止折叠历史] 已挂钩 "
+                    + Constants.FOLD_NOTIF_CONTROLLER_CLASS + ".sendFoldNotification");
+        } catch (Throwable t) {
+            LogUtil.logAlways("[禁止折叠历史] 挂载失败: " + t);
+        }
+    }
+
+    /** 禁止收纳通知为组：分组摘要判定一律为 false（同应用多条通知不再折叠成一组）。
+     *  刻意不 hook getGroupSummary（返回 null 有 NPE 风险），只改布尔判定，安全。 */
+    private void installNoGroupHook(ClassLoader cl) {
+        try {
+            Class<?> g = Class.forName(Constants.GROUP_MEMBER_MANAGER_CLASS, false, cl);
+            Class<?> entryCl = Class.forName(Constants.NOTIF_ENTRY_CLASS, false, cl);
+            Method is = g.getDeclaredMethod(Constants.GROUP_IS_SUMMARY_METHOD, entryCl);
+            is.setAccessible(true);
+            hook(is)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("no-group-is-summary")
+                    .intercept(chain ->
+                            sNoGroupFlag.get() ? Boolean.FALSE : chain.proceed());
+            LogUtil.logAlways("[禁止通知分组] 已挂钩 "
+                    + Constants.GROUP_MEMBER_MANAGER_CLASS + ".isGroupSummary");
+        } catch (Throwable t) {
+            LogUtil.logAlways("[禁止通知分组] 挂载失败: " + t);
+        }
+        try {
+            Class<?> rowCl = Class.forName(Constants.EXPANDABLE_NOTIF_ROW_CLASS, false, cl);
+            Method m = rowCl.getDeclaredMethod(Constants.ROW_IS_CHILD_METHOD);
+            m.setAccessible(true);
+            hook(m)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("no-group-is-child")
+                    .intercept(chain ->
+                            sNoGroupFlag.get() ? Boolean.FALSE : chain.proceed());
+            LogUtil.logAlways("[禁止通知分组] 已挂钩 ExpandableNotificationRow.isChildInGroup");
+        } catch (Throwable t) {
+            LogUtil.logAlways("[禁止通知分组] isChildInGroup 未命中（可忽略）: " + t);
         }
     }
 
@@ -523,47 +1199,15 @@ public class MainHook extends XposedModule {
     private void reloadPrefs() {
         if (sPrefs == null) return;
         try {
-            boolean newSink = sPrefs.getBoolean(Constants.PREFS_SINK_ENABLED,
-                    Constants.DEFAULT_SINK_ENABLED);
-            boolean newGlass = sPrefs.getBoolean(Constants.PREFS_GLASS_ENABLED,
-                    Constants.DEFAULT_GLASS_ENABLED);
-            boolean newHideLockFod = sPrefs.getBoolean(Constants.PREFS_HIDE_LOCK_FOD,
-                    Constants.DEFAULT_HIDE_LOCK_FOD);
-            boolean newHideDismiss = sPrefs.getBoolean(Constants.PREFS_HIDE_DISMISS_BTN,
-                    Constants.DEFAULT_HIDE_DISMISS_BTN);
-            boolean newFocusGlass = sPrefs.getBoolean(Constants.PREFS_FOCUS_GLASS,
-                    Constants.DEFAULT_FOCUS_GLASS);
-            boolean newAod = sPrefs.getBoolean(Constants.PREFS_AOD_BATTERY_SYNC,
-                    Constants.DEFAULT_AOD_BATTERY_SYNC);
-            boolean newPinGlass = sPrefs.getBoolean(Constants.PREFS_PIN_GLASS,
-                    Constants.DEFAULT_PIN_GLASS);
-            boolean newNavHandleHide = sPrefs.getBoolean(Constants.PREFS_NAV_HANDLE_HIDE,
-                    Constants.DEFAULT_NAV_HANDLE_HIDE);
-            boolean newQsEditHide = sPrefs.getBoolean(Constants.PREFS_QS_EDIT_HIDE,
-                    Constants.DEFAULT_QS_EDIT_HIDE);
-            boolean log = sPrefs.getBoolean(Constants.PREFS_ENABLE_LOG,
-                    Constants.DEFAULT_ENABLE_LOG);
-            sSinkEnabled = newSink;
-            sGlassEnabled = newGlass;
-            // v3.3.7：开关为「开」时补写字段（含用户关→开的场景，见方法注释）
-            if (newGlass) reassertAllThemeUtilsFields();
-            sHideLockFod = newHideLockFod;
-            sHideLockFodFlag.set(newHideLockFod);
-            sHideDismissBtn = newHideDismiss;
-            sHideDismissFlag.set(newHideDismiss);
-            sFocusGlass = newFocusGlass;
-            sFocusGlassFlag.set(newFocusGlass);
-            sAodBatterySyncFlag.set(newAod);
-            sPinGlassFlag.set(newPinGlass);
-            sNavHandleHideFlag.set(newNavHandleHide);
-            sQsEditHideFlag.set(newQsEditHide);
-            LogUtil.setEnabled(log);
-            LogUtil.logAlways("设置(框架)：sink=" + sSinkEnabled + "，glass=" + sGlassEnabled
-                    + "，hideLockFod=" + sHideLockFod + "，hideDismiss=" + sHideDismissBtn
-                    + "，focusGlass=" + sFocusGlass + "，aodBattery=" + newAod
-                    + "，pinGlass=" + newPinGlass + "，navHandleHide=" + newNavHandleHide
-                    + "，qsEditHide=" + newQsEditHide
-                    + "，日志=" + log);
+            // ponytail: 与 applyRealPrefs 合并为单一真值表。原 ~40 行逐键读取
+            // 与 applyRealPrefs 完全重复，且易漏新键（v3.11 新增的 xmsf/health
+            // 就漏在 applyRealPrefs 里 → 冷启动不生效）。现统一走 ALL_PREF_KEYS 遍历。
+            android.os.Bundle out = new android.os.Bundle();
+            for (int i = 0; i < Constants.ALL_PREF_KEYS.length; i++) {
+                out.putBoolean(Constants.ALL_PREF_KEYS[i],
+                        sPrefs.getBoolean(Constants.ALL_PREF_KEYS[i], Constants.ALL_PREF_DEFAULTS[i]));
+            }
+            applyRealPrefs(out);
         } catch (Throwable t) {
             LogUtil.logAlways("读取设置失败: " + t);
         }
@@ -634,6 +1278,26 @@ public class MainHook extends XposedModule {
                     Constants.DEFAULT_NAV_HANDLE_HIDE);
             boolean qsEditHide = out.getBoolean(Constants.PREFS_QS_EDIT_HIDE,
                     Constants.DEFAULT_QS_EDIT_HIDE);
+            boolean noFoldHistory = out.getBoolean(Constants.PREFS_NO_FOLD_HISTORY,
+                    Constants.DEFAULT_NO_FOLD_HISTORY);
+            boolean noGroup = out.getBoolean(Constants.PREFS_NO_GROUP,
+                    Constants.DEFAULT_NO_GROUP);
+            boolean noNotifLimit = out.getBoolean(Constants.PREFS_NO_NOTIF_LIMIT,
+                    Constants.DEFAULT_NO_NOTIF_LIMIT);
+            boolean keepNotif = out.getBoolean(Constants.PREFS_KEEP_NOTIF,
+                    Constants.DEFAULT_KEEP_NOTIF);
+            boolean hideBtUnlock = out.getBoolean(Constants.PREFS_HIDE_BT_UNLOCK,
+                    Constants.DEFAULT_HIDE_BT_UNLOCK);
+            boolean muteScreenOn = out.getBoolean(Constants.PREFS_MUTE_SCREEN_ON,
+                    Constants.DEFAULT_MUTE_SCREEN_ON);
+            boolean cancelVibrateScreenOn = out.getBoolean(Constants.PREFS_CANCEL_VIBRATE_SCREEN_ON,
+                    Constants.DEFAULT_CANCEL_VIBRATE_SCREEN_ON);
+            boolean redirectNotifSet = out.getBoolean(Constants.PREFS_REDIRECT_NOTIF_SET,
+                    Constants.DEFAULT_REDIRECT_NOTIF_SET);
+            boolean allowManageAll = out.getBoolean(Constants.PREFS_ALLOW_MANAGE_ALL,
+                    Constants.DEFAULT_ALLOW_MANAGE_ALL);
+            boolean unlockAllFocus = out.getBoolean(Constants.PREFS_UNLOCK_ALL_FOCUS,
+                    Constants.DEFAULT_UNLOCK_ALL_FOCUS);
             boolean log = out.getBoolean(Constants.PREFS_ENABLE_LOG,
                     Constants.DEFAULT_ENABLE_LOG);
             sSinkEnabled = sink;
@@ -650,12 +1314,38 @@ public class MainHook extends XposedModule {
             sPinGlassFlag.set(pinGlass);
             sNavHandleHideFlag.set(navHandleHide);
             sQsEditHideFlag.set(qsEditHide);
+            sNoFoldHistoryFlag.set(noFoldHistory);
+            sNoGroupFlag.set(noGroup);
+            sNoNotifLimitFlag.set(noNotifLimit);
+            sKeepNotifFlag.set(keepNotif);
+            sHideBtUnlockFlag.set(hideBtUnlock);
+            sMuteScreenOnFlag.set(muteScreenOn);
+            sCancelVibrateScreenOnFlag.set(cancelVibrateScreenOn);
+            sRedirectNotifSetFlag.set(redirectNotifSet);
+            sAllowManageAllFlag.set(allowManageAll);
+            sUnlockAllFocusFlag.set(unlockAllFocus);
+            // v3.12 补充：真实值同步路径此前漏读这两个键（reloadPrefs 有、applyRealPrefs 无），
+            // 导致各自进程冷启动时不生效。现此处为唯一真值表，必须含全部开关。
+            boolean xmsfFocusSign = out.getBoolean(Constants.PREFS_XMSF_FOCUS_SIGN,
+                    Constants.DEFAULT_XMSF_FOCUS_SIGN);
+            boolean healthFocusAllowAll = out.getBoolean(Constants.PREFS_HEALTH_FOCUS_ALLOW_ALL,
+                    Constants.DEFAULT_HEALTH_FOCUS_ALLOW_ALL);
+            sXmsfFocusSignFlag.set(xmsfFocusSign);
+            sHealthFocusAllowAllFlag.set(healthFocusAllowAll);
             LogUtil.setEnabled(log);
             LogUtil.logAlways("设置(真实值同步)：sink=" + sink + "，glass=" + glass
                     + "，hideLockFod=" + fod + "，hideDismiss=" + dismiss
                     + "，focusGlass=" + focus + "，aodBattery=" + aod
                     + "，pinGlass=" + pinGlass + "，navHandleHide=" + navHandleHide
-                    + "，qsEditHide=" + qsEditHide
+                    + "，qsEditHide=" + qsEditHide + "，noFoldHistory=" + noFoldHistory
+                    + "，noGroup=" + noGroup
+                    + "，noNotifLimit=" + noNotifLimit + "，keepNotif=" + keepNotif
+                    + "，hideBtUnlock=" + hideBtUnlock + "，muteScreenOn=" + muteScreenOn
+                    + "，redirectNotifSet=" + redirectNotifSet
+                    + "，allowManageAll=" + allowManageAll
+                    + "，unlockAllFocus=" + unlockAllFocus
+                    + "，xmsfFocusSign=" + xmsfFocusSign
+                    + "，healthFocusAllowAll=" + healthFocusAllowAll
                     + "，日志=" + log);
         } catch (Throwable t) {
             LogUtil.logAlways("设置(真实值同步) 应用失败: " + t);
@@ -750,7 +1440,7 @@ public class MainHook extends XposedModule {
                                 @Override
                                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
                                     // 热路径：只读 volatile 布尔，绝不写日志/IO。
-                                    // 液态玻璃开关关闭时放行原逻辑。
+                                    // 柔光玻璃开关关闭时放行原逻辑。
                                     if (sGlassEnabled) return Boolean.TRUE;
                                     return chain.proceed();
                                 }
@@ -778,7 +1468,7 @@ public class MainHook extends XposedModule {
                                     if (sGlassEnabled) {
                                         if (LogUtil.hitOnce("glass-set")) {
                                             LogUtil.logAlways("[玻璃] setDefault*Theme 强制 true"
-                                                    + "（保留液态玻璃，原入参被覆盖）");
+                                                    + "（保留柔光玻璃，原入参被覆盖）");
                                         }
                                         return chain.proceed(new Object[]{true});
                                     }
@@ -870,7 +1560,7 @@ public class MainHook extends XposedModule {
 
     /** v3.3.9：钩 MiBlurCompat.getBackgroundMaterialOpenedInDefaultTheme（线 A 总闸门）。
      *  静态方法 (Context)Z，PUBLIC STATIC FINAL，46 code units 不会被 ART 内联。
-     *  仅当系统当前 material_style == 1（Bionics / 液态玻璃）时才强制 true，避免关闭/磨砂
+     *  仅当系统当前 material_style == 1（Bionics / 柔光玻璃）时才强制 true，避免关闭/磨砂
      *  模式下被强制玻璃导致磁贴形状/背景错乱。其余模式调用原逻辑，保留系统材质判据。
      *  按 Class 对象身份去重（同 ThemeUtils 的多 ClassLoader 副本陷阱）。 */
     private void tryHookMiBlurCompatIn(ClassLoader loader) {
@@ -1565,7 +2255,7 @@ public class MainHook extends XposedModule {
     }
 
     // ============================================================
-    // 液态玻璃焦点通知（v3.2.0 用户 smali 方案：Focus→NotificationRow）
+    // 柔光玻璃焦点通知（v3.2.0 用户 smali 方案：Focus→NotificationRow）
     // ============================================================
     /**
      * 用户 smali patch 语义（dexdump 确认 classes2.dex）：
@@ -1938,6 +2628,147 @@ public class MainHook extends XposedModule {
             }
         }
         throw new NoSuchFieldException(name);
+    }
+
+    // ============================================================
+    // 跨应用焦点通知（v3.11 移植 HyperCeiler，忠实按上游实现）
+    //   - xmsf：解锁焦点通知白名单签名验证（AuthSession.getAuthError 错误码清零 → 视为成功）
+    //   - health：允许所有应用发送焦点通知到手表/手环（handleNotificationPosted 清 ongoing
+    //             + NotificationFilterHelper.isNotificationSpotlightAppInWhiteList 恒 true）
+    // 两个作用域 com.xiaomi.xmsf / com.mi.health 已在 scope.list 声明。
+    // ============================================================
+
+    /** 小米服务框架：解锁焦点通知白名单签名验证。
+     *  反射定位 com.xiaomi.xms.auth.AuthSession 的 getAuthError/getAuthSuccess 与
+     *  AuthError 的 int 错误码字段；命中开关时把错误码清零并直接返回成功 Bundle，
+     *  解除白名单应用的签名校验（HyperCeiler xmsf/UnlockFoucsAuth 等价）。 */
+    private void installXmsfFocusHooks(ClassLoader cl) {
+        try {
+            final Class<?> authSession =
+                    Class.forName("com.xiaomi.xms.auth.AuthSession", false, cl);
+            final Class<?> authError =
+                    Class.forName("com.xiaomi.xms.auth.AuthError", false, cl);
+
+            Method getAuthError = null;
+            Method getAuthSuccess = null;
+            for (Method m : authSession.getDeclaredMethods()) {
+                if (m.getParameterCount() == 1
+                        && m.getParameterTypes()[0] == authError
+                        && m.getReturnType() == android.os.Bundle.class) {
+                    getAuthError = m;
+                } else if (m.getParameterCount() == 0
+                        && m.getReturnType() == android.os.Bundle.class) {
+                    getAuthSuccess = m;
+                }
+            }
+            java.lang.reflect.Field errField = null;
+            for (java.lang.reflect.Field f : authError.getDeclaredFields()) {
+                if (f.getType() == int.class) {
+                    errField = f;
+                    break;
+                }
+            }
+            final java.lang.reflect.Field errorField = errField;
+            if (getAuthError == null || getAuthSuccess == null || errorField == null) {
+                LogUtil.logAlways("[xmsf焦点] 未命中 AuthSession 方法/字段，跳过");
+                return;
+            }
+            getAuthError.setAccessible(true);
+            getAuthSuccess.setAccessible(true);
+            errorField.setAccessible(true);
+
+            final Method success = getAuthSuccess;
+            hook(getAuthError)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("xmsf-focus-sign")
+                    .intercept(chain -> {
+                        if (!sXmsfFocusSignFlag.get()) return chain.proceed();
+                        try {
+                            Object error = chain.getArg(0);
+                            errorField.set(error, 0); // 错误码清零
+                            return success.invoke(chain.getThisObject()); // 直接返回成功 Bundle
+                        } catch (Throwable t) {
+                            return chain.proceed();
+                        }
+                    });
+            LogUtil.logAlways("[xmsf焦点] 已挂钩 AuthSession.getAuthError（签名验证绕过）");
+        } catch (Throwable t) {
+            LogUtil.logAlways("[xmsf焦点] 挂钩失败: " + t);
+        }
+    }
+
+    /** 小米运动健康：允许所有应用发送焦点通知到手表/手环（HyperCeiler health/UnlockFoucsAuth）。 */
+    private void installHealthFocusHooks(ClassLoader cl) {
+        // 路径 A：handleNotificationPosted 中清掉焦点歌词通知的 FLAG_ONGOING_EVENT，使其在手表/手环常驻
+        try {
+            Class<?> svc = Class.forName(
+                    "com.xiaomi.fitness.notify.BaseNotifySyncService", false, cl);
+            Method posted = null;
+            for (Method m : svc.getDeclaredMethods()) {
+                if ("handleNotificationPosted".equals(m.getName())
+                        && m.getParameterCount() == 1
+                        && android.service.notification.StatusBarNotification.class
+                        .isAssignableFrom(m.getParameterTypes()[0])) {
+                    posted = m;
+                    break;
+                }
+            }
+            if (posted != null) {
+                posted.setAccessible(true);
+                hook(posted)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .setId("health-focus-posted")
+                        .intercept(chain -> {
+                            if (sHealthFocusAllowAllFlag.get()) {
+                                try {
+                                    Object sbn = chain.getArg(0);
+                                    if (sbn instanceof android.service.notification.StatusBarNotification) {
+                                        android.app.Notification n =
+                                                ((android.service.notification.StatusBarNotification) sbn)
+                                                        .getNotification();
+                                        if ("channel_id_focusNotifLyrics".equals(n.getChannelId())) {
+                                            n.flags &= ~android.app.Notification.FLAG_ONGOING_EVENT;
+                                        }
+                                    }
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                            return chain.proceed();
+                        });
+                LogUtil.logAlways("[health焦点] 已挂钩 BaseNotifySyncService.handleNotificationPosted");
+            } else {
+                LogUtil.logAlways("[health焦点] 未命中 handleNotificationPosted");
+            }
+        } catch (Throwable t) {
+            LogUtil.logAlways("[health焦点] handleNotificationPosted 挂钩失败: " + t);
+        }
+
+        // 路径 B：isNotificationSpotlightAppInWhiteList 恒返回 true（解除白名单，允许所有应用）
+        try {
+            Class<?> helper = Class.forName(
+                    "com.xiaomi.fitness.notify.util.NotificationFilterHelper", false, cl);
+            Method white = null;
+            for (Method m : helper.getDeclaredMethods()) {
+                if ("isNotificationSpotlightAppInWhiteList".equals(m.getName())
+                        && m.getParameterCount() == 1) {
+                    white = m;
+                    break;
+                }
+            }
+            if (white != null) {
+                white.setAccessible(true);
+                hook(white)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .setId("health-focus-whitelist")
+                        .intercept(chain -> sHealthFocusAllowAllFlag.get()
+                                ? Boolean.TRUE : chain.proceed());
+                LogUtil.logAlways("[health焦点] 已挂钩 NotificationFilterHelper.isNotificationSpotlightAppInWhiteList");
+            } else {
+                LogUtil.logAlways("[health焦点] 未命中 isNotificationSpotlightAppInWhiteList");
+            }
+        } catch (Throwable t) {
+            LogUtil.logAlways("[health焦点] 白名单挂钩失败: " + t);
+        }
     }
 
 }

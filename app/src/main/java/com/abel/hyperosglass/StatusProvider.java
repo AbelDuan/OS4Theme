@@ -47,52 +47,20 @@ public class StatusProvider extends ContentProvider {
         // hook，把最新设置同步进 daemon 快照；此后 SystemUI 侧
         // getRemotePreferences 即可直接读到（重启手机也无需 CE 兜底重试）。
         try {
-            sp.edit()
-                    .putBoolean(Constants.PREFS_GLASS_ENABLED, sp.getBoolean(
-                            Constants.PREFS_GLASS_ENABLED, Constants.DEFAULT_GLASS_ENABLED))
-                    .putBoolean(Constants.PREFS_SINK_ENABLED, sp.getBoolean(
-                            Constants.PREFS_SINK_ENABLED, Constants.DEFAULT_SINK_ENABLED))
-                    .putBoolean(Constants.PREFS_HIDE_LOCK_FOD, sp.getBoolean(
-                            Constants.PREFS_HIDE_LOCK_FOD, Constants.DEFAULT_HIDE_LOCK_FOD))
-                    .putBoolean(Constants.PREFS_HIDE_DISMISS_BTN, sp.getBoolean(
-                            Constants.PREFS_HIDE_DISMISS_BTN, Constants.DEFAULT_HIDE_DISMISS_BTN))
-                    .putBoolean(Constants.PREFS_FOCUS_GLASS, sp.getBoolean(
-                            Constants.PREFS_FOCUS_GLASS, Constants.DEFAULT_FOCUS_GLASS))
-                    .putBoolean(Constants.PREFS_AOD_BATTERY_SYNC, sp.getBoolean(
-                            Constants.PREFS_AOD_BATTERY_SYNC, Constants.DEFAULT_AOD_BATTERY_SYNC))
-                    .putBoolean(Constants.PREFS_PIN_GLASS, sp.getBoolean(
-                            Constants.PREFS_PIN_GLASS, Constants.DEFAULT_PIN_GLASS))
-                    .putBoolean(Constants.PREFS_NAV_HANDLE_HIDE, sp.getBoolean(
-                            Constants.PREFS_NAV_HANDLE_HIDE, Constants.DEFAULT_NAV_HANDLE_HIDE))
-                    .putBoolean(Constants.PREFS_QS_EDIT_HIDE, sp.getBoolean(
-                            Constants.PREFS_QS_EDIT_HIDE, Constants.DEFAULT_QS_EDIT_HIDE))
-                    .putBoolean(Constants.PREFS_ENABLE_LOG, sp.getBoolean(
-                            Constants.PREFS_ENABLE_LOG, Constants.DEFAULT_ENABLE_LOG))
-                    .commit();
+            SharedPreferences.Editor ed = sp.edit();
+            for (int i = 0; i < Constants.ALL_PREF_KEYS.length; i++) {
+                String k = Constants.ALL_PREF_KEYS[i];
+                ed.putBoolean(k, sp.getBoolean(k, Constants.ALL_PREF_DEFAULTS[i]));
+            }
+            ed.commit();
         } catch (Throwable ignored) {
         }
 
         Bundle out = new Bundle();
-        out.putBoolean(Constants.PREFS_GLASS_ENABLED,
-                sp.getBoolean(Constants.PREFS_GLASS_ENABLED, Constants.DEFAULT_GLASS_ENABLED));
-        out.putBoolean(Constants.PREFS_SINK_ENABLED,
-                sp.getBoolean(Constants.PREFS_SINK_ENABLED, Constants.DEFAULT_SINK_ENABLED));
-        out.putBoolean(Constants.PREFS_HIDE_LOCK_FOD,
-                sp.getBoolean(Constants.PREFS_HIDE_LOCK_FOD, Constants.DEFAULT_HIDE_LOCK_FOD));
-        out.putBoolean(Constants.PREFS_HIDE_DISMISS_BTN,
-                sp.getBoolean(Constants.PREFS_HIDE_DISMISS_BTN, Constants.DEFAULT_HIDE_DISMISS_BTN));
-        out.putBoolean(Constants.PREFS_FOCUS_GLASS,
-                sp.getBoolean(Constants.PREFS_FOCUS_GLASS, Constants.DEFAULT_FOCUS_GLASS));
-        out.putBoolean(Constants.PREFS_AOD_BATTERY_SYNC,
-                sp.getBoolean(Constants.PREFS_AOD_BATTERY_SYNC, Constants.DEFAULT_AOD_BATTERY_SYNC));
-        out.putBoolean(Constants.PREFS_PIN_GLASS,
-                sp.getBoolean(Constants.PREFS_PIN_GLASS, Constants.DEFAULT_PIN_GLASS));
-        out.putBoolean(Constants.PREFS_NAV_HANDLE_HIDE,
-                sp.getBoolean(Constants.PREFS_NAV_HANDLE_HIDE, Constants.DEFAULT_NAV_HANDLE_HIDE));
-        out.putBoolean(Constants.PREFS_QS_EDIT_HIDE,
-                sp.getBoolean(Constants.PREFS_QS_EDIT_HIDE, Constants.DEFAULT_QS_EDIT_HIDE));
-        out.putBoolean(Constants.PREFS_ENABLE_LOG,
-                sp.getBoolean(Constants.PREFS_ENABLE_LOG, Constants.DEFAULT_ENABLE_LOG));
+        for (int i = 0; i < Constants.ALL_PREF_KEYS.length; i++) {
+            String k = Constants.ALL_PREF_KEYS[i];
+            out.putBoolean(k, sp.getBoolean(k, Constants.ALL_PREF_DEFAULTS[i]));
+        }
         out.putBoolean("ok", true);
         return out;
     }
