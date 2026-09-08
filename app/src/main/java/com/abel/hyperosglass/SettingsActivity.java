@@ -49,6 +49,20 @@ import java.util.Locale;
 public class SettingsActivity extends Activity {
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        // 设置页在前台 → 取消空闲退出（v3.14）
+        StatusProvider.noteForeground(true);
+    }
+
+    @Override
+    protected void onPause() {
+        // 离开设置页 → 重新开始空闲退出计时（v3.14）
+        StatusProvider.noteForeground(false);
+        super.onPause();
+    }
+
+    @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         try {

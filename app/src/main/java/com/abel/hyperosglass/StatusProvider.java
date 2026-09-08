@@ -18,13 +18,58 @@ import android.os.Bundle;
  */
 public class StatusProvider extends ContentProvider {
 
+    // ── 空闲退出（v3.14）：不保留后台进程 ──
+    // 本进程只在 systemui / xmsf / health 跨进程取设置时被 AMS 拉起
+    // （DE 真值同步必需，拉起本身无法避免），但取完没必要继续常驻。
+    // 每次服务完一次 call 就重新计时；空闲 IDLE_EXIT_MS 且设置页不在前台
+    // → 主动结束进程，不再占着后台。
+    private static final long IDLE_EXIT_MS = 5000L;
+    private static final android.os.Handler sMain =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+    private static int sForeground = 0;
+    private static final Runnable sIdleExit = new Runnable() {
+        @Override
+        public void run() {
+            if (sForeground <= 0) {
+                android.os.Process.killProcess(android.os.Process.myPid());
+            }
+        }
+    };
+
+    /** 服务完一次跨进程调用后重新计时 */
+    public static void scheduleIdleExit() {
+        sMain.removeCallbacks(sIdleExit);
+        sMain.postDelayed(sIdleExit, IDLE_EXIT_MS);
+    }
+
+    /** 设置页前后台切换：前台期间不退出，回到后台重新开始计时 */
+    public static void noteForeground(boolean foreground) {
+        sForeground += foreground ? 1 : -1;
+        if (sForeground < 0) sForeground = 0;
+        if (sForeground > 0) sMain.removeCallbacks(sIdleExit);
+        else scheduleIdleExit();
+    }
+
     @Override
     public boolean onCreate() {
+        // 进程无论因何被拉起（含框架为同步 prefs 自行启动），AMS 都会安装本
+        // Provider → onCreate 必然执行。这里就开始空闲倒计时：没人用就退出，
+        // 不依赖「必须发生一次 call」才计时（实测 SystemUI 重启拉起的进程
+        // 走的是框架通道，压根不经过 call，导致上一版计时器从未启动）。
+        scheduleIdleExit();
         return true;
     }
 
     @Override
     public Bundle call(String method, String arg, Bundle extras) {
+        try {
+            return callInternal(method, arg, extras);
+        } finally {
+            scheduleIdleExit();
+        }
+    }
+
+    private Bundle callInternal(String method, String arg, Bundle extras) {
         Context ctx = getContext();
         if (ctx == null) return null;
         // DE（设备保护）存储：解锁前也可读写。配合本 provider 的

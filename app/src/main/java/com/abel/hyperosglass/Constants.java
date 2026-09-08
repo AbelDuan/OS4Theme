@@ -36,7 +36,7 @@ public final class Constants {
     public static final String PKG_HEALTH = "com.mi.health";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.13";
+    public static final String VERSION = "3.14";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";

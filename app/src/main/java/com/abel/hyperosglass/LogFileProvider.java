@@ -35,6 +35,8 @@ public class LogFileProvider extends ContentProvider {
     @Override
     public Cursor query(Uri uri, String[] projection, String sel,
                         String[] selArgs, String sort) {
+        // 外部 App 正在读取（分享/导出）→ 推迟空闲退出，别读到一半进程没了
+        StatusProvider.scheduleIdleExit();
         File f = resolve(uri);
         if (f == null || !f.exists()) return null;
         String[] cols = (projection == null || projection.length == 0)
@@ -61,6 +63,7 @@ public class LogFileProvider extends ContentProvider {
 
     @Override
     public ParcelFileDescriptor openFile(Uri uri, String mode) throws FileNotFoundException {
+        StatusProvider.scheduleIdleExit();
         File f = resolve(uri);
         if (f == null || !f.exists()) throw new FileNotFoundException(uri.toString());
         return ParcelFileDescriptor.open(f, ParcelFileDescriptor.parseMode(mode));
