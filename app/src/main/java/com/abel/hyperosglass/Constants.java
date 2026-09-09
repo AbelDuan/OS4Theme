@@ -34,9 +34,11 @@ public final class Constants {
     public static final String PKG_XMSF = "com.xiaomi.xmsf";
     /** 作用域：小米运动健康（允许所有应用转发焦点通知到手表/手环） */
     public static final String PKG_HEALTH = "com.mi.health";
+    /** 作用域：小米电源管家（禁止恢复电池优化白名单所在进程） */
+    public static final String PKG_POWERKEEPER = "com.miui.powerkeeper";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.16";
+    public static final String VERSION = "3.18";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -200,13 +202,6 @@ public final class Constants {
     public static final String PREFS_PIN_GLASS = "pin_glass";
     public static final boolean DEFAULT_PIN_GLASS = true;
 
-    /** 隐藏手势导航小白条（v3.6 默认开启；v3.15 起仅桌面生效）：拦截
-     *  NavigationHandle / QuickswitchOrientedNavHandle 的 onDraw，
-     *  开启且处于桌面（launcher 前台）时跳过绘制 → 手势提示线（小白条）
-     *  不可见，但视图仍占位、手势区与底栏抬高（insets）保留。
-     *  其他应用：不拦截，交回系统默认（按系统设置显示）。 */
-    public static final String PREFS_NAV_HANDLE_HIDE = "nav_handle_hide";
-    public static final boolean DEFAULT_NAV_HANDLE_HIDE = true;
 
     // ── v3.9 新增开关 ──
     /** 禁止折叠历史通知（v3.9，默认开）：拦截 FoldNotifControllerImpl.sendFoldNotification，
@@ -219,10 +214,6 @@ public final class Constants {
      *  同一应用多条通知不再折叠为一个分组。 */
     public static final String PREFS_NO_GROUP = "no_group";
     public static final boolean DEFAULT_NO_GROUP = true;
-
-    // 注：v3.9 曾有过「桌面手势白条」（仅桌面隐藏）开关，后被删除；
-    // v3.15 起：「手势小白条」本身改为仅在桌面（launcher 前台）隐藏，
-    // 其他应用一律交回系统默认。UI、开关名称与数量均不变，只改作用范围。
 
     // ── v3.9 移植 HyperCeiler（开源参考 https://github.com/ReChronoRain/HyperCeiler）──
     /** 解除通知数量限制（默认开）：跳过 CountLimitCoordinator 注册的数量上限折叠逻辑 */
@@ -273,6 +264,13 @@ public final class Constants {
      *  NotificationFilterHelper.isNotificationSpotlightAppInWhiteList 返回 true。 */
     public static final String PREFS_HEALTH_FOCUS_ALLOW_ALL = "health_focus_allow_all";
     public static final boolean DEFAULT_HEALTH_FOCUS_ALLOW_ALL = true;
+
+    /** 禁止恢复电池优化白名单（默认开，移植 HyperCeiler）：挂钩
+     *  com.miui.powerkeeper.utils.CommonAdapter.addPowerSaveWhitelistApps，
+     *  批量恢复（>1 个应用）时直接返回，避免系统把用户已优化的应用重新加回
+     *  电池优化白名单（即「恢复电池优化白名单」行为被禁止）。 */
+    public static final String PREFS_PREVENT_BATTERY_WHITELIST = "prevent_battery_whitelist";
+    public static final boolean DEFAULT_PREVENT_BATTERY_WHITELIST = true;
 
     // ── 禁止折叠历史通知（v3.9，main SystemUI loader）──
     public static final String FOLD_NOTIF_CONTROLLER_CLASS =
@@ -416,14 +414,6 @@ public final class Constants {
             0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f,
     };
 
-    // ── 隐藏手势导航小白条（v3.6）──
-    /** 手势导航手柄（home/后台/返回 三键合一小白条所在 View；onDraw 绘制白色药丸） */
-    public static final String NAV_HANDLE_CLASS =
-            "com.android.systemui.navigationbar.gestural.NavigationHandle";
-    /** 多任务/快速切换（quickswitch）场景下的定向手柄（继承 NavigationHandle，
-     *  同样 override onDraw 绘制小白条） */
-    public static final String QUICKSWITCH_NAV_HANDLE_CLASS =
-            "com.android.systemui.navigationbar.gestural.QuickswitchOrientedNavHandle";
 
     // ── 隐藏控制中心「编辑」按钮（v3.7，默认开启）──
     /**
@@ -556,8 +546,8 @@ public final class Constants {
             PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_UNLOCK_ALL_FOCUS, PREFS_REDIRECT_NOTIF_SET,
             PREFS_ALLOW_MANAGE_ALL,
             PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE,
-            PREFS_NAV_HANDLE_HIDE,
             PREFS_XMSF_FOCUS_SIGN, PREFS_HEALTH_FOCUS_ALLOW_ALL,
+            PREFS_PREVENT_BATTERY_WHITELIST,
             PREFS_ENABLE_LOG,
     };
     /** 与 ALL_PREF_KEYS 一一对应的默认值 */
@@ -568,8 +558,8 @@ public final class Constants {
             DEFAULT_MUTE_SCREEN_ON, DEFAULT_CANCEL_VIBRATE_SCREEN_ON, DEFAULT_UNLOCK_ALL_FOCUS, DEFAULT_REDIRECT_NOTIF_SET,
             DEFAULT_ALLOW_MANAGE_ALL,
             DEFAULT_HIDE_LOCK_FOD, DEFAULT_HIDE_DISMISS_BTN, DEFAULT_QS_EDIT_HIDE,
-            DEFAULT_NAV_HANDLE_HIDE,
             DEFAULT_XMSF_FOCUS_SIGN, DEFAULT_HEALTH_FOCUS_ALLOW_ALL,
+            DEFAULT_PREVENT_BATTERY_WHITELIST,
             DEFAULT_ENABLE_LOG,
     };
 }

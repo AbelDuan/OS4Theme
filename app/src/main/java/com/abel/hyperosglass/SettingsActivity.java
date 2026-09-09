@@ -2,6 +2,7 @@ package com.abel.hyperosglass;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.content.ComponentName;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Typeface;
@@ -156,9 +157,6 @@ public class SettingsActivity extends Activity {
             boolean pinGlass = de.contains(Constants.PREFS_PIN_GLASS)
                     ? de.getBoolean(Constants.PREFS_PIN_GLASS, Constants.DEFAULT_PIN_GLASS)
                     : ce.getBoolean(Constants.PREFS_PIN_GLASS, Constants.DEFAULT_PIN_GLASS);
-            boolean navHandle = de.contains(Constants.PREFS_NAV_HANDLE_HIDE)
-                    ? de.getBoolean(Constants.PREFS_NAV_HANDLE_HIDE, Constants.DEFAULT_NAV_HANDLE_HIDE)
-                    : ce.getBoolean(Constants.PREFS_NAV_HANDLE_HIDE, Constants.DEFAULT_NAV_HANDLE_HIDE);
             boolean qsEditHide = de.contains(Constants.PREFS_QS_EDIT_HIDE)
                     ? de.getBoolean(Constants.PREFS_QS_EDIT_HIDE, Constants.DEFAULT_QS_EDIT_HIDE)
                     : ce.getBoolean(Constants.PREFS_QS_EDIT_HIDE, Constants.DEFAULT_QS_EDIT_HIDE);
@@ -272,6 +270,29 @@ public class SettingsActivity extends Activity {
                 ScrollView.LayoutParams.MATCH_PARENT,
                 ScrollView.LayoutParams.WRAP_CONTENT));
 
+        // ── 系统界面（调用系统自带页面；作用于 com.android.settings）──
+        LinearLayout cardSystem = newCard();
+        addSectionTitle(cardSystem, "系统界面", "跳转至系统设置自带页面");
+        addLinkRow(cardSystem, "电池优化", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openBatteryOptimization();
+            }
+        });
+        addLinkRow(cardSystem, "应用管理", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openAppManage();
+            }
+        });
+        addLinkRow(cardSystem, "正在运行的服务", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openRunningServices();
+            }
+        });
+        root.addView(cardSystem, cardLp());
+
         // ── 玻璃效果（v3.11：三个开关去掉「柔光玻璃」字样）──
         LinearLayout cardGlass = newCard();
         addSectionTitle(cardGlass, "玻璃效果", null);
@@ -311,7 +332,6 @@ public class SettingsActivity extends Activity {
                 new Sw("锁屏指纹图标", Constants.PREFS_HIDE_LOCK_FOD, Constants.DEFAULT_HIDE_LOCK_FOD),
                 new Sw("通知清除按钮", Constants.PREFS_HIDE_DISMISS_BTN, Constants.DEFAULT_HIDE_DISMISS_BTN),
                 new Sw("控制中心「编辑」", Constants.PREFS_QS_EDIT_HIDE, Constants.DEFAULT_QS_EDIT_HIDE),
-                new Sw("手势小白条", Constants.PREFS_NAV_HANDLE_HIDE, Constants.DEFAULT_NAV_HANDLE_HIDE),
                 new Sw("蓝牙设备解锁提示", Constants.PREFS_HIDE_BT_UNLOCK, Constants.DEFAULT_HIDE_BT_UNLOCK));
         root.addView(cardHide, cardLp());
 
@@ -328,6 +348,15 @@ public class SettingsActivity extends Activity {
         addSwitches(cardHealth,
                 new Sw("允许所有应用发送焦点通知", Constants.PREFS_HEALTH_FOCUS_ALLOW_ALL, Constants.DEFAULT_HEALTH_FOCUS_ALLOW_ALL));
         root.addView(cardHealth, cardLp());
+
+        // ── 电量与性能（作用于 com.miui.powerkeeper；需为模块勾选该作用域）──
+        LinearLayout cardPower = newCard();
+        addSectionTitle(cardPower, "电量与性能",
+                "作用于 小米电源管家 (com.miui.powerkeeper)");
+        addSwitch(cardPower, "禁止恢复电池优化白名单",
+                Constants.PREFS_PREVENT_BATTERY_WHITELIST,
+                Constants.DEFAULT_PREVENT_BATTERY_WHITELIST);
+        root.addView(cardPower, cardLp());
 
         // ── 应用工具 ──
         LinearLayout cardTool = newCard();
@@ -519,6 +548,77 @@ public class SettingsActivity extends Activity {
         bg.setCornerRadius(dp(8));
         b.setBackground(bg);
         return b;
+    }
+
+    /** 可点击行：左标题 + 右箭头，点击触发 action（用于跳转系统自带页面）。
+     *  使用系统列表选择器背景，按下有反馈。 */
+    private void addLinkRow(final LinearLayout card, String label,
+                            final View.OnClickListener action) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(4), dp(6), dp(4), dp(6));
+        row.setClickable(true);
+        row.setBackgroundResource(android.R.drawable.list_selector_background);
+
+        TextView tv = new TextView(this);
+        tv.setText(label);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        tv.setTextColor(Color.parseColor("#222222"));
+        row.addView(tv, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        TextView arrow = new TextView(this);
+        arrow.setText("›");
+        arrow.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
+        arrow.setTextColor(Color.parseColor("#BBBBBB"));
+        row.addView(arrow);
+
+        row.setOnClickListener(action);
+        card.addView(row, mw());
+    }
+
+    /** 电池优化：打开系统「电池优化 / 不受监控的应用」页（移植 HyperCeiler） */
+    private void openBatteryOptimization() {
+        try {
+            Intent intent = new Intent("android.intent.action.MAIN");
+            intent.addCategory("android.intent.category.DEFAULT");
+            intent.setComponent(new ComponentName("com.android.settings",
+                    "com.android.settings.SubSettings"));
+            intent.putExtra(":settings:show_fragment",
+                    "com.android.settings.applications.manageapplications.ManageApplications");
+            Bundle bundle = new Bundle();
+            bundle.putString("classname",
+                    "com.android.settings.Settings$HighPowerApplicationsActivity");
+            intent.putExtra(":settings:show_fragment_args", bundle);
+            startActivity(intent);
+        } catch (Throwable t) {
+            toast("无法打开：电池优化");
+        }
+    }
+
+    /** 正在运行的服务（移植 HyperCeiler） */
+    private void openRunningServices() {
+        try {
+            Intent intent = new Intent();
+            intent.setComponent(new ComponentName("com.android.settings",
+                    "com.android.settings.RunningServices"));
+            startActivity(intent);
+        } catch (Throwable t) {
+            toast("无法打开：正在运行的服务");
+        }
+    }
+
+    /** 应用管理（移植 HyperCeiler） */
+    private void openAppManage() {
+        try {
+            Intent intent = new Intent();
+            intent.setComponent(new ComponentName("com.android.settings",
+                    "com.android.settings.applications.ManageApplications"));
+            startActivity(intent);
+        } catch (Throwable t) {
+            toast("无法打开：应用管理");
+        }
     }
 
     // ────────────────────────────── 动作 ──────────────────────────────
