@@ -177,6 +177,16 @@ public class MainHook extends XposedModule {
     /** 一次性重绘守卫（避免 invalidate 重入循环）：记录已触发清空旧画面的手柄 View */
     private static final java.util.WeakHashMap<View, Boolean> sNavHandleCleared =
             new java.util.WeakHashMap<>();
+    /** 导航手柄 View 集合（桌面/应用切换时用于触发重绘） */
+    private static final java.util.WeakHashMap<View, Boolean> sNavHandleViews =
+            new java.util.WeakHashMap<>();
+    /** 是否处于桌面（launcher）前台：v3.15 起「手势小白条」仅在桌面隐藏 */
+    private static final java.util.concurrent.atomic.AtomicBoolean sOnHome =
+            new java.util.concurrent.atomic.AtomicBoolean(true);
+    /** 桌面包名（首次用到时解析并缓存） */
+    private static volatile String[] sLauncherPkgs = null;
+    /** 退化路径的查询节流时间戳 */
+    private static volatile long sLastHomeQueryMs = 0;
     // v3.3.11 日志精简：删除此处原有的 10 个「前 N 次记日志」计数器
     // （flow1/flow2/glassSet/glassUpd/poke/pluginCl/islandDef/expandFix/miBlur/hideFod/dismiss）。
     // 统一改用 LogUtil.logAlwaysOnce(key, msg)：常开、但每种事件全进程只记 1 条。
@@ -236,6 +246,7 @@ public class MainHook extends XposedModule {
             installFocusGlassHooks(cl);
             installAodBatteryHooks(cl);
             installPinGlassHook(cl);
+            installHomeStateTracker(cl);
             installNavHandleHideHook(cl);
             installQsEditHideHook(cl);
             installNotifEnhanceHooks(cl);
@@ -265,7 +276,13 @@ public class MainHook extends XposedModule {
                     } catch (Throwable ignored) {
                     }
                 }
-            }, new android.content.IntentFilter(Constants.ACTION_RELOAD_PREFS));
+                    // API 33+ 必须显式指定 RECEIVER_EXPORTED / NOT_EXPORTED，
+                    // 旧的 2 参重载会直接抛 SecurityException（LSPosed 日志实证：
+                    // "[重载] 注册失败: SecurityException ... RECEIVER_EXPORTED ..."），
+                    // 结果是广播永远收不到 → 所有开关都要重启 SystemUI 才生效。
+                    // 发送方是模块 App（与 SystemUI 不同 uid），故必须用 EXPORTED。
+            }, new android.content.IntentFilter(Constants.ACTION_RELOAD_PREFS),
+                    Context.RECEIVER_EXPORTED);
             sReloadReceiverRegistered = true;
             LogUtil.logAlways("[重载] 已注册实时重载广播接收器");
         } catch (Throwable t) {
@@ -320,6 +337,10 @@ public class MainHook extends XposedModule {
     //  手势区与底栏抬高（系统 window insets）照常保留——即「隐藏小白条但保留底栏」。
     //  两类的 onDraw 均为各自 override（dexdump 实证：protected onDraw(Canvas)V），
     //  分别 hook 覆盖 主屏/home 与 多任务(quickswitch) 场景。
+    //
+    //  v3.15 变更：本开关不再全局隐藏，只在「桌面」（launcher 前台）跳过绘制；
+    //  其他应用一律 chain.proceed() 交回系统默认。桌面状态由
+    //  installHomeStateTracker() 事件驱动维护，onDraw 内不做任何 IPC。
     // ============================================================
 
     /** 拦截两个导航手柄的 onDraw；开启隐藏时跳过绘制（小白条不可见，底栏保留） */
@@ -346,8 +367,14 @@ public class MainHook extends XposedModule {
                     .setId(id)
                     .intercept(chain -> {
                         Object thisObj = chain.getThisObject();
-                        // 隐藏手势小白条：跳过绘制
-                        if (sNavHandleHideFlag.get()) {
+                        if (thisObj instanceof View) {
+                            View vv = (View) thisObj;
+                            if (!sNavHandleViews.containsKey(vv)) {
+                                sNavHandleViews.put(vv, Boolean.TRUE);
+                            }
+                        }
+                        // v3.15：仅在「桌面」下隐藏小白条；其他应用一律交回系统默认
+                        if (sNavHandleHideFlag.get() && isOnHome()) {
                             // 跳过绘制：小白条不可见；视图仍占位 → 手势区/底栏抬高保留
                             if (thisObj instanceof View) {
                                 View v = (View) thisObj;
@@ -361,12 +388,179 @@ public class MainHook extends XposedModule {
                             }
                             return null;
                         }
+                        // 不在桌面（或开关关闭）：交回系统默认绘制，并撤掉清空守卫，
+                        // 使下次回到桌面时能再次触发一次重绘清空。
+                        if (thisObj instanceof View) sNavHandleCleared.remove(thisObj);
                         return chain.proceed();
                     });
             return true;
         } catch (Throwable t) {
             LogUtil.logAlways("[小白条] 挂钩失败 " + className + ": " + t);
             return false;
+        }
+    }
+
+    // ============================================================
+    // 桌面状态跟踪（v3.15：让「手势小白条」只在桌面隐藏）
+    //
+    // 设计要点：onDraw 是热路径，绝不能在里面查前台任务（IPC）。
+    // 改为事件驱动——挂钩 SystemUI 自己的 TaskStackChangeListeners 回调，
+    // 任务切换时更新 sOnHome；onDraw 只读一个 AtomicBoolean，零开销。
+    // 回调参数自带 RunningTaskInfo 时零 IPC；否则退化为查一次前台任务（节流）。
+    // ============================================================
+
+    /** 挂钩 TaskStackChangeListeners 的任务切换回调，维护「是否在桌面」 */
+    private void installHomeStateTracker(ClassLoader cl) {
+        try {
+            // dexdump 实证：任务回调不在 TaskStackChangeListeners 本体
+            // （本体只有 registerTaskStackListener / getListenerImpl），
+            // 而在其内部类 $Impl 上。挂错类 = 挂 0 个方法 = 状态永远停在默认值。
+            final Class<?> tsl = Class.forName(
+                    "com.android.systemui.shared.system.TaskStackChangeListeners$Impl", false, cl);
+            int n = 0;
+            for (final Method m : tsl.getDeclaredMethods()) {
+                final String mn = m.getName();
+                if (!"onTaskMovedToFront".equals(mn) && !"onTaskStackChanged".equals(mn)) {
+                    continue;
+                }
+                m.setAccessible(true);
+                final int pc = m.getParameterCount();
+                hook(m)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .setId("home-state-" + mn)
+                        .intercept(chain -> {
+                            Object res = chain.proceed();
+                            try {
+                                Object[] args = new Object[pc];
+                                for (int i = 0; i < pc; i++) args[i] = chain.getArg(i);
+                                updateHomeState(args);
+                            } catch (Throwable ignored) {
+                            }
+                            return res;
+                        });
+                n++;
+            }
+            LogUtil.logAlways("[小白条] 桌面状态跟踪已挂钩 " + n + " 个回调");
+        } catch (Throwable t) {
+            LogUtil.logAlways("[小白条] 桌面状态跟踪挂钩失败: " + t);
+        }
+    }
+
+    /** 依据任务回调更新「是否在桌面」 */
+    private static void updateHomeState(Object[] args) {
+        if (args != null) {
+            for (Object a : args) {
+                if (a instanceof android.app.ActivityManager.RunningTaskInfo) {
+                    android.app.ActivityManager.RunningTaskInfo ti =
+                            (android.app.ActivityManager.RunningTaskInfo) a;
+                    android.content.ComponentName cn =
+                            ti.topActivity != null ? ti.topActivity : ti.baseActivity;
+                    if (cn != null) {
+                        setOnHome(isLauncherPackage(cn.getPackageName()));
+                        return;
+                    }
+                }
+            }
+        }
+        // 退化路径：节流查询，避免 onTaskStackChanged 频繁触发造成 IPC 压力
+        long now = android.os.SystemClock.uptimeMillis();
+        if (now - sLastHomeQueryMs > 1000) {
+            sLastHomeQueryMs = now;
+            setOnHome(queryTopIsLauncher());
+        }
+    }
+
+    /** 退化路径：查一次前台任务（仅在任务回调时执行，非 onDraw 热路径） */
+    private static boolean queryTopIsLauncher() {
+        try {
+            android.content.Context ctx = currentAppContext();
+            if (ctx == null) return false;
+            android.app.ActivityManager am = (android.app.ActivityManager)
+                    ctx.getSystemService(android.content.Context.ACTIVITY_SERVICE);
+            if (am == null) return false;
+            java.util.List<android.app.ActivityManager.RunningTaskInfo> ts = am.getRunningTasks(1);
+            if (ts == null || ts.isEmpty()) return false;
+            android.app.ActivityManager.RunningTaskInfo ti = ts.get(0);
+            android.content.ComponentName cn =
+                    ti.topActivity != null ? ti.topActivity : ti.baseActivity;
+            return cn != null && isLauncherPackage(cn.getPackageName());
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static boolean isLauncherPackage(String pkg) {
+        if (pkg == null) return false;
+        String[] pkgs = sLauncherPkgs;
+        if (pkgs == null) {
+            pkgs = resolveLauncherPackages();
+            sLauncherPkgs = pkgs;
+        }
+        for (String p : pkgs) {
+            if (p.equals(pkg)) return true;
+        }
+        return false;
+    }
+
+    /** 解析桌面（CATEGORY_HOME）包名，失败兜底 com.miui.home */
+    private static String[] resolveLauncherPackages() {
+        try {
+            android.content.Context ctx = currentAppContext();
+            if (ctx != null) {
+                android.content.Intent i =
+                        new android.content.Intent(android.content.Intent.ACTION_MAIN);
+                i.addCategory(android.content.Intent.CATEGORY_HOME);
+                java.util.List<android.content.pm.ResolveInfo> rs =
+                        ctx.getPackageManager().queryIntentActivities(i, 0);
+                if (rs != null && !rs.isEmpty()) {
+                    java.util.LinkedHashSet<String> set = new java.util.LinkedHashSet<>();
+                    for (android.content.pm.ResolveInfo r : rs) {
+                        if (r.activityInfo != null && r.activityInfo.packageName != null) {
+                            set.add(r.activityInfo.packageName);
+                        }
+                    }
+                    String[] arr = set.toArray(new String[0]);
+                    LogUtil.logAlways("[小白条] 桌面包名=" + java.util.Arrays.toString(arr));
+                    return arr;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return new String[]{"com.miui.home"};
+    }
+
+    /**
+     * 是否在桌面：优先用任务回调维护的缓存 sOnHome；
+     * 并节流兜底查一次，防止回调未命中（ROM 差异 / 挂错类）时永久停在错误状态。
+     */
+    private static boolean isOnHome() {
+        long now = android.os.SystemClock.uptimeMillis();
+        if (now - sLastHomeQueryMs > 1000) {
+            sLastHomeQueryMs = now;
+            boolean home = queryTopIsLauncher();
+            if (home != sOnHome.get()) setOnHome(home);
+        }
+        return sOnHome.get();
+    }
+
+    private static void setOnHome(boolean home) {
+        if (sOnHome.get() == home) return;
+        sOnHome.set(home);
+        LogUtil.logAlways("[小白条] 桌面状态=" + home + "，触发手柄重绘");
+        invalidateNavHandles();
+    }
+
+    /** 桌面/应用切换时让导航手柄重绘，使显隐立即生效 */
+    private static void invalidateNavHandles() {
+        try {
+            java.util.List<View> vs;
+            synchronized (sNavHandleViews) {
+                vs = new java.util.ArrayList<>(sNavHandleViews.keySet());
+            }
+            for (View v : vs) {
+                if (v != null) v.post(v::invalidate);
+            }
+        } catch (Throwable ignored) {
         }
     }
 
@@ -2612,23 +2806,6 @@ public class MainHook extends XposedModule {
 
     // ④ 可见性隐藏已取消：AOD/锁屏状态栏完全跟随系统原生，模块不隐藏运营商/信号/WiFi。
     //   电池仍由 ①②③ 驱动为系统状态栏同款样式（toggleAodMode→系统样式）。
-
-    /** 跨父类链读取字段（替代 XposedHelpers.getObjectField，避免额外依赖） */
-    private static Object getFieldReflect(Object obj, String name) throws NoSuchFieldException {
-        Class<?> c = obj.getClass();
-        while (c != null) {
-            try {
-                java.lang.reflect.Field f = c.getDeclaredField(name);
-                f.setAccessible(true);
-                return f.get(obj);
-            } catch (NoSuchFieldException e) {
-                c = c.getSuperclass();
-            } catch (IllegalAccessException e) {
-                throw new RuntimeException(e);
-            }
-        }
-        throw new NoSuchFieldException(name);
-    }
 
     // ============================================================
     // 跨应用焦点通知（v3.11 移植 HyperCeiler，忠实按上游实现）

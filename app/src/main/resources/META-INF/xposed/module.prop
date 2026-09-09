@@ -4,5 +4,5 @@ author=AbelDuan
 description=HyperOS 4 主题增强：三方主题柔光玻璃通知 / 锁屏通知下沉 / 息屏电池状态同步 / 锁屏密码柔光玻璃 / 隐藏手势导航白条（保留底栏）/ 隐藏控制中心编辑按钮（保留编辑功能）
 minApiVersion=100
 targetApiVersion=102
-version=3.14
-versionCode=84
+version=3.16
+versionCode=86

@@ -36,7 +36,7 @@ public final class Constants {
     public static final String PKG_HEALTH = "com.mi.health";
 
     /** 模块版本（与 build.gradle versionName 保持一致，用于运行日志） */
-    public static final String VERSION = "3.14";
+    public static final String VERSION = "3.16";
 
     /** 真实目标类（位于 /product/app/MIUISystemUIPlugin/MIUISystemUIPlugin.apk） */
     public static final String TARGET_CLASS = "miui.systemui.util.ThemeUtils";
@@ -137,10 +137,6 @@ public final class Constants {
             "com.android.systemui.shared.plugins.PluginInstance$PluginFactory";
     /** 创建插件 ClassLoader 的入口方法（dex 确认：返回 PathClassLoader/缓存） */
     public static final String PLUGIN_CREATE_CLASSLOADER_METHOD = "createClassLoader";
-    /** 插件 classloader 缓存（MIUI PluginInstanceInjector 持有，dex 确认 sClassLoaders 字段） */
-    public static final String PLUGIN_LOADER_CACHE_CLASS =
-            "com.miui.systemui.plugin.PluginInstanceInjector";
-    public static final String PLUGIN_LOADER_CACHE_FIELD = "sClassLoaders";
 
     // ── 媒体岛崩溃防御（v3.0.1 吞异常版）──
     /**
@@ -162,8 +158,6 @@ public final class Constants {
 
     public static final String LOG_TAG = "[HyperOSGlass]";
 
-    /** 本模块自身包名 */
-    public static final String MODULE_PKG = "com.abel.hyperosglass";
 
     /** SharedPreferences 文件名（设置页写入 / StatusProvider 读取） */
     public static final String PREFS = "hyperosglass";
@@ -206,9 +200,11 @@ public final class Constants {
     public static final String PREFS_PIN_GLASS = "pin_glass";
     public static final boolean DEFAULT_PIN_GLASS = true;
 
-    /** 隐藏手势导航小白条（v3.6，默认开启）：拦截 NavigationHandle /
-     *  QuickswitchOrientedNavHandle 的 onDraw，开启时跳过绘制 → 手势提示线
-     *  （小白条）不可见，但视图仍占位、手势区与底栏抬高（insets）保留。 */
+    /** 隐藏手势导航小白条（v3.6 默认开启；v3.15 起仅桌面生效）：拦截
+     *  NavigationHandle / QuickswitchOrientedNavHandle 的 onDraw，
+     *  开启且处于桌面（launcher 前台）时跳过绘制 → 手势提示线（小白条）
+     *  不可见，但视图仍占位、手势区与底栏抬高（insets）保留。
+     *  其他应用：不拦截，交回系统默认（按系统设置显示）。 */
     public static final String PREFS_NAV_HANDLE_HIDE = "nav_handle_hide";
     public static final boolean DEFAULT_NAV_HANDLE_HIDE = true;
 
@@ -224,8 +220,9 @@ public final class Constants {
     public static final String PREFS_NO_GROUP = "no_group";
     public static final boolean DEFAULT_NO_GROUP = true;
 
-    // 注：v3.9 曾有过「桌面手势白条」（仅桌面隐藏）开关，已按用户要求删除；
-    // 现只保留一个「手势小白条」（全局隐藏）。
+    // 注：v3.9 曾有过「桌面手势白条」（仅桌面隐藏）开关，后被删除；
+    // v3.15 起：「手势小白条」本身改为仅在桌面（launcher 前台）隐藏，
+    // 其他应用一律交回系统默认。UI、开关名称与数量均不变，只改作用范围。
 
     // ── v3.9 移植 HyperCeiler（开源参考 https://github.com/ReChronoRain/HyperCeiler）──
     /** 解除通知数量限制（默认开）：跳过 CountLimitCoordinator 注册的数量上限折叠逻辑 */
@@ -289,7 +286,6 @@ public final class Constants {
             "com.android.systemui.statusbar.notification.utils.GroupMemberManagerLegacy";
     public static final String EXPANDABLE_NOTIF_ROW_CLASS =
             "com.android.systemui.statusbar.notification.row.ExpandableNotificationRow";
-    public static final String GROUP_GET_SUMMARY_METHOD = "getGroupSummary";
     public static final String GROUP_IS_SUMMARY_METHOD = "isGroupSummary";
     public static final String ROW_IS_CHILD_METHOD = "isChildInGroup";
 
@@ -319,9 +315,6 @@ public final class Constants {
     public static final String ENTRY_SBN_FIELD = "mSbn";
     public static final String SBN_SHOWN_AFTER_UNLOCK_FIELD = "mHasShownAfterUnlock";
 
-    /** 隐藏「已通过蓝牙设备解锁」Toast：目标系统资源的完整名（HyperCeiler 原版比对） */
-    public static final String BLE_UNLOCK_RES_NAME =
-            "com.android.systemui:string/miui_keyguard_ble_unlock_succeed_msg";
     /** 兜底：资源 entry name（getResourceEntryName 返回，不含包名前缀） */
     public static final String BLE_UNLOCK_RES_ENTRY = "miui_keyguard_ble_unlock_succeed_msg";
     /** 兜底文本判定（资源名对不上时按内容匹配，小写比较需同时命中两组关键词） */
@@ -373,9 +366,6 @@ public final class Constants {
     public static final String AOD_COMBINE_CLASS =
             "com.android.systemui.statusbar.ui.viewmodel."
                     + "KeyguardStatusBarViewModel$special$$inlined$combine$1$3";
-    /** 锁屏状态栏控制器（持有 mView = MiuiKeyguardStatusBarView；同一视图用于锁屏与 AOD） */
-    public static final String AOD_KSVC_CLASS =
-            "com.android.systemui.statusbar.phone.KeyguardStatusBarViewController";
     /** 同上类的 Inject 变体：animateFullAod(ZZ)V 实际声明在此类中 */
     public static final String AOD_KSVC_INJECT_CLASS =
             "com.android.systemui.statusbar.phone.KeyguardStatusBarViewControllerInject";
@@ -434,8 +424,6 @@ public final class Constants {
      *  同样 override onDraw 绘制小白条） */
     public static final String QUICKSWITCH_NAV_HANDLE_CLASS =
             "com.android.systemui.navigationbar.gestural.QuickswitchOrientedNavHandle";
-    /** onDraw 的 Canvas 参数类型 */
-    public static final String CANVAS_CLASS = "android.graphics.Canvas";
 
     // ── 隐藏控制中心「编辑」按钮（v3.7，默认开启）──
     /**
@@ -471,8 +459,6 @@ public final class Constants {
     /** 普通通知行模糊效果类（4 个 Focus 类结构一致，dexdump 确认 INSTANCE + apply 签名） */
     public static final String ROW_BLUR_CLASS =
             "com.android.systemui.statusbar.notification.style.vieweffect.NotificationRowBlurEffect";
-    /** 焦点玻璃参数 array（0x7f0300a8，用户 smali 换掉） */
-    public static final String FOCUS_GLASS_PARAMS_RES = "focus_notification_glass_params_normal";
     /** 普通通知玻璃参数 array（0x7f0300ce，用户 smali 换用）；运行时 getIdentifier 解析 */
     public static final String NORMAL_GLASS_PARAMS_RES = "notification_glass_params_normal";
 

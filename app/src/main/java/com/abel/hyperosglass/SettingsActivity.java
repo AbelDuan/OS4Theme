@@ -331,7 +331,7 @@ public class SettingsActivity extends Activity {
 
         // ── 应用工具 ──
         LinearLayout cardTool = newCard();
-        addSectionTitle(cardTool, "应用工具", null);
+        addSectionTitle(cardTool, "应用工具", "日志记录：开启后需重启系统界面才开始记录");
         addSwitch(cardTool, "日志记录", Constants.PREFS_ENABLE_LOG,
                 Constants.DEFAULT_ENABLE_LOG);
 
@@ -406,7 +406,12 @@ public class SettingsActivity extends Activity {
         }
     }
 
-    /** 一行开关：左标题 + 右 Switch（开=启用/隐藏，关=停用） */
+    /**
+     * 一行开关：左标题 + 右 Switch（开=启用/隐藏，关=停用）。
+     *
+     * 不弹 toast：各开关的实际生效时机并不一致（部分需重启 SystemUI 才生效），
+     * 统一提示「实时生效」与真实行为不符，索性不提示。
+     */
     private void addSwitch(final LinearLayout card, String label,
                            final String prefKey, final boolean defVal) {
         LinearLayout row = new LinearLayout(this);
@@ -428,7 +433,6 @@ public class SettingsActivity extends Activity {
             public void onCheckedChanged(CompoundButton b, boolean checked) {
                 writeBoth(prefKey, checked);
                 sendReloadBroadcast();
-                toast(checked ? "已开启（实时生效）" : "已关闭（实时生效）");
             }
         });
         row.addView(sw);
