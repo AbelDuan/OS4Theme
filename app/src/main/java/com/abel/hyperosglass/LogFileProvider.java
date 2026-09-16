@@ -6,98 +6,95 @@ import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.net.Uri;
 import android.os.ParcelFileDescriptor;
-import android.provider.OpenableColumns;
-
 import java.io.File;
 import java.io.FileNotFoundException;
 
-/**
- * 仅供「导出日志」使用：把模块外部私有存储目录里的日志文件，
- * 通过 content:// 暴露给其它 App（澎湃互联 / 微信文件传输 / WorkBuddy 等）读取。
- *
- * 关键：query() 必须返回 MatrixCursor（DISPLAY_NAME + SIZE）——
- * 多数接收端（含澎湃互联跨端互传）会先 query 拿文件信息，拿不到就判定文件无效、
- * 分享失败。旧版 LogProvider 的 query() 返回 null 正是「MT 管理器能分享、
- * 澎湃互联不能」的根因。
- *
- * exported=false + grantUriPermissions=true：只有被本次分享授权的 App 能读，安全。
- * 解析路径时做了防目录穿越校验，只能访问 getExternalFilesDir(null) 下的文件。
- */
+/* JADX INFO: loaded from: classes.dex */
 public class LogFileProvider extends ContentProvider {
+    public static final String AUTH = "com.abel.hyperosglass.fileprovider";
 
-    public static final String AUTH = Constants.FILE_AUTH;
+    @Override // android.content.ContentProvider
+    public int delete(Uri uri, String str, String[] strArr) {
+        return 0;
+    }
 
-    @Override
+    @Override // android.content.ContentProvider
+    public Uri insert(Uri uri, ContentValues contentValues) {
+        return null;
+    }
+
+    @Override // android.content.ContentProvider
     public boolean onCreate() {
         return true;
     }
 
-    @Override
-    public Cursor query(Uri uri, String[] projection, String sel,
-                        String[] selArgs, String sort) {
-        // 外部 App 正在读取（分享/导出）→ 推迟空闲退出，别读到一半进程没了
-        StatusProvider.scheduleIdleExit();
-        File f = resolve(uri);
-        if (f == null || !f.exists()) return null;
-        String[] cols = (projection == null || projection.length == 0)
-                ? new String[]{OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE}
-                : projection;
-        MatrixCursor c = new MatrixCursor(cols);
-        Object[] row = new Object[cols.length];
-        for (int i = 0; i < cols.length; i++) {
-            if (OpenableColumns.DISPLAY_NAME.equals(cols[i])) row[i] = f.getName();
-            else if (OpenableColumns.SIZE.equals(cols[i])) row[i] = f.length();
-        }
-        c.addRow(row);
-        return c;
+    @Override // android.content.ContentProvider
+    public int update(Uri uri, ContentValues contentValues, String str, String[] strArr) {
+        return 0;
     }
 
-    @Override
+    @Override // android.content.ContentProvider
+    public Cursor query(Uri uri, String[] strArr, String str, String[] strArr2, String str2) {
+        StatusProvider.scheduleIdleExit();
+        File fileResolve = resolve(uri);
+        if (fileResolve == null || !fileResolve.exists()) {
+            return null;
+        }
+        if (strArr == null || strArr.length == 0) {
+            strArr = new String[]{"_display_name", "_size"};
+        }
+        MatrixCursor matrixCursor = new MatrixCursor(strArr);
+        Object[] objArr = new Object[strArr.length];
+        for (int i = 0; i < strArr.length; i++) {
+            if ("_display_name".equals(strArr[i])) {
+                objArr[i] = fileResolve.getName();
+            } else if ("_size".equals(strArr[i])) {
+                objArr[i] = Long.valueOf(fileResolve.length());
+            }
+        }
+        matrixCursor.addRow(objArr);
+        return matrixCursor;
+    }
+
+    @Override // android.content.ContentProvider
     public String getType(Uri uri) {
-        File f = resolve(uri);
-        if (f == null) return null;
-        String n = f.getName().toLowerCase();
-        if (n.endsWith(".log") || n.endsWith(".txt")) return "text/plain";
+        File fileResolve = resolve(uri);
+        if (fileResolve == null) {
+            return null;
+        }
+        String lowerCase = fileResolve.getName().toLowerCase();
+        if (lowerCase.endsWith(".log") || lowerCase.endsWith(".txt")) {
+            return "text/plain";
+        }
         return "application/octet-stream";
     }
 
-    @Override
-    public ParcelFileDescriptor openFile(Uri uri, String mode) throws FileNotFoundException {
+    @Override // android.content.ContentProvider
+    public ParcelFileDescriptor openFile(Uri uri, String str) throws FileNotFoundException {
         StatusProvider.scheduleIdleExit();
-        File f = resolve(uri);
-        if (f == null || !f.exists()) throw new FileNotFoundException(uri.toString());
-        return ParcelFileDescriptor.open(f, ParcelFileDescriptor.parseMode(mode));
+        File fileResolve = resolve(uri);
+        if (fileResolve == null || !fileResolve.exists()) {
+            throw new FileNotFoundException(uri.toString());
+        }
+        return ParcelFileDescriptor.open(fileResolve, ParcelFileDescriptor.parseMode(str));
     }
 
-    /** 只允许访问外部私有目录下的文件，防目录穿越 */
     private File resolve(Uri uri) {
-        String p = uri.getPath();
-        if (p == null) return null;
-        File root = getContext().getExternalFilesDir(null);
-        if (root == null) return null;
-        File target = new File(root, p);
-        try {
-            String rp = root.getCanonicalPath();
-            String tp = target.getCanonicalPath();
-            if (!tp.equals(rp) && !tp.startsWith(rp + File.separator)) return null;
-        } catch (Throwable t) {
+        File externalFilesDir;
+        String path = uri.getPath();
+        if (path == null || (externalFilesDir = getContext().getExternalFilesDir(null)) == null) {
             return null;
         }
-        return target;
-    }
-
-    @Override
-    public Uri insert(Uri uri, ContentValues v) {
-        return null;
-    }
-
-    @Override
-    public int delete(Uri uri, String s, String[] a) {
-        return 0;
-    }
-
-    @Override
-    public int update(Uri uri, ContentValues v, String s, String[] a) {
-        return 0;
+        File file = new File(externalFilesDir, path);
+        try {
+            String canonicalPath = externalFilesDir.getCanonicalPath();
+            String canonicalPath2 = file.getCanonicalPath();
+            if (canonicalPath2.equals(canonicalPath) || canonicalPath2.startsWith(canonicalPath + File.separator)) {
+                return file;
+            }
+            return null;
+        } catch (Throwable unused) {
+            return null;
+        }
     }
 }

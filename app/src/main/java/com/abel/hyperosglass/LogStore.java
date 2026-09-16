@@ -1,7 +1,6 @@
 package com.abel.hyperosglass;
 
 import android.content.Context;
-
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
@@ -11,139 +10,159 @@ import java.io.RandomAccessFile;
 import java.util.ArrayList;
 import java.util.List;
 
-/**
- * 日志落在模块 App 自己的私有目录（getFilesDir），
- * 完全不碰 /sdcard —— 不需要任何存储权限，也不受 Android 10+ 分区存储影响。
- * SystemUI 侧的日志通过 StatusProvider 跨进程送进来，由本类统一写入。
- */
+/* JADX INFO: loaded from: classes.dex */
 public final class LogStore {
+    private static final int TRIM_EVERY = 32;
+    private static int sAppendCount;
 
     private LogStore() {
     }
 
-    public static File file(Context c) {
-        return new File(c.getFilesDir(), Constants.LOG_FILE);
+    public static File file(Context context) {
+        return new File(context.getFilesDir(), Constants.LOG_FILE);
     }
 
-    /** v3.3.11：每 32 行才做一次截断检查。
-     *  原来每行都 trim() → 每行多一次 f.length()（stat）+ 超限时的半文件读写。
-     *  32 行的溢出量（几 KB）相对 512KB 上限完全无害。 */
-    private static int sAppendCount = 0;
-    private static final int TRIM_EVERY = 32;
-
-    public static synchronized void append(Context c, String text) {
-        if (text == null || text.length() == 0) return;
-        FileOutputStream fos = null;
-        try {
-            File f = file(c);
-            fos = new FileOutputStream(f, true);
-            fos.write(text.getBytes("UTF-8"));
-            if (!text.endsWith("\n")) fos.write('\n');
-            fos.flush();
-        } catch (Throwable ignored) {
-        } finally {
-            close(fos);
-        }
-        if (++sAppendCount >= TRIM_EVERY) {
-            sAppendCount = 0;
-            try {
-                trim(c);
-            } catch (Throwable ignored) {
-            }
-        }
-    }
-
-    /** 超限时保留后半段，避免无限增长 */
-    private static void trim(Context c) throws Exception {
-        File f = file(c);
-        if (!f.exists() || f.length() <= Constants.LOG_MAX) return;
-        RandomAccessFile raf = new RandomAccessFile(f, "r");
-        try {
-            long keep = Constants.LOG_MAX / 2;
-            raf.seek(f.length() - keep);
-            raf.readLine(); // 丢弃半行
-            byte[] buf = new byte[(int) (f.length() - raf.getFilePointer())];
-            raf.readFully(buf);
-            FileOutputStream fos = new FileOutputStream(f, false);
-            try {
-                fos.write("… 日志已自动截断 …\n".getBytes("UTF-8"));
-                fos.write(buf);
-            } finally {
-                close(fos);
-            }
-        } finally {
-            try {
-                raf.close();
-            } catch (Throwable ignored) {
-            }
-        }
-    }
-
-    public static synchronized void clear(Context c) {
-        try {
-            File f = file(c);
-            if (f.exists()) {
-                //noinspection ResultOfMethodCallIgnored
-                f.delete();
-            }
-        } catch (Throwable ignored) {
-        }
-    }
-
-    /** 读取末尾 n 行 */
-    public static synchronized List<String> tail(Context c, int n) {
-        List<String> all = new ArrayList<String>();
-        File f = file(c);
-        if (!f.exists()) return all;
-        BufferedReader r = null;
-        try {
-            r = new BufferedReader(new FileReader(f));
-            String ln;
-            while ((ln = r.readLine()) != null) {
-                all.add(ln);
-                if (all.size() > 6000) all.remove(0);
-            }
-        } catch (Throwable t) {
-            all.add("[读取日志失败] " + t);
-        } finally {
-            if (r != null) {
+    public static synchronized void append(Context context, String str) {
+        if (str != null) {
+            if (str.length() != 0) {
+                FileOutputStream fileOutputStream = null;
                 try {
-                    r.close();
-                } catch (Throwable ignored) {
+                    FileOutputStream fileOutputStream2 = new FileOutputStream(file(context), true);
+                    try {
+                        fileOutputStream2.write(str.getBytes("UTF-8"));
+                        if (!str.endsWith("\n")) {
+                            fileOutputStream2.write(10);
+                        }
+                        fileOutputStream2.flush();
+                        close(fileOutputStream2);
+                    } catch (Throwable unused) {
+                        fileOutputStream = fileOutputStream2;
+                        close(fileOutputStream);
+                    }
+                } catch (Throwable unused2) {
+                }
+                int i = sAppendCount + 1;
+                sAppendCount = i;
+                if (i >= TRIM_EVERY) {
+                    sAppendCount = 0;
+                    try {
+                        trim(context);
+                    } catch (Throwable unused3) {
+                    }
                 }
             }
         }
-        if (all.size() <= n) return all;
-        return new ArrayList<String>(all.subList(all.size() - n, all.size()));
     }
 
-    /** 读取整个日志文件内容（用于导出）。文件不存在返回空串。 */
-    public static synchronized String readFully(Context c) {
-        File f = file(c);
-        if (!f.exists()) return "";
+    private static void trim(Context context) throws Exception {
+        File file = file(context);
+        if (!file.exists() || file.length() <= Constants.LOG_MAX) {
+            return;
+        }
+        RandomAccessFile randomAccessFile = new RandomAccessFile(file, "r");
+        try {
+            randomAccessFile.seek(file.length() - 262144);
+            randomAccessFile.readLine();
+            byte[] bArr = new byte[(int) (file.length() - randomAccessFile.getFilePointer())];
+            randomAccessFile.readFully(bArr);
+            FileOutputStream fileOutputStream = new FileOutputStream(file, false);
+            try {
+                fileOutputStream.write("… 日志已自动截断 …\n".getBytes("UTF-8"));
+                fileOutputStream.write(bArr);
+                close(fileOutputStream);
+                try {
+                    randomAccessFile.close();
+                } catch (Throwable unused) {
+                }
+            } catch (Throwable th) {
+                close(fileOutputStream);
+                throw th;
+            }
+        } catch (Throwable th2) {
+            try {
+                randomAccessFile.close();
+            } catch (Throwable unused2) {
+            }
+            throw th2;
+        }
+    }
+
+    public static synchronized void clear(Context context) {
+        try {
+            File file = file(context);
+            if (file.exists()) {
+                file.delete();
+            }
+        } catch (Throwable unused) {
+        }
+    }
+
+    /* JADX WARN: Code duplicated, block: B:26:0x005e A[DONT_GENERATE] */
+    /* JADX WARN: Code duplicated, block: B:28:0x0060 A[Catch: all -> 0x007b, TRY_ENTER, TRY_LEAVE, TryCatch #4 {, blocks: (B:4:0x0003, B:24:0x0058, B:28:0x0060, B:34:0x007a, B:21:0x003d), top: B:49:0x0003, inners: #0 }] */
+    /* JADX WARN: Instruction removed from duplicated block: B:26:0x005e, please report this as an issue */
+    public static synchronized List<String> tail(Context context, int i) {
+        ArrayList<String> arrayList = new ArrayList<>();
+        File file = file(context);
+        if (!file.exists()) {
+            return arrayList;
+        }
+        BufferedReader br = null;
+        try {
+            br = new BufferedReader(new FileReader(file));
+            String line;
+            while ((line = br.readLine()) != null) {
+                arrayList.add(line);
+                if (arrayList.size() > 6000) {
+                    arrayList.remove(0);
+                }
+            }
+        } catch (Throwable th) {
+            arrayList.add("[读取日志失败] " + th);
+        } finally {
+            if (br != null) {
+                try {
+                    br.close();
+                } catch (Throwable unused) {
+                }
+            }
+        }
+        if (arrayList.size() <= i) {
+            return arrayList;
+        }
+        return new ArrayList<>(arrayList.subList(arrayList.size() - i, arrayList.size()));
+    }
+
+    public static synchronized String readFully(Context context) {
+        File file = file(context);
+        if (!file.exists()) {
+            return "";
+        }
         FileInputStream fis = null;
         try {
-            fis = new FileInputStream(f);
-            byte[] buf = new byte[(int) f.length()];
-            int n = fis.read(buf);
-            return new String(buf, 0, n < 0 ? 0 : n, "UTF-8");
-        } catch (Throwable t) {
-            return "[读取失败] " + t;
+            fis = new FileInputStream(file);
+            byte[] bArr = new byte[(int) file.length()];
+            int i = fis.read(bArr);
+            if (i < 0) {
+                i = 0;
+            }
+            return new String(bArr, 0, i, "UTF-8");
+        } catch (Throwable th) {
+            return "[读取失败] " + th;
         } finally {
             if (fis != null) {
                 try {
                     fis.close();
-                } catch (Throwable ignored) {
+                } catch (Throwable unused) {
                 }
             }
         }
     }
 
-    private static void close(FileOutputStream fos) {
-        if (fos != null) {
+    private static void close(FileOutputStream fileOutputStream) {
+        if (fileOutputStream != null) {
             try {
-                fos.close();
-            } catch (Throwable ignored) {
+                fileOutputStream.close();
+            } catch (Throwable unused) {
             }
         }
     }

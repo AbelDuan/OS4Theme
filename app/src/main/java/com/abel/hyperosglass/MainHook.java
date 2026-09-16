@@ -1,28 +1,31 @@
 package com.abel.hyperosglass;
 
-import android.app.ActivityManager;
-import android.app.Notification;
-import android.content.ComponentName;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
-import android.content.pm.PackageManager;
-import android.os.PowerManager;
-import android.os.UserHandle;
-import android.provider.Settings;
 import android.content.res.ColorStateList;
-import android.graphics.Canvas;
+import android.content.res.Resources;
 import android.graphics.Color;
 import android.graphics.Outline;
+import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
+import android.net.Uri;
+import android.os.Bundle;
+import android.os.PowerManager;
+import android.os.UserHandle;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
-import android.view.ViewTreeObserver;
+import android.view.ViewOutlineProvider;
 import android.widget.ImageView;
 import android.widget.TextView;
-
+import android.widget.Toast;
+import io.github.libxposed.api.XposedInterface;
+import io.github.libxposed.api.XposedModule;
+import io.github.libxposed.api.XposedModuleInterface;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -30,2730 +33,1859 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-import io.github.libxposed.api.XposedInterface;
-import io.github.libxposed.api.XposedModule;
-import io.github.libxposed.api.XposedModuleInterface;
-
-/**
- * OS4 Themer —— HyperOS 4 主题增强模块（LibXposed API 102 版）。
- *
- * v3.0 完全重构：只保留两个功能，其余全部取消（用户要求，确认无 bug 后再逐步加回）：
- *   1) 三方主题柔光玻璃通知：挂钩 miui.systemui.util.ThemeUtils 的
- *      getDefaultSysUiTheme / getDefaultPluginTheme 强制返回 true。
- *      关键修复：ThemeUtils 在插件 APK（MIUISystemUIPlugin）的独立 classloader，
- *      宿主 onPackageLoaded 的 Class.forName 必然失败（v2.1.x 移除 loadClass 拦截
- *      后玻璃 hook 从未挂上）。v3.0 改为 hook 宿主侧
- *      PluginInstance$PluginFactory.createClassLoader()——宿主加载插件 APK 时
- *      创建插件 classloader 的唯一入口（dex 确认，含 sClassLoaders 缓存），
- *      在其回调中拿插件 ClassLoader 后补挂 ThemeUtils 两个 getter。
- *   2) 锁屏通知下沉（启用/不启用，默认关）：useExtraShelfSpace flow -> false、
- *      通知位置 flow L$1[6]=false（参照 HyperChanger）。每个目标类独立去重。
- *
- * v3.0.1：媒体岛崩溃防御改为「吞异常版」。
- *   设备系统 bug（真机确认）：播放媒体时 MiuiIslandMediaViewBinderImpl.attach
- *   内部无条件调用 MiPalette.init() → MiPalette.<clinit> → loadLibrary
- *   libMiMainColor.so 被 namespace clns-13 拒绝 → UnsatisfiedLinkError →
- *   SystemUI 主线程崩溃循环（v3.0.0 实测确认）。系统原版即崩，必须防御。
- *   v2.1.10 旧防御「短路 attach」导致音乐胶囊弹窗只剩进度条；v3.0.1 改为
- *   try/catch 包住 proceed：attach 前半段（holder/前景色/进度条）正常执行，
- *   仅在 MiPalette 崩溃处吞掉异常返回 null —— 不崩、弹窗内容尽量完整。
- *
- * 已移除（v3.0）：指纹图标隐藏/显示（v2.1.9 起）、展开按钮药丸修复（曾导致
- * 音乐通知卡片圆角变方）。音乐卡片圆角问题随之恢复系统默认行为。
- *
- * 相对 API 82 的改进（与 HyperChanger 同框架）：
- *   - getRemotePreferences()：设置由 LSPosed 框架直供，不依赖模块 App 进程，
- *     开机后 SystemUI 即使先于模块 App 启动也能立刻读到开关（「重启即生效」）；
- *   - autoHotReload：设置变化自动热重载。
- *
- * 防崩溃：所有回调整体 try/catch + ExceptionMode.PROTECTIVE，绝不向上抛异常。
- * 防卡顿：ThemeUtils 热路径回调只读 volatile 布尔，绝不写日志/IO。
- * 精准命中铁律（v2.1 播放音频崩溃教训）：绝不 hook View.setBackground /
- *   setBackgroundTintList 等全局方法、不 hook ClassLoader.loadClass、不 hook
- *   ClassLoader 构造、不做轮询——只 hook 具体目标类的具体方法
- *   （ThemeUtils 2 方法 / 插件工厂 1 方法 / 通知下沉 2 方法 / 媒体岛 1 方法），
- *   避免任何「批量命中」。
- */
+/* JADX INFO: loaded from: classes.dex */
 public class MainHook extends XposedModule {
-
-    /** 已挂钩的 ThemeUtils 类对象（v3.3.6：按 Class 身份去重，不再按类名）
-     *  ThemeUtils 在宿主与 MIUISystemUIPlugin 插件中各有独立 ClassLoader 副本，
-     *  旧版用「类名字符串」去重 → 首个副本挂钩后，其余副本被误判为已挂钩而直接
-     *  return 跳过；控制中心所在的插件副本因此从未挂钩 → 柔光玻璃丢失。
-     *  这是 v3.3.5 丢玻璃的真实根因（此前误判为 ART 内联）。
-     *  改按 Class 对象身份去重后每个副本各自挂钩；弱引用避免持有 loader 造成泄漏。 */
-    private static final Set<Class<?>> glassHooked =
-            Collections.newSetFromMap(new WeakHashMap<Class<?>, Boolean>());
-    /** 已挂钩的 MiBlurCompat 类对象（v3.3.9：线 A 总闸门，仅液态模式强制 true）。多 ClassLoader 副本同样需 Class 身份去重。 */
-    private static final Set<Class<?>> miBlurCompatHooked =
-            Collections.newSetFromMap(new WeakHashMap<Class<?>, Boolean>());
-    /** 已挂钩的通知下沉目标类（每个类独立去重） */
-    private static final Set<String> sinkHooked = new HashSet<String>();
-    /** 已挂钩的控制中心「编辑」按钮控制器类（插件 loader，按 Class 身份去重） */
-    private static final Set<Class<?>> qsEditHooked =
-            Collections.newSetFromMap(new WeakHashMap<Class<?>, Boolean>());
-
-    // ---- 设置（LibXposed 框架直供 getRemotePreferences）----
     private volatile SharedPreferences sPrefs;
-    private volatile boolean sSinkEnabled = Constants.DEFAULT_SINK_ENABLED;
-    private volatile boolean sGlassEnabled = Constants.DEFAULT_GLASS_ENABLED;
-    private volatile boolean sHideLockFod = Constants.DEFAULT_HIDE_LOCK_FOD;
-    private volatile boolean sHideDismissBtn = Constants.DEFAULT_HIDE_DISMISS_BTN;
-    private volatile boolean sFocusGlass = Constants.DEFAULT_FOCUS_GLASS;
-    /** 隐藏锁屏指纹开关（AtomicBoolean，供热路径拦截器读取） */
-    private static final java.util.concurrent.atomic.AtomicBoolean sHideLockFodFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HIDE_LOCK_FOD);
-    /** 隐藏通知清除按钮开关（AtomicBoolean） */
-    private static final java.util.concurrent.atomic.AtomicBoolean sHideDismissFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HIDE_DISMISS_BTN);
-    /** 柔光玻璃焦点通知开关（AtomicBoolean） */
-    private static final java.util.concurrent.atomic.AtomicBoolean sFocusGlassFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_FOCUS_GLASS);
-    /** 息屏电池状态同步开关（AtomicBoolean，供热路径拦截器读取） */
-    private static final java.util.concurrent.atomic.AtomicBoolean sAodBatterySyncFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_AOD_BATTERY_SYNC);
-    /** 当前是否处于 AOD 息屏态（combine / animateFullAod / 电池 toggleAodMode 共同维护） */
+    private static final Set<String> sinkHooked = new HashSet();
+    private static final Set<Class<?>> qsEditHooked = Collections.newSetFromMap(new WeakHashMap());
+    private static final AtomicBoolean sHideLockFodFlag = new AtomicBoolean(true);
+    private static final AtomicBoolean sHideDismissFlag = new AtomicBoolean(true);
+    private static final AtomicBoolean sFocusGlassFlag = new AtomicBoolean(true);
+    private static final AtomicBoolean sAodBatterySyncFlag = new AtomicBoolean(true);
     private static volatile boolean sAodDozing = false;
-    /** 锁屏密码键盘柔光玻璃开关（AtomicBoolean） */
-    private static final java.util.concurrent.atomic.AtomicBoolean sPinGlassFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_PIN_GLASS);
-    /** 隐藏控制中心「编辑」按钮开关（v3.7，默认开：隐藏但保留点击进入编辑） */
-    private static final java.util.concurrent.atomic.AtomicBoolean sQsEditHideFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_QS_EDIT_HIDE);
-    /** 禁止折叠历史通知开关（v3.9，默认关） */
-    private static final java.util.concurrent.atomic.AtomicBoolean sNoFoldHistoryFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_NO_FOLD_HISTORY);
-    /** 禁止收纳通知为组开关（v3.9，默认关） */
-    private static final java.util.concurrent.atomic.AtomicBoolean sNoGroupFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_NO_GROUP);
-    /** 解除通知数量限制（v3.9 移植 HyperCeiler，默认关） */
-    private static final java.util.concurrent.atomic.AtomicBoolean sNoNotifLimitFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_NO_NOTIF_LIMIT);
-    /** 解锁保留通知（v3.9 移植 HyperCeiler，默认关） */
-    private static final java.util.concurrent.atomic.AtomicBoolean sKeepNotifFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_KEEP_NOTIF);
-    /** 隐藏蓝牙解锁通知（v3.11 移植 HyperCeiler DisableUnlockByBleToast，默认关） */
-    private static final java.util.concurrent.atomic.AtomicBoolean sHideBtUnlockFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HIDE_BT_UNLOCK);
-    /** 小米服务框架：解锁焦点通知白名单签名验证（默认关） */
-    private static final java.util.concurrent.atomic.AtomicBoolean sXmsfFocusSignFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_XMSF_FOCUS_SIGN);
-    /** 小米运动健康：允许所有应用转发焦点通知到手表/手环（默认关） */
-    private static final java.util.concurrent.atomic.AtomicBoolean sHealthFocusAllowAllFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_HEALTH_FOCUS_ALLOW_ALL);
-    /** 禁止恢复电池优化白名单（默认开，移植 HyperCeiler） */
-    private static final java.util.concurrent.atomic.AtomicBoolean sPreventBatteryWhitelistFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_PREVENT_BATTERY_WHITELIST);
-    /** 亮屏时静音（v3.9 移植 HyperCeiler，默认关） */
-    private static final java.util.concurrent.atomic.AtomicBoolean sMuteScreenOnFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_MUTE_SCREEN_ON);
-    /** 亮屏时取消通知震动（v3.9 新增，默认关）：仅屏蔽震动，保留响铃与闪烁 */
-    private static final java.util.concurrent.atomic.AtomicBoolean sCancelVibrateScreenOnFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_CANCEL_VIBRATE_SCREEN_ON);
-    /** 通知设置重定向到渠道设置（v3.9 移植 HyperCeiler，默认关） */
-    private static final java.util.concurrent.atomic.AtomicBoolean sRedirectNotifSetFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_REDIRECT_NOTIF_SET);
-    /** 允许管理所有通知（v3.9 移植 HyperCeiler，默认关） */
-    private static final java.util.concurrent.atomic.AtomicBoolean sAllowManageAllFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_ALLOW_MANAGE_ALL);
-    /** 移除焦点通知白名单（v3.9 移植 HyperCeiler UnlockFocus，默认关） */
-    private static final java.util.concurrent.atomic.AtomicBoolean sUnlockAllFocusFlag =
-            new java.util.concurrent.atomic.AtomicBoolean(Constants.DEFAULT_UNLOCK_ALL_FOCUS);
-    /** 被判定为「蓝牙解锁 Toast」的 Toast 实例（show 时据此吞掉；弱引用，不泄漏） */
-    private static final Set<Object> sBleUnlockToasts =
-            Collections.newSetFromMap(new WeakHashMap<Object, Boolean>());
-    /** 是否正处于 MiuiBleUnlockHelper.tryUnlockByBle() 执行期间（HyperCeiler 同思路）：
-     *  该期间产生的 Toast 必然就是「已通过蓝牙设备解锁」，直接吞掉，
-     *  不依赖资源 id / 文本匹配，最稳。 */
-    private static final ThreadLocal<Boolean> sInBleUnlock = new ThreadLocal<Boolean>() {
-        @Override
-        protected Boolean initialValue() {
+    private static final AtomicBoolean sPinGlassFlag = new AtomicBoolean(true);
+    private static final AtomicBoolean sQsEditHideFlag = new AtomicBoolean(true);
+    private static final AtomicBoolean sNoFoldHistoryFlag = new AtomicBoolean(true);
+    private static final AtomicBoolean sNoNotifLimitFlag = new AtomicBoolean(true);
+    private static final AtomicBoolean sKeepNotifFlag = new AtomicBoolean(true);
+    private static final AtomicBoolean sHideBtUnlockFlag = new AtomicBoolean(true);
+    private static final AtomicBoolean sMuteScreenOnFlag = new AtomicBoolean(true);
+    private static final AtomicBoolean sCancelVibrateScreenOnFlag = new AtomicBoolean(true);
+    private static final AtomicBoolean sAllowManageAllFlag = new AtomicBoolean(true);
+    private static final Set<Object> sBleUnlockToasts = Collections.newSetFromMap(new WeakHashMap());
+    private static final ThreadLocal<Boolean> sInBleUnlock = new ThreadLocal<Boolean>() { // from class: com.abel.hyperosglass.MainHook.1
+        /* JADX INFO: Access modifiers changed from: protected */
+        /* JADX WARN: Can't rename method to resolve collision */
+        @Override // java.lang.ThreadLocal
+        public Boolean initialValue() {
             return Boolean.FALSE;
         }
     };
-    /** 导航手柄 View 集合（桌面/应用切换时用于触发重绘） */
-    /** 桌面包名（首次用到时解析并缓存） */
-    /** 退化路径的查询节流时间戳 */
-    // v3.3.11 日志精简：删除此处原有的 10 个「前 N 次记日志」计数器
-    // （flow1/flow2/glassSet/glassUpd/poke/pluginCl/islandDef/expandFix/miBlur/hideFod/dismiss）。
-    // 统一改用 LogUtil.logAlwaysOnce(key, msg)：常开、但每种事件全进程只记 1 条。
-    // 收益：热路径命中日志从「配额 3~5 条」降到 1 条，且不再需要逐处维护计数。
+    private static volatile boolean sReloadReceiverRegistered = false;
+    private static final AtomicBoolean sSyncRunning = new AtomicBoolean(false);
+    private static volatile boolean sSyncDirty = false;
+    private static volatile int sExpandPillId = 0;
+    private static volatile Class<?> sExpandViewClass = null;
+    private static volatile Field sFodAuthenField = null;
+    private static volatile Field sFodAnimMapField = null;
+    private static volatile Field sFodCtxField = null;
+    private static volatile Boolean sHideResValid = null;
+    private static volatile Field sFlow2Field = null;
+    private volatile boolean sSinkEnabled = true;
+    private volatile boolean sGlassEnabled = true;
+    private volatile boolean sHideLockFod = true;
+    private volatile boolean sHideDismissBtn = true;
+    private volatile boolean sFocusGlass = true;
 
-    @Override
-    public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
+    public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam moduleLoadedParam) {
         try {
-            sPrefs = getRemotePreferences(Constants.PREFS);
+            this.sPrefs = getRemotePreferences(Constants.PREFS);
             LogUtil.attach(this);
             reloadPrefs();
-            // v3.3.4：无条件同步真实设置值（getRemotePreferences 对 DE 写入不同步，
-            // 只读默认上下文 CE；设置页写 DE → SystemUI 永远读默认值 → 开关全失效）
-            startPrefsSync();
-            LogUtil.logAlways("==== 模块已加载 v" + Constants.VERSION
-                    + "（LibXposed API " + getApiVersion() + "，进程="
-                    + param.getProcessName() + "）====");
-        } catch (Throwable t) {
-            LogUtil.logAlways("onModuleLoaded 异常: " + t);
+            syncRealPrefsAsync();
+            LogUtil.logAlways("==== 模块已加载 v3.34（LibXposed API " + getApiVersion() + "，进程=" + moduleLoadedParam.getProcessName() + "）====");
+        } catch (Throwable th) {
+            LogUtil.logAlways("onModuleLoaded 异常: " + th);
         }
     }
 
-    @Override
-    public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam param) {
+    public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam packageLoadedParam) {
         try {
-            String pkg = param.getPackageName();
-            ClassLoader cl = param.getDefaultClassLoader();
-            LogUtil.logAlways("onPackageLoaded: " + pkg);
-
+            String packageName = packageLoadedParam.getPackageName();
+            ClassLoader defaultClassLoader = packageLoadedParam.getDefaultClassLoader();
+            LogUtil.logAlways("onPackageLoaded: " + packageName);
             reloadPrefs();
+            syncRealPrefsAsync();
             registerPrefsReloadReceiver();
-
-            // ── com.xiaomi.xmsf：解锁焦点通知白名单签名验证 ──
-            if (Constants.PKG_XMSF.equals(pkg)) {
-                installXmsfFocusHooks(cl);
-                return;
+            if (Constants.TARGET_PKG.equals(packageName)) {
+                installNotificationSinkHooks(defaultClassLoader);
+                installPluginClassLoaderHooks(defaultClassLoader);
+                installMediaIslandDefense(defaultClassLoader);
+                installExpandButtonColor(defaultClassLoader);
+                installLockFodHooks(defaultClassLoader);
+                installHideDismissButtonHook(defaultClassLoader);
+                installFocusGlassHooks(defaultClassLoader);
+                installAodBatteryHooks(defaultClassLoader);
+                installPinGlassHook(defaultClassLoader);
+                installQsEditHideHook(defaultClassLoader);
+                installNotifEnhanceHooks(defaultClassLoader);
+                installThirdPartyThemeGlassHooks(defaultClassLoader);
             }
-            // ── com.mi.health：允许所有应用转发焦点通知到手表/手环 ──
-            if (Constants.PKG_HEALTH.equals(pkg)) {
-                installHealthFocusHooks(cl);
-                return;
-            }
-            // ── com.miui.powerkeeper：禁止恢复电池优化白名单 ──
-            if (Constants.PKG_POWERKEEPER.equals(pkg)) {
-                installPowerKeeperHooks(cl);
-                return;
-            }
-
-            // ── com.android.systemui：全部功能 ──
-            if (!Constants.TARGET_PKG.equals(pkg)) return;
-
-            // 宿主包：通知下沉（flow 类在宿主 loader）+ 玻璃（插件工厂在宿主 loader）
-            // + 媒体岛崩溃防御（吞异常版，系统 bug 必要保护）
-            // + 展开按钮药丸（v3.0.2 精准命中：仅 2 参构造 + 严格 id 匹配）
-            // + 锁屏指纹图标/动画隐藏（v3.1.0 用户 smali 方案，仅锁屏生效）
-            installNotificationSinkHooks(cl);
-            installGlassHooks(cl);
-            installMediaIslandDefense(cl);
-            installExpandButtonColor(cl);
-            installLockFodHooks(cl);
-            installHideDismissButtonHook(cl);
-            installFocusGlassHooks(cl);
-            installAodBatteryHooks(cl);
-            installPinGlassHook(cl);
-            installQsEditHideHook(cl);
-            installNotifEnhanceHooks(cl);
-        } catch (Throwable t) {
-            LogUtil.logAlways("onPackageLoaded 异常: " + t);
+        } catch (Throwable th) {
+            LogUtil.logAlways("onPackageLoaded 异常: " + th);
         }
     }
-
-    // ============================================================
-    // 实时重载：设置开关变化后，模块 App 发广播，各注入进程重新读取 pref，
-    // 无需重启对应作用域即可生效（修复「拨开关要重启 SystemUI 才生效」的历史问题）。
-    // ============================================================
-    private static volatile boolean sReloadReceiverRegistered = false;
 
     private void registerPrefsReloadReceiver() {
-        if (sReloadReceiverRegistered) return;
-        try {
-            Object app = currentApplication();
-            if (!(app instanceof Context)) return;
-            Context ctx = (Context) app;
-            ctx.registerReceiver(new android.content.BroadcastReceiver() {
-                @Override
-                public void onReceive(Context c, android.content.Intent i) {
-                    try {
-                        reloadPrefs();
-                        LogUtil.logAlways("收到重载广播，设置已刷新");
-                    } catch (Throwable ignored) {
-                    }
-                }
-                    // API 33+ 必须显式指定 RECEIVER_EXPORTED / NOT_EXPORTED，
-                    // 旧的 2 参重载会直接抛 SecurityException（LSPosed 日志实证：
-                    // "[重载] 注册失败: SecurityException ... RECEIVER_EXPORTED ..."），
-                    // 结果是广播永远收不到 → 所有开关都要重启 SystemUI 才生效。
-                    // 发送方是模块 App（与 SystemUI 不同 uid），故必须用 EXPORTED。
-            }, new android.content.IntentFilter(Constants.ACTION_RELOAD_PREFS),
-                    Context.RECEIVER_EXPORTED);
-            sReloadReceiverRegistered = true;
-            LogUtil.logAlways("[重载] 已注册实时重载广播接收器");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[重载] 注册失败: " + t);
+        if (sReloadReceiverRegistered) {
+            return;
         }
-    }
-
-    // ============================================================
-    // 锁屏密码键盘柔光玻璃（v3.5，移植自 HyperChanger / MIT）
-    //
-    // 实现原理：HyperOS 4 的柔光柔光玻璃是**系统接口**，非私有实现——
-    //  com.miui.systemui.util.MiGlassCompat：
-    //    setMiGlassBlurRadius(view, small, large)  设置模糊半径
-    //    setMiViewMaterialTypeCompat(type, view)   指定材质类型（1=柔光玻璃）
-    //    setMiGlassCompat(view, float[])           下发扬光参数表
-    //  View 的 MIUI 扩展（背景合成器，必须先于 MiGlassCompat 调用）：
-    //    setPassWindowBlurEnabled / setMiViewBlurMode / setMiBackgroundBlurMode
-    //    / setMiBackgroundBlurRadius / addMiBackgroundBlendColor
-    // 数字键（key0..key9）原生无背景，因此额外插入一层圆形 ImageView
-    // 作为材质载体（椭圆裁剪 + 圆形水波纹），并把按压态转发给它。
-    // ============================================================
-
-    /** 挂钩 KeyguardPINView.onFinishInflate，布局完成后给每个数字键加柔光材质 */
-    private void installPinGlassHook(ClassLoader cl) {
         try {
-            Class<?> c = Class.forName(Constants.PIN_VIEW_CLASS, false, cl);
-            Method m = c.getDeclaredMethod("onFinishInflate");
-            m.setAccessible(true);
-            hook(m)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("pin-glass")
-                    .intercept(chain -> {
-                        Object ret = chain.proceed();
-                        if (sPinGlassFlag.get() && chain.getThisObject() instanceof View) {
-                            final View pinView = (View) chain.getThisObject();
-                            pinView.post(() -> applyPinGlass(pinView, cl));
+            Object objCurrentApplication = currentApplication();
+            if (objCurrentApplication instanceof Context) {
+                ((Context) objCurrentApplication).registerReceiver(new BroadcastReceiver() { // from class: com.abel.hyperosglass.MainHook.2
+                    @Override // android.content.BroadcastReceiver
+                    public void onReceive(Context context, Intent intent) {
+                        try {
+                            MainHook.this.reloadPrefs();
+                            LogUtil.logAlways("收到重载广播，设置已刷新");
+                        } catch (Throwable unused) {
                         }
-                        return ret;
-                    });
-            LogUtil.logAlways("[密码玻璃] 已挂钩 " + Constants.PIN_VIEW_CLASS + ".onFinishInflate");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[密码玻璃] 挂钩失败: " + t);
+                    }
+                }, new IntentFilter(Constants.ACTION_RELOAD_PREFS), 2);
+                sReloadReceiverRegistered = true;
+                LogUtil.logAlways("[重载] 已注册实时重载广播接收器");
+            }
+        } catch (Throwable th) {
+            LogUtil.logAlways("[重载] 注册失败: " + th);
         }
     }
 
-    // v3.9 通知增强（6 项移植 HyperCeiler / 1 项自研 + 禁止折叠历史 + 禁止分组）
-    //
-    // 目标签名全部经 dexdump 在 nezha（HyperOS 4 / OS4.0.0.17.XPACNXM）核准：
-    //   CountLimitCoordinator.attach(NotifPipeline)V                        classes2
-    //   CountLimitCoordinator$$ExternalSyntheticLambda0
-    //       .onViewBound$1(NotificationEntry)V                              classes2
-    //   KeyguardNotificationVisibilityProviderImpl
-    //       .shouldHideNotification(NotificationEntry)Z                     classes2
-    //   MiuiAlertManager.buzzBeepBlink(NotificationEntry)V                  classes2
-    //   NotificationSettingsHelper
-    //       .startAppNotificationSettings(Context,String,String,I,String)V  classes3
-    //   FoldNotifControllerImpl.sendFoldNotification(UserHandle,Reason)V    classes2
-    //   GroupMemberManagerLegacy.isGroupSummary(Entry)Z                     classes2（static）
-    //   ExpandableNotificationRow.onNotificationUpdated()V / getEntry()     classes2
-    // 每项独立 try/catch + PROTECTIVE：任一目标缺失只记日志，不影响其余功能。
-    // ============================================================
-
-    /** v3.9 通知增强总入口（逐个独立安装，互不影响） */
-    private void installNotifEnhanceHooks(ClassLoader cl) {
-        installNoNotifLimitHook(cl);
-        installKeepNotifHook(cl);
-        installHideBtUnlockHook(cl);
-        installMuteScreenOnHook(cl);
-        installRedirectNotifSettingsHook(cl);
-        installAllowManageAllHook(cl);
-        installUnlockAllFocusHook(cl);
-        installFoldNotifHook(cl);
-        installNoGroupHook(cl);
+    private void installPinGlassHook(final ClassLoader classLoader) {
+        try {
+            Method declaredMethod = Class.forName(Constants.PIN_VIEW_CLASS, false, classLoader).getDeclaredMethod("onFinishInflate", new Class[0]);
+            declaredMethod.setAccessible(true);
+            hook(declaredMethod).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("pin-glass").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda3
+                public final Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    return MainHook.this.lambda$installPinGlassHook$1(classLoader, chain);
+                }
+            });
+            LogUtil.logAlways("[密码玻璃] 已挂钩 com.android.keyguard.KeyguardPINView.onFinishInflate");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[密码玻璃] 挂钩失败: " + th);
+        }
     }
 
-    /** 沿类继承链查找字段（含父类），找不到返回 null */
-    private static Field findField(Class<?> cls, String name) {
-        Class<?> c = cls;
-        while (c != null) {
+    /* JADX INFO: Access modifiers changed from: private */
+    public /* synthetic */ Object lambda$installPinGlassHook$1(final ClassLoader classLoader, XposedInterface.Chain chain) throws Throwable {
+        Object objProceed = chain.proceed();
+        if (sPinGlassFlag.get() && (chain.getThisObject() instanceof View)) {
+            final View view = (View) chain.getThisObject();
+            view.post(new Runnable() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda7
+                @Override // java.lang.Runnable
+                public final void run() {
+                    MainHook.this.lambda$installPinGlassHook$0(view, classLoader);
+                }
+            });
+        }
+        return objProceed;
+    }
+
+    private void installNotifEnhanceHooks(ClassLoader classLoader) {
+        installNoNotifLimitHook(classLoader);
+        installKeepNotifHook(classLoader);
+        installHideBtUnlockHook(classLoader);
+        installMuteScreenOnHook(classLoader);
+        installAllowManageAllHook(classLoader);
+        installFoldNotifHook(classLoader);
+    }
+
+    private static Field findField(Class<?> cls, String str) {
+        while (cls != null) {
             try {
-                Field f = c.getDeclaredField(name);
-                f.setAccessible(true);
-                return f;
-            } catch (Throwable ignored) {
-                c = c.getSuperclass();
+                Field declaredField = cls.getDeclaredField(str);
+                declaredField.setAccessible(true);
+                return declaredField;
+            } catch (Throwable unused) {
+                cls = cls.getSuperclass();
             }
         }
         return null;
     }
 
-    /** 取 NotificationEntry.mSbn（StatusBarNotification） */
-    private static Object entrySbn(Object entry) {
-        try {
-            if (entry == null) return null;
-            Field f = findField(entry.getClass(), Constants.ENTRY_SBN_FIELD);
-            return f == null ? null : f.get(entry);
-        } catch (Throwable ignored) {
+    private static Object entrySbn(Object obj) {
+        if (obj == null) {
             return null;
         }
-    }
-
-    /** 解除通知数量限制（HyperCeiler RemoveNotifNumLimit）：
-     *  跳过 CountLimitCoordinator.attach（不注册数量上限折叠逻辑），
-     *  并跳过提示条 lambda 的 onViewBound$1（不再生成「N 条通知已折叠」条）。 */
-    private void installNoNotifLimitHook(ClassLoader cl) {
         try {
-            Class<?> c = Class.forName(Constants.NOTIF_LIMIT_CLASS, false, cl);
-            Class<?> pipe = Class.forName(Constants.NOTIF_PIPELINE_CLASS, false, cl);
-            Method m = c.getDeclaredMethod(Constants.NOTIF_LIMIT_ATTACH_METHOD, pipe);
-            m.setAccessible(true);
-            hook(m)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("no-notif-limit")
-                    .intercept(chain -> sNoNotifLimitFlag.get() ? null : chain.proceed());
-            LogUtil.logAlways("[解除通知限制] 已挂钩 " + Constants.NOTIF_LIMIT_CLASS + ".attach");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[解除通知限制] 挂载失败: " + t);
-        }
-        // 提示条由编译期生成的 lambda 绑定，类名随 ROM 变，失败属正常（记录但不影响主逻辑）
-        try {
-            Class<?> lam = Class.forName(Constants.NOTIF_LIMIT_LAMBDA_CLASS, false, cl);
-            Class<?> entry = Class.forName(Constants.NOTIF_ENTRY_CLASS, false, cl);
-            Method lm = lam.getDeclaredMethod(Constants.NOTIF_LIMIT_ONVIEWBOUND_METHOD, entry);
-            lm.setAccessible(true);
-            hook(lm)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("no-notif-limit-lambda")
-                    .intercept(chain -> sNoNotifLimitFlag.get() ? null : chain.proceed());
-            LogUtil.logAlways("[解除通知限制] 已挂钩提示条 lambda");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[解除通知限制] 提示条 lambda 未命中（ROM 差异，可忽略）: " + t);
-        }
-    }
-
-    /** 解锁保留通知（HyperCeiler KeepNotification）：解锁瞬间把通知重置为
-     *  「解锁后尚未展示过」→ 锁屏上出现过的通知不会在解锁后被收起。 */
-    private void installKeepNotifHook(ClassLoader cl) {
-        try {
-            Class<?> c = Class.forName(Constants.KEEP_NOTIF_CLASS, false, cl);
-            Class<?> entryCl = Class.forName(Constants.NOTIF_ENTRY_CLASS, false, cl);
-            int n = 0;
-            for (Method m : c.getDeclaredMethods()) {
-                if (!Constants.KEEP_NOTIF_METHOD.equals(m.getName())) continue;
-                if (m.getParameterCount() != 1 || m.getParameterTypes()[0] != entryCl) continue;
-                m.setAccessible(true);
-                hook(m)
-                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                        .setId("keep-notif")
-                        .intercept(chain -> {
-                            if (sKeepNotifFlag.get()) forceNotShownAfterUnlock(chain.getArg(0));
-                            return chain.proceed();
-                        });
-                n++;
+            Field fieldFindField = findField(obj.getClass(), Constants.ENTRY_SBN_FIELD);
+            if (fieldFindField == null) {
+                return null;
             }
-            LogUtil.logAlways("[解锁保留通知] 已挂钩 shouldHideNotification ×" + n);
-        } catch (Throwable t) {
-            LogUtil.logAlways("[解锁保留通知] 挂载失败: " + t);
-        }
-    }
-
-    /** 取 NotificationEntry → StatusBarNotification → Notification（用于屏蔽震动字段） */
-    private static Object entryNotification(Object entry) {
-        try {
-            Object sbn = entrySbn(entry);
-            if (sbn == null) return null;
-            Field f = findField(sbn.getClass(), "mNotification");
-            return f == null ? null : f.get(sbn);
-        } catch (Throwable ignored) {
+            return fieldFindField.get(obj);
+        } catch (Throwable unused) {
             return null;
         }
     }
 
-    /** NotificationEntry.mSbn.mHasShownAfterUnlock = false */
-    private static void forceNotShownAfterUnlock(Object entry) {
+    private void installNoNotifLimitHook(ClassLoader classLoader) {
         try {
-            Object sbn = entrySbn(entry);
-            if (sbn == null) return;
-            Field f = findField(sbn.getClass(), Constants.SBN_SHOWN_AFTER_UNLOCK_FIELD);
-            if (f != null) f.setBoolean(sbn, false);
-        } catch (Throwable ignored) {
+            Method declaredMethod = Class.forName(Constants.NOTIF_LIMIT_CLASS, false, classLoader).getDeclaredMethod("attach", Class.forName(Constants.NOTIF_PIPELINE_CLASS, false, classLoader));
+            declaredMethod.setAccessible(true);
+            hook(declaredMethod).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("no-notif-limit").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda4
+                public final Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    return MainHook.lambda$installNoNotifLimitHook$2(chain);
+                }
+            });
+            LogUtil.logAlways("[解除通知限制] 已挂钩 com.android.systemui.statusbar.notification.collection.coordinator.CountLimitCoordinator.attach");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[解除通知限制] 挂载失败: " + th);
+        }
+        try {
+            Method declaredMethod2 = Class.forName(Constants.NOTIF_LIMIT_LAMBDA_CLASS, false, classLoader).getDeclaredMethod(Constants.NOTIF_LIMIT_ONVIEWBOUND_METHOD, Class.forName(Constants.NOTIF_ENTRY_CLASS, false, classLoader));
+            declaredMethod2.setAccessible(true);
+            hook(declaredMethod2).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("no-notif-limit-lambda").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda5
+                public final Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    return MainHook.lambda$installNoNotifLimitHook$3(chain);
+                }
+            });
+            LogUtil.logAlways("[解除通知限制] 已挂钩提示条 lambda");
+        } catch (Throwable th2) {
+            LogUtil.logAlways("[解除通知限制] 提示条 lambda 未命中（ROM 差异，可忽略）: " + th2);
         }
     }
 
-    /** 隐藏「已通过蓝牙设备解锁」Toast（v3.9，移植 HyperCeiler DisableUnlockByBleToast）。
-     *
-     *  上游原实现：在 KeyguardSecurityContainerController$3.dismiss / MiuiBleUnlockHelper
-     *  .tryUnlockByBle 里**嵌套** hook Toast.makeText 比对资源名
-     *  com.android.systemui:string/miui_keyguard_ble_unlock_succeed_msg，命中再 hook show() 吞掉。
-     *  本模块改为等价但更稳的两段式（不需要嵌套、也不依赖那两个内部类）：
-     *   1) hook Toast.makeText(Context,int,int)：把 resId 解析成资源 entry name，
-     *      命中 miui_keyguard_ble_unlock_succeed_msg（或文本同时含「蓝牙」与「解锁」）
-     *      → 把返回的 Toast 实例记入弱集合；
-     *   2) hook Toast.show()：仅当 this 在该弱集合中才 return null 吞掉。
-     *  Toast 非热路径；资源名取不到时一律放行，绝不误吞其它 Toast。 */
-    private void installHideBtUnlockHook(ClassLoader cl) {
-        installBleUnlockSourceHook(cl); // 路径 0：源头标记（最可靠，HyperCeiler 思路）
-        installBleUnlockViewHide();     // 路径 1：锁屏自定义 TextView 兜底
-        installBleUnlockToastHide();    // 路径 2：Toast 文本 / 资源名兜底
+    static /* synthetic */ Object lambda$installNoNotifLimitHook$2(XposedInterface.Chain chain) throws Throwable {
+        if (sNoNotifLimitFlag.get()) {
+            return null;
+        }
+        return chain.proceed();
     }
 
-    /** 路径 0：hook 蓝牙解锁源头 MiuiBleUnlockHelper.tryUnlockByBle()，
-     *  在其执行期间把 sInBleUnlock 置位，Toast.show() 据此直接吞掉。
-     *  依据：反汇编 classes.dex 证实该方法内就是 Toast.makeText(…).show()。 */
-    private void installBleUnlockSourceHook(ClassLoader cl) {
+    static /* synthetic */ Object lambda$installNoNotifLimitHook$3(XposedInterface.Chain chain) throws Throwable {
+        if (sNoNotifLimitFlag.get()) {
+            return null;
+        }
+        return chain.proceed();
+    }
+
+    private void installKeepNotifHook(ClassLoader classLoader) {
         try {
-            Class<?> c = Class.forName(Constants.BLE_UNLOCK_HELPER_CLASS, false, cl);
-            Method m = c.getDeclaredMethod(Constants.BLE_TRY_UNLOCK_METHOD);
-            m.setAccessible(true);
-            hook(m)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("ble-unlock-source")
-                    .intercept(chain -> {
-                        sInBleUnlock.set(Boolean.TRUE);
-                        try {
-                            return chain.proceed();
-                        } finally {
-                            sInBleUnlock.set(Boolean.FALSE);
+            Class<?> cls = Class.forName(Constants.KEEP_NOTIF_CLASS, false, classLoader);
+            Class<?> cls2 = Class.forName(Constants.NOTIF_ENTRY_CLASS, false, classLoader);
+            int i = 0;
+            for (Method method : cls.getDeclaredMethods()) {
+                if (Constants.KEEP_NOTIF_METHOD.equals(method.getName()) && method.getParameterCount() == 1 && method.getParameterTypes()[0] == cls2) {
+                    method.setAccessible(true);
+                    hook(method).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("keep-notif").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda15
+                        public final Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            return MainHook.lambda$installKeepNotifHook$4(chain);
                         }
                     });
-            LogUtil.logAlways("[蓝牙解锁提示] 已挂钩 "
-                    + Constants.BLE_UNLOCK_HELPER_CLASS + ".tryUnlockByBle");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[蓝牙解锁提示] tryUnlockByBle 未命中: " + t);
+                    i++;
+                }
+            }
+            LogUtil.logAlways("[解锁保留通知] 已挂钩 shouldHideNotification ×" + i);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[解锁保留通知] 挂载失败: " + th);
         }
     }
 
-    /** 路径 1（本 ROM 实证路径，v3.9.1 修正）。
-     *
-     *  ⚠️ v3.9 首版按 HyperCeiler 当成 Toast 处理，**在 HyperOS 4 上打不中**——
-     *  反查资源引用（dexdump -d classes.dex）证实：
-     *    7f1409a7 (string/miui_keyguard_ble_unlock_succeed_msg) +
-     *    7f070524/7f070525 (dimen/keyguard_ble_unlock_text_size/_textview_margin_top)
-     *  被 com.android.keyguard.MiuiBleUnlockHelper.tryUnlockByBle 与
-     *  com.android.keyguard.KeyguardSecurityContainerController.showNextSecurityScreenOrFinish
-     *  引用 → 它是锁屏上**代码创建的 TextView**，并非 android.widget.Toast。
-     *
-     *  故改为 hook TextView.setText(CharSequence…)：命中「蓝牙 + 解锁」文案即把该
-     *  TextView 置 GONE。文案高度唯一（"已通过蓝牙设备解锁"），误伤概率极低；
-     *  开关默认关闭，关闭时拦截器只做一次 volatile 读即放行。 */
+    static /* synthetic */ Object lambda$installKeepNotifHook$4(XposedInterface.Chain chain) throws Throwable {
+        if (sKeepNotifFlag.get()) {
+            forceNotShownAfterUnlock(chain.getArg(0));
+        }
+        return chain.proceed();
+    }
+
+    private static Object entryNotification(Object obj) {
+        Field fieldFindField;
+        try {
+            Object objEntrySbn = entrySbn(obj);
+            if (objEntrySbn == null || (fieldFindField = findField(objEntrySbn.getClass(), "mNotification")) == null) {
+                return null;
+            }
+            return fieldFindField.get(objEntrySbn);
+        } catch (Throwable unused) {
+            return null;
+        }
+    }
+
+    private static void forceNotShownAfterUnlock(Object obj) {
+        Field fieldFindField;
+        try {
+            Object objEntrySbn = entrySbn(obj);
+            if (objEntrySbn == null || (fieldFindField = findField(objEntrySbn.getClass(), Constants.SBN_SHOWN_AFTER_UNLOCK_FIELD)) == null) {
+                return;
+            }
+            fieldFindField.setBoolean(objEntrySbn, false);
+        } catch (Throwable unused) {
+        }
+    }
+
+    private void installHideBtUnlockHook(ClassLoader classLoader) {
+        installBleUnlockSourceHook(classLoader);
+        installBleUnlockViewHide();
+        installBleUnlockToastHide();
+    }
+
+    private void installBleUnlockSourceHook(ClassLoader classLoader) {
+        try {
+            Method declaredMethod = Class.forName(Constants.BLE_UNLOCK_HELPER_CLASS, false, classLoader).getDeclaredMethod(Constants.BLE_TRY_UNLOCK_METHOD, new Class[0]);
+            declaredMethod.setAccessible(true);
+            hook(declaredMethod).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("ble-unlock-source").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda14
+                public final Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    return MainHook.lambda$installBleUnlockSourceHook$5(chain);
+                }
+            });
+            LogUtil.logAlways("[蓝牙解锁提示] 已挂钩 com.android.keyguard.MiuiBleUnlockHelper.tryUnlockByBle");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[蓝牙解锁提示] tryUnlockByBle 未命中: " + th);
+        }
+    }
+
+    static /* synthetic */ Object lambda$installBleUnlockSourceHook$5(XposedInterface.Chain chain) throws Throwable {
+        sInBleUnlock.set(Boolean.TRUE);
+        try {
+            return chain.proceed();
+        } finally {
+            sInBleUnlock.set(Boolean.FALSE);
+        }
+    }
+
     private void installBleUnlockViewHide() {
         try {
-            int n = 0;
-            for (Method m : android.widget.TextView.class.getDeclaredMethods()) {
-                if (!"setText".equals(m.getName())) continue;
-                Class<?>[] ps = m.getParameterTypes();
-                if (ps.length == 0 || ps[0] != CharSequence.class) continue;
-                m.setAccessible(true);
-                hook(m)
-                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                        .setId("ble-unlock-text")
-                        .intercept(chain -> {
-                            Object ret = chain.proceed();
-                            try {
-                                if (!sHideBtUnlockFlag.get()) return ret;
-                                Object thiz = chain.getThisObject();
-                                if (thiz instanceof View
-                                        && isBluetoothUnlockText((CharSequence) chain.getArg(0))) {
-                                    final View tv = (View) thiz;
-                                    tv.setVisibility(View.GONE);
-                                    // 再 post 一次：setText 之后业务代码通常还会
-                                    // setVisibility(VISIBLE) 重新显示，延到下一帧
-                                    // 收尾，确保最终保持隐藏。
-                                    tv.post(new Runnable() {
-                                        @Override
-                                        public void run() {
-                                            try {
-                                                tv.setVisibility(View.GONE);
-                                            } catch (Throwable ignored) {
-                                            }
-                                        }
-                                    });
-                                }
-                            } catch (Throwable ignored) {
+            int i = 0;
+            for (Method method : TextView.class.getDeclaredMethods()) {
+                if ("setText".equals(method.getName())) {
+                    Class<?>[] parameterTypes = method.getParameterTypes();
+                    if (parameterTypes.length != 0 && parameterTypes[0] == CharSequence.class) {
+                        method.setAccessible(true);
+                        hook(method).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("ble-unlock-text").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda18
+                            public final Object intercept(XposedInterface.Chain chain) throws Throwable {
+                                return MainHook.this.lambda$installBleUnlockViewHide$6(chain);
                             }
-                            return ret;
                         });
-                n++;
+                        i++;
+                    }
+                }
             }
-            LogUtil.logAlways("[蓝牙解锁提示] 已挂钩 TextView.setText ×" + n);
-        } catch (Throwable t) {
-            LogUtil.logAlways("[蓝牙解锁提示] 挂载失败: " + t);
+            LogUtil.logAlways("[蓝牙解锁提示] 已挂钩 TextView.setText ×" + i);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[蓝牙解锁提示] 挂载失败: " + th);
         }
     }
 
-    /** 路径 2：真 Toast（部分 ROM / 未来版本）；show 前按视图文本判定再吞掉 */
+    /* JADX INFO: Access modifiers changed from: private */
+    public /* synthetic */ Object lambda$installBleUnlockViewHide$6(XposedInterface.Chain chain) throws Throwable {
+        Object objProceed = chain.proceed();
+        try {
+            if (sHideBtUnlockFlag.get()) {
+                Object thisObject = chain.getThisObject();
+                if ((thisObject instanceof View) && isBluetoothUnlockText((CharSequence) chain.getArg(0))) {
+                    final View view = (View) thisObject;
+                    view.setVisibility(8);
+                    view.post(new Runnable() { // from class: com.abel.hyperosglass.MainHook.3
+                        @Override // java.lang.Runnable
+                        public void run() {
+                            try {
+                                view.setVisibility(8);
+                            } catch (Throwable unused) {
+                            }
+                        }
+                    });
+                }
+            }
+        } catch (Throwable unused) {
+        }
+        return objProceed;
+    }
+
     private void installBleUnlockToastHide() {
         try {
-            Method mk = android.widget.Toast.class.getDeclaredMethod("makeText",
-                    Context.class, int.class, int.class);
-            mk.setAccessible(true);
-            hook(mk)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("ble-toast-make")
-                    .intercept(chain -> {
-                        Object ret = chain.proceed();
-                        try {
-                            if (sHideBtUnlockFlag.get() && ret != null
-                                    && isBleUnlockRes(chain.getArg(0), (Integer) chain.getArg(1))) {
-                                sBleUnlockToasts.add(ret);
-                            }
-                        } catch (Throwable ignored) {
-                        }
-                        return ret;
-                    });
-            Method show = android.widget.Toast.class.getDeclaredMethod("show");
-            show.setAccessible(true);
-            hook(show)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("ble-toast-show")
-                    .intercept(chain -> {
-                        try {
-                            if (sHideBtUnlockFlag.get()) {
-                                // 最高优先：正处于蓝牙解锁流程内 → 必是该提示，直接吞
-                                if (sInBleUnlock.get()) return null;
-                                Object thiz = chain.getThisObject();
-                                if (sBleUnlockToasts.remove(thiz)) {
-                                    return null; // makeText 阶段已按资源名命中
-                                }
-                                if (thiz instanceof android.widget.Toast
-                                        && isBluetoothUnlockText(toastText(
-                                                ((android.widget.Toast) thiz).getView()))) {
-                                    return null; // 兜底：按 Toast 文本命中
-                                }
-                            }
-                        } catch (Throwable ignored) {
-                        }
-                        return chain.proceed();
-                    });
+            Method declaredMethod = Toast.class.getDeclaredMethod("makeText", Context.class, Integer.TYPE, Integer.TYPE);
+            declaredMethod.setAccessible(true);
+            hook(declaredMethod).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("ble-toast-make").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda12
+                public final Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    return MainHook.lambda$installBleUnlockToastHide$7(chain);
+                }
+            });
+            Method declaredMethod2 = Toast.class.getDeclaredMethod("show", new Class[0]);
+            declaredMethod2.setAccessible(true);
+            hook(declaredMethod2).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("ble-toast-show").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda13
+                public final Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    return MainHook.lambda$installBleUnlockToastHide$8(chain);
+                }
+            });
             LogUtil.logAlways("[蓝牙解锁Toast] 已挂钩 Toast.makeText/show");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[蓝牙解锁Toast] 挂载失败: " + t);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[蓝牙解锁Toast] 挂载失败: " + th);
         }
     }
 
-    /** 判定资源 id 是否为「蓝牙解锁成功」文案 */
-    private static boolean isBleUnlockRes(Object ctxObj, int resId) {
+    static /* synthetic */ Object lambda$installBleUnlockToastHide$7(XposedInterface.Chain chain) throws Throwable {
+        Object objProceed = chain.proceed();
         try {
-            if (!(ctxObj instanceof Context)) return false;
-            android.content.res.Resources res = ((Context) ctxObj).getResources();
-            if (Constants.BLE_UNLOCK_RES_ENTRY.equals(res.getResourceEntryName(resId))) {
+            if (sHideBtUnlockFlag.get() && objProceed != null && isBleUnlockRes(chain.getArg(0), ((Integer) chain.getArg(1)).intValue())) {
+                sBleUnlockToasts.add(objProceed);
+            }
+        } catch (Throwable unused) {
+        }
+        return objProceed;
+    }
+
+    static /* synthetic */ Object lambda$installBleUnlockToastHide$8(XposedInterface.Chain chain) throws Throwable {
+        try {
+            if (sHideBtUnlockFlag.get()) {
+                if (sInBleUnlock.get().booleanValue()) {
+                    return null;
+                }
+                Object thisObject = chain.getThisObject();
+                if (sBleUnlockToasts.remove(thisObject)) {
+                    return null;
+                }
+                if ((thisObject instanceof Toast) && isBluetoothUnlockText(toastText(((Toast) thisObject).getView()))) {
+                    return null;
+                }
+            }
+        } catch (Throwable unused) {
+        }
+        return chain.proceed();
+    }
+
+    private static boolean isBleUnlockRes(Object obj, int i) {
+        try {
+            if (!(obj instanceof Context)) {
+                return false;
+            }
+            Resources resources = ((Context) obj).getResources();
+            if (Constants.BLE_UNLOCK_RES_ENTRY.equals(resources.getResourceEntryName(i))) {
                 return true;
             }
-            String text = String.valueOf(res.getText(resId)).toLowerCase();
-            return matchBluetoothUnlock(text);
-        } catch (Throwable ignored) {
+            return matchBluetoothUnlock(String.valueOf(resources.getText(i)).toLowerCase());
+        } catch (Throwable unused) {
             return false;
         }
     }
 
-    /** 文案判定：同时含「蓝牙/bluetooth」与「解锁/unlock」 */
-    private static boolean isBluetoothUnlockText(CharSequence cs) {
-        if (cs == null) return false;
-        return matchBluetoothUnlock(cs.toString().toLowerCase());
+    private static boolean isBluetoothUnlockText(CharSequence charSequence) {
+        if (charSequence == null) {
+            return false;
+        }
+        return matchBluetoothUnlock(charSequence.toString().toLowerCase());
     }
 
-    private static boolean matchBluetoothUnlock(String lower) {
-        if (lower == null || lower.length() == 0) return false;
-        boolean bt = false, unlock = false;
-        for (String k : Constants.BLE_UNLOCK_TEXT_BT) {
-            if (lower.contains(k)) { bt = true; break; }
+    private static boolean matchBluetoothUnlock(String str) {
+        if (str != null && str.length() != 0) {
+            for (String str2 : Constants.BLE_UNLOCK_TEXT_BT) {
+                if (str.contains(str2)) {
+                    for (String str3 : Constants.BLE_UNLOCK_TEXT_UNLOCK) {
+                        if (str.contains(str3)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            }
         }
-        if (!bt) return false;
-        for (String k : Constants.BLE_UNLOCK_TEXT_UNLOCK) {
-            if (lower.contains(k)) { unlock = true; break; }
-        }
-        return unlock;
+        return false;
     }
 
-    /** 收集视图树内所有 TextView 文本（用于 Toast 兜底判定） */
-    private static String toastText(View v) {
+    private static String toastText(View view) {
         StringBuilder sb = new StringBuilder();
-        collectText(v, sb);
+        collectText(view, sb);
         return sb.toString();
     }
 
-    private static void collectText(View v, StringBuilder sb) {
+    private static void collectText(View view, StringBuilder sb) {
+        if (view == null) {
+            return;
+        }
         try {
-            if (v == null) return;
-            if (v instanceof TextView) sb.append(((TextView) v).getText()).append(' ');
-            if (v instanceof ViewGroup) {
-                ViewGroup g = (ViewGroup) v;
-                for (int i = 0; i < g.getChildCount(); i++) collectText(g.getChildAt(i), sb);
+            if (view instanceof TextView) {
+                sb.append(((TextView) view).getText()).append(' ');
             }
-        } catch (Throwable ignored) {
+            if (view instanceof ViewGroup) {
+                ViewGroup viewGroup = (ViewGroup) view;
+                for (int i = 0; i < viewGroup.getChildCount(); i++) {
+                    collectText(viewGroup.getChildAt(i), sb);
+                }
+            }
+        } catch (Throwable unused) {
         }
     }
 
-    /** 亮屏时静音（HyperCeiler MuteVisibleNotifications）：
-     *  屏幕已点亮时直接跳过 buzzBeepBlink → 不响铃、不震动、不亮屏闪烁。 */
-    private void installMuteScreenOnHook(ClassLoader cl) {
+    private void installMuteScreenOnHook(ClassLoader classLoader) {
         try {
-            Class<?> c = Class.forName(Constants.MUTE_ALERT_CLASS, false, cl);
-            Class<?> entryCl = Class.forName(Constants.NOTIF_ENTRY_CLASS, false, cl);
-            Method m = c.getDeclaredMethod(Constants.MUTE_ALERT_METHOD, entryCl);
-            m.setAccessible(true);
-            hook(m)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("mute-screen-on")
-                    .intercept(chain -> {
-                        if (!isScreenInteractive(chain.getThisObject())) {
-                            return chain.proceed();
-                        }
-                        // 全静音：亮屏时直接跳过 buzzBeepBlink（不响铃/不震动/不闪烁）
-                        if (sMuteScreenOnFlag.get()) {
-                            return null;
-                        }
-                        // 仅取消震动：临时置空通知的 vibrate 字段与 DEFAULT_VIBRATE 位，调用后还原
-                        if (sCancelVibrateScreenOnFlag.get()) {
-                            Object entry = chain.getArg(0);
-                            Object notif = entry == null ? null : entryNotification(entry);
-                            Field vf = notif == null ? null : findField(notif.getClass(), "vibrate");
-                            Field df = notif == null ? null : findField(notif.getClass(), "defaults");
-                            Object oldVibrate = null;
-                            boolean stripped = false;
-                            int oldDefaults = 0;
-                            boolean defaultVibrate = false;
-                            try {
-                                if (vf != null) {
-                                    oldVibrate = vf.get(notif);
-                                    if (oldVibrate != null) {
-                                        vf.set(notif, null);
-                                        stripped = true;
-                                    }
-                                }
-                                if (df != null) {
-                                    oldDefaults = df.getInt(notif);
-                                    if ((oldDefaults & android.app.Notification.DEFAULT_VIBRATE) != 0) {
-                                        df.setInt(notif, oldDefaults & ~android.app.Notification.DEFAULT_VIBRATE);
-                                        defaultVibrate = true;
-                                    }
-                                }
-                            } catch (Throwable ignored) {
-                            }
-                            try {
-                                return chain.proceed();
-                            } finally {
+            Method declaredMethod = Class.forName(Constants.MUTE_ALERT_CLASS, false, classLoader).getDeclaredMethod(Constants.MUTE_ALERT_METHOD, Class.forName(Constants.NOTIF_ENTRY_CLASS, false, classLoader));
+            declaredMethod.setAccessible(true);
+            hook(declaredMethod).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("mute-screen-on").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda17
+                public final Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    return MainHook.lambda$installMuteScreenOnHook$9(chain);
+                }
+            });
+            LogUtil.logAlways("[亮屏静音] 已挂钩 com.android.systemui.statusbar.notification.policy.MiuiAlertManager.buzzBeepBlink");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[亮屏静音] 挂载失败: " + th);
+        }
+    }
+
+    /* JADX WARN: Code duplicated, block: B:35:0x006d  */
+    /* JADX WARN: Code duplicated, block: B:38:0x0073  */
+    /* JADX WARN: Code duplicated, block: B:41:0x0078  */
+    /* JADX WARN: Code duplicated, block: B:64:0x0065 A[EXC_TOP_SPLITTER, SYNTHETIC] */
+    static /* synthetic */ Object lambda$installMuteScreenOnHook$9(XposedInterface.Chain chain) throws Throwable {
+        boolean z;
+        int i;
+        if (!isScreenInteractive(chain.getThisObject())) {
+            return chain.proceed();
+        }
+        Object obj = null;
+        if (sMuteScreenOnFlag.get()) {
+            return null;
+        }
+        if (sCancelVibrateScreenOnFlag.get()) {
+            int i2 = 0;
+            Object arg = chain.getArg(0);
+            Object objEntryNotification = arg == null ? null : entryNotification(arg);
+            Field fieldFindField = objEntryNotification == null ? null : findField(objEntryNotification.getClass(), "vibrate");
+            Field fieldFindField2 = objEntryNotification == null ? null : findField(objEntryNotification.getClass(), "defaults");
+            int i3 = 1;
+            if (fieldFindField != null) {
+                try {
+                    Object obj2 = fieldFindField.get(objEntryNotification);
+                    if (obj2 != null) {
+                        try {
+                            fieldFindField.set(objEntryNotification, null);
+                            obj = obj2;
+                            z = true;
+                            if (fieldFindField2 != null) {
                                 try {
-                                    if (stripped && vf != null) vf.set(notif, oldVibrate);
-                                    if (defaultVibrate && df != null) df.setInt(notif, oldDefaults);
-                                } catch (Throwable ignored) {
+                                    i = fieldFindField2.getInt(objEntryNotification);
+                                    if ((i & 2) != 0) {
+                                        fieldFindField2.setInt(objEntryNotification, i & (-3));
+                                    } else {
+                                        i3 = 0;
+                                    }
+                                    i2 = i;
+                                } catch (Throwable unused) {
+                                    i = 0;
                                 }
+                            } else {
+                                i3 = 0;
                             }
+                            i = i2;
+                            i2 = i3;
+                        } catch (Throwable unused2) {
+                            i = 0;
+                            obj = obj2;
+                            z = false;
                         }
-                        return chain.proceed();
-                    });
-            LogUtil.logAlways("[亮屏静音] 已挂钩 " + Constants.MUTE_ALERT_CLASS + ".buzzBeepBlink");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[亮屏静音] 挂载失败: " + t);
+                    } else {
+                        obj = obj2;
+                        z = false;
+                        if (fieldFindField2 != null) {
+                            i = fieldFindField2.getInt(objEntryNotification);
+                            if ((i & 2) != 0) {
+                                fieldFindField2.setInt(objEntryNotification, i & (-3));
+                            } else {
+                                i3 = 0;
+                            }
+                            i2 = i;
+                        } else {
+                            i3 = 0;
+                        }
+                        i = i2;
+                        i2 = i3;
+                    }
+                } catch (Throwable unused3) {
+                    z = false;
+                    i = 0;
+                }
+            } else {
+                z = false;
+                if (fieldFindField2 != null) {
+                    i = fieldFindField2.getInt(objEntryNotification);
+                    if ((i & 2) != 0) {
+                        fieldFindField2.setInt(objEntryNotification, i & (-3));
+                    } else {
+                        i3 = 0;
+                    }
+                    i2 = i;
+                } else {
+                    i3 = 0;
+                }
+                i = i2;
+                i2 = i3;
+            }
+            try {
+                Object objProceed = chain.proceed();
+                if (z && fieldFindField != null) {
+                    try {
+                        fieldFindField.set(objEntryNotification, obj);
+                        if (i2 != 0) {
+                        }
+                    } catch (Throwable unused4) {
+                    }
+                } else if (i2 != 0 && fieldFindField2 != null) {
+                }
+                return objProceed;
+            } finally {
+                if (z && fieldFindField != null) {
+                    try {
+                        fieldFindField.set(objEntryNotification, obj);
+                        if (i2 != 0) {
+                            fieldFindField2.setInt(objEntryNotification, i);
+                        }
+                    } catch (Throwable unused5) {
+                    }
+                } else if (i2 != 0 && fieldFindField2 != null) {
+                    fieldFindField2.setInt(objEntryNotification, i);
+                }
+            }
         }
+        return chain.proceed();
     }
 
-    /** 亮屏判定：PowerManager.isInteractive()。拿不到 Context 时按「亮屏」处理（保守静音）。 */
-    private static boolean isScreenInteractive(Object thisObj) {
+    private static boolean isScreenInteractive(Object obj) {
+        PowerManager powerManager;
         try {
-            Field f = findField(thisObj.getClass(), Constants.MUTE_ALERT_CONTEXT_FIELD);
-            if (f == null) return true;
-            Object ctx = f.get(thisObj);
-            if (ctx instanceof Context) {
-                PowerManager pm = (PowerManager) ((Context) ctx).getSystemService(Context.POWER_SERVICE);
-                if (pm != null) return pm.isInteractive();
+            Field fieldFindField = findField(obj.getClass(), Constants.MUTE_ALERT_CONTEXT_FIELD);
+            if (fieldFindField == null) {
+                return true;
             }
-        } catch (Throwable ignored) {
+            Object obj2 = fieldFindField.get(obj);
+            if ((obj2 instanceof Context) && (powerManager = (PowerManager) ((Context) obj2).getSystemService("power")) != null) {
+                return powerManager.isInteractive();
+            }
+        } catch (Throwable unused) {
         }
         return true;
     }
 
-    /** 重定向通知设置（HyperCeiler RedirectToNotificationChannelSetting）：
-     *  拦截 startAppNotificationSettings(Context,pkg,channel,uid,...) → 直接打开该
-     *  渠道的通知设置页，跳过应用级通知设置页。 */
-    private void installRedirectNotifSettingsHook(ClassLoader cl) {
+    private void installAllowManageAllHook(ClassLoader classLoader) {
         try {
-            Class<?> helper = Class.forName(Constants.NOTIF_SETTINGS_HELPER_CLASS, false, cl);
-            Method m = helper.getDeclaredMethod(Constants.NOTIF_SETTINGS_START_METHOD,
-                    Context.class, String.class, String.class, int.class, String.class);
-            m.setAccessible(true);
-            hook(m)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("redirect-notif-settings")
-                    .intercept(chain -> {
-                        if (!sRedirectNotifSetFlag.get()) return chain.proceed();
-                        try {
-                            Object ctx0 = chain.getArg(0);
-                            String pkg = (String) chain.getArg(1);
-                            if (ctx0 instanceof Context && pkg != null) {
-                                Intent i = new Intent(
-                                        Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS);
-                                i.putExtra(Settings.EXTRA_APP_PACKAGE, pkg);
-                                Object ch = chain.getArg(2);
-                                if (ch instanceof String) {
-                                    i.putExtra(Settings.EXTRA_CHANNEL_ID, (String) ch);
-                                }
-                                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                                ((Context) ctx0).startActivity(i);
-                                return null;
-                            }
-                        } catch (Throwable ignored) {
-                        }
-                        return chain.proceed();
-                    });
-            LogUtil.logAlways("[通知设置重定向] 已挂钩 "
-                    + Constants.NOTIF_SETTINGS_HELPER_CLASS + ".startAppNotificationSettings");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[通知设置重定向] 挂载失败: " + t);
-        }
-    }
-
-    /** 允许管理所有通知（HyperCeiler AllowManageAllNotifications）：
-     *  NotificationChannel 一律视为可屏蔽（isBlockable → true），并把 blockable 字段写 true。 */
-    private void installAllowManageAllHook(ClassLoader cl) {
-        try {
-            Class<?> ch = Class.forName(Constants.NOTIF_CHANNEL_CLASS, false, cl);
-            Method isB = ch.getDeclaredMethod(Constants.CHANNEL_IS_BLOCKABLE_METHOD);
-            isB.setAccessible(true);
-            hook(isB)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("allow-manage-all-is")
-                    .intercept(chain ->
-                            sAllowManageAllFlag.get() ? Boolean.TRUE : chain.proceed());
-            Method setB = ch.getDeclaredMethod(Constants.CHANNEL_SET_BLOCKABLE_METHOD,
-                    boolean.class);
-            setB.setAccessible(true);
-            hook(setB)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("allow-manage-all-set")
-                    .intercept(chain -> {
-                        Object ret = chain.proceed();
-                        try {
-                            if (sAllowManageAllFlag.get()) {
-                                Field f = ch.getDeclaredField(Constants.CHANNEL_BLOCKABLE_FIELD);
-                                f.setAccessible(true);
-                                f.setBoolean(chain.getThisObject(), true);
-                            }
-                        } catch (Throwable ignored) {
-                        }
-                        return ret;
-                    });
-            LogUtil.logAlways("[允许管理所有通知] 已挂钩 NotificationChannel.is/setBlockable");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[允许管理所有通知] 挂载失败: " + t);
-        }
-    }
-
-    /** 移除焦点通知白名单（HyperCeiler UnlockFocus）：
-     *  NotificationSettingsManager.canShowFocusState / canShowFocusStateApp
-     *  (Context,String)I 一律返回 1 → 任意应用（含小米健康、小米服务框架等
-     *  原本不在白名单内的）都能显示为焦点通知。 */
-    private void installUnlockAllFocusHook(ClassLoader cl) {
-        try {
-            Class<?> c = Class.forName(Constants.FOCUS_MANAGER_CLASS, false, cl);
-            int n = 0;
-            for (String mname : Constants.FOCUS_CAN_SHOW_METHODS) {
-                try {
-                    Method m = c.getDeclaredMethod(mname, Context.class, String.class);
-                    m.setAccessible(true);
-                    hook(m)
-                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                            .setId("unlock-all-focus-" + mname)
-                            .intercept(chain -> sUnlockAllFocusFlag.get()
-                                    ? Integer.valueOf(1) : chain.proceed());
-                    n++;
-                } catch (Throwable ignored) {
+            final Class<?> cls = Class.forName(Constants.NOTIF_CHANNEL_CLASS, false, classLoader);
+            Method declaredMethod = cls.getDeclaredMethod(Constants.CHANNEL_IS_BLOCKABLE_METHOD, new Class[0]);
+            declaredMethod.setAccessible(true);
+            hook(declaredMethod).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("allow-manage-all-is").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda8
+                public final Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    return MainHook.lambda$installAllowManageAllHook$10(chain);
                 }
+            });
+            Method declaredMethod2 = cls.getDeclaredMethod(Constants.CHANNEL_SET_BLOCKABLE_METHOD, Boolean.TYPE);
+            declaredMethod2.setAccessible(true);
+            hook(declaredMethod2).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("allow-manage-all-set").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda9
+                public final Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    return MainHook.lambda$installAllowManageAllHook$11(cls, chain);
+                }
+            });
+            LogUtil.logAlways("[允许管理所有通知] 已挂钩 NotificationChannel.is/setBlockable");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[允许管理所有通知] 挂载失败: " + th);
+        }
+    }
+
+    static /* synthetic */ Object lambda$installAllowManageAllHook$10(XposedInterface.Chain chain) throws Throwable {
+        return sAllowManageAllFlag.get() ? Boolean.TRUE : chain.proceed();
+    }
+
+    static /* synthetic */ Object lambda$installAllowManageAllHook$11(Class cls, XposedInterface.Chain chain) throws Throwable {
+        Object objProceed = chain.proceed();
+        try {
+            if (sAllowManageAllFlag.get()) {
+                Field declaredField = cls.getDeclaredField(Constants.CHANNEL_BLOCKABLE_FIELD);
+                declaredField.setAccessible(true);
+                declaredField.setBoolean(chain.getThisObject(), true);
             }
-            LogUtil.logAlways("[焦点通知白名单] 已挂钩 canShowFocusState/App ×" + n);
-        } catch (Throwable t) {
-            LogUtil.logAlways("[焦点通知白名单] 挂载失败: " + t);
+        } catch (Throwable unused) {
+        }
+        return objProceed;
+    }
+
+    private void installFoldNotifHook(ClassLoader classLoader) {
+        try {
+            Method declaredMethod = Class.forName(Constants.FOLD_NOTIF_CONTROLLER_CLASS, false, classLoader).getDeclaredMethod(Constants.FOLD_SEND_METHOD, UserHandle.class, Class.forName(Constants.FOLD_NOTIF_REASON_CLASS, false, classLoader));
+            declaredMethod.setAccessible(true);
+            hook(declaredMethod).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("no-fold-history").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda16
+                public final Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    return MainHook.lambda$installFoldNotifHook$12(chain);
+                }
+            });
+            LogUtil.logAlways("[禁止折叠历史] 已挂钩 com.android.systemui.statusbar.notification.history.FoldNotifControllerImpl.sendFoldNotification");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[禁止折叠历史] 挂载失败: " + th);
         }
     }
 
-    /** 禁止折叠历史通知：跳过 sendFoldNotification(UserHandle, CreateFoldNotifReason)，
-     *  历史/静音通知不再被收纳成一条「折叠」通知。 */
-    private void installFoldNotifHook(ClassLoader cl) {
-        try {
-            Class<?> c = Class.forName(Constants.FOLD_NOTIF_CONTROLLER_CLASS, false, cl);
-            Class<?> reason = Class.forName(Constants.FOLD_NOTIF_REASON_CLASS, false, cl);
-            Method m = c.getDeclaredMethod(Constants.FOLD_SEND_METHOD, UserHandle.class, reason);
-            m.setAccessible(true);
-            hook(m)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("no-fold-history")
-                    .intercept(chain -> sNoFoldHistoryFlag.get() ? null : chain.proceed());
-            LogUtil.logAlways("[禁止折叠历史] 已挂钩 "
-                    + Constants.FOLD_NOTIF_CONTROLLER_CLASS + ".sendFoldNotification");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[禁止折叠历史] 挂载失败: " + t);
+    static /* synthetic */ Object lambda$installFoldNotifHook$12(XposedInterface.Chain chain) throws Throwable {
+        if (sNoFoldHistoryFlag.get()) {
+            return null;
         }
+        return chain.proceed();
     }
 
-    /** 禁止收纳通知为组：分组摘要判定一律为 false（同应用多条通知不再折叠成一组）。
-     *  刻意不 hook getGroupSummary（返回 null 有 NPE 风险），只改布尔判定，安全。 */
-    private void installNoGroupHook(ClassLoader cl) {
-        try {
-            Class<?> g = Class.forName(Constants.GROUP_MEMBER_MANAGER_CLASS, false, cl);
-            Class<?> entryCl = Class.forName(Constants.NOTIF_ENTRY_CLASS, false, cl);
-            Method is = g.getDeclaredMethod(Constants.GROUP_IS_SUMMARY_METHOD, entryCl);
-            is.setAccessible(true);
-            hook(is)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("no-group-is-summary")
-                    .intercept(chain ->
-                            sNoGroupFlag.get() ? Boolean.FALSE : chain.proceed());
-            LogUtil.logAlways("[禁止通知分组] 已挂钩 "
-                    + Constants.GROUP_MEMBER_MANAGER_CLASS + ".isGroupSummary");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[禁止通知分组] 挂载失败: " + t);
-        }
-        try {
-            Class<?> rowCl = Class.forName(Constants.EXPANDABLE_NOTIF_ROW_CLASS, false, cl);
-            Method m = rowCl.getDeclaredMethod(Constants.ROW_IS_CHILD_METHOD);
-            m.setAccessible(true);
-            hook(m)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("no-group-is-child")
-                    .intercept(chain ->
-                            sNoGroupFlag.get() ? Boolean.FALSE : chain.proceed());
-            LogUtil.logAlways("[禁止通知分组] 已挂钩 ExpandableNotificationRow.isChildInGroup");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[禁止通知分组] isChildInGroup 未命中（可忽略）: " + t);
-        }
+    private void installQsEditHideHook(ClassLoader classLoader) {
+        tryHookQsEditIn(classLoader);
     }
 
-    // ============================================================
-    // 隐藏控制中心「编辑」按钮（v3.7）
-    //
-    // 需求：隐藏下拉控制中心底栏的「编辑」按钮，但点击仍能进入磁贴编辑
-    // （保留实际功能，参考 HyperCeiler 思路但适配 HyperOS 4 的 Compose footer）。
-    //
-    // 实现：HyperOS 4 控制中心底栏是 Compose（FooterActionsKt.AnimatedFooterTextButton
-    //  渲染每个 footer 文本按钮，含「编辑」）。每个按钮自带 onClick，故只需对
-    //  「编辑」按钮的 Modifier 追加 alpha(0f)——alpha 只影响绘制、不改指针命中区域，
-    //  视觉透明但点击区域与 onClick 不变 → 「隐藏但保留功能」。其余文本按钮
-    //  （如「设置」）不受影响。全程 PROTECTIVE + 全 catch，类名/字段不符即放行原逻辑。
-    // ============================================================
-
-    /**
-     * 隐藏控制中心「编辑」按钮（v3.7）。
-     * 入口：在 onPackageLoaded 用宿主 cl 先试一次（少数 ROM 插件类并入宿主 dex），
-     * 真正的目标在 MiuiSystemUIPlugin 插件 ClassLoader，由 installGlassHooks 的
-     * PluginFactory.createClassLoader 回调统一补挂（见 tryHookQsEditIn）。
-     */
-    private void installQsEditHideHook(ClassLoader cl) {
-        tryHookQsEditIn(cl); // 宿主 loader 试探（不存在则静默）
-    }
-
-    /**
-     * 用指定 ClassLoader 找 EditButtonController 并挂 onBindViewHolder（幂等，成功一次即止）。
-     * 该控制器位于插件 APK（miui.systemui.controlcenter 包）的独立 ClassLoader，
-     * 故 loader 参数来自 PluginFactory.createClassLoader 回调。
-     * onBindViewHolder() 内已把编辑点击设到 binding.touchContainer（LinearLayout），
-     * 故执行原逻辑后把该 View setAlpha(0f) —— alpha 只影响绘制、不改 VISIBILITY 标志位，
-     * View 仍是 VISIBLE、仍接收触摸事件，因此「完全透明但点击命中保留」，实现「隐藏但
-     * 保留编辑功能」。注意：必须用 alpha(0f) 而非 INVISIBLE —— Android 的
-     * ViewGroup.canViewReceivePointerEvents 要求 VISIBILITY_MASK==VISIBLE 才分发触摸，
-     * INVISIBLE/GONE 都会让按钮收不到点击（v3.7 初版踩坑：按钮隐了但点不动）。
-     */
-    private void tryHookQsEditIn(ClassLoader loader) {
-        if (loader == null) return;
+    /* JADX INFO: Access modifiers changed from: private */
+    public void tryHookQsEditIn(ClassLoader classLoader) {
+        if (classLoader == null) {
+            return;
+        }
+        // 插件 loader 出现时，补挂三方主题玻璃的插件侧 guard（MiBlurCompat / 主题控制器 / ThemeUtils）
+        installThirdPartyThemeGlassHooks(classLoader);
         try {
-            final Class<?> c = Class.forName(Constants.QS_EDIT_CONTROLLER_CLASS, false, loader);
-            if (c == null) return;
-            synchronized (qsEditHooked) {
-                if (qsEditHooked.contains(c)) return; // 幂等，避免插件 loader 复用重复打日志
-                qsEditHooked.add(c);
+            final Class<?> cls = Class.forName(Constants.QS_EDIT_CONTROLLER_CLASS, false, classLoader);
+            if (cls == null) {
+                return;
             }
-            final Method onBind = c.getDeclaredMethod("onBindViewHolder"); // ()V，无参
-            onBind.setAccessible(true);
-            hook(onBind)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("qs-edit-hide")
-                    .intercept(chain -> {
-                        chain.proceed(); // 先完成绑定 + 挂好点击监听
-                        if (!sQsEditHideFlag.get()) return null;
-                        try {
-                            Object controller = chain.getThisObject();
-                            // getEditButton() 是 private final，内部返回 binding.touchContainer（LinearLayout，点击监听挂这里）
-                            Method getEditButton = c.getDeclaredMethod("getEditButton");
-                            getEditButton.setAccessible(true);
-                            View v = (View) getEditButton.invoke(controller);
-                            if (v != null && v.getAlpha() != 0f) {
-                                // alpha(0f)：透明但不改 VISIBILITY，仍 VISIBLE → 仍收触摸，点击命中保留
-                                v.setAlpha(0f);
-                                LogUtil.logAlwaysOnce("qs-edit-hide",
-                                        "[控制中心编辑] 已对「编辑」按钮设 alpha(0f)（完全透明但保留点击）");
-                            }
-                        } catch (Throwable t) {
-                            LogUtil.logAlways("[控制中心编辑] 命中处理异常: " + t);
-                        }
-                        return null;
-                    });
-            LogUtil.logAlways("[控制中心编辑] 已挂钩 EditButtonController.onBindViewHolder（插件 loader）");
-        } catch (Throwable t) {
-            // ClassNotFoundException 属预期（宿主 loader / 其他插件 loader 不含此类），不刷误报；
-            // 仅记录真正的异常，避免对其他插件 pop 出「失败」字样。
-            if (!(t instanceof ClassNotFoundException)) {
-                LogUtil.logAlways("[控制中心编辑] 挂钩失败: " + t);
+            Set<Class<?>> set = qsEditHooked;
+            synchronized (set) {
+                if (set.contains(cls)) {
+                    return;
+                }
+                set.add(cls);
+                Method declaredMethod = cls.getDeclaredMethod("onBindViewHolder", new Class[0]);
+                declaredMethod.setAccessible(true);
+                hook(declaredMethod).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("qs-edit-hide").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda6
+                    public final Object intercept(XposedInterface.Chain chain) throws Throwable {
+                        return MainHook.lambda$tryHookQsEditIn$13(cls, chain);
+                    }
+                });
+                LogUtil.logAlways("[控制中心编辑] 已挂钩 EditButtonController.onBindViewHolder（插件 loader）");
+            }
+        } catch (Throwable th) {
+            if (th instanceof ClassNotFoundException) {
+                return;
+            }
+            LogUtil.logAlways("[控制中心编辑] 挂钩失败: " + th);
+        }
+    }
+
+    static /* synthetic */ Object lambda$tryHookQsEditIn$13(Class cls, XposedInterface.Chain chain) throws Throwable {
+        chain.proceed();
+        if (!sQsEditHideFlag.get()) {
+            return null;
+        }
+        try {
+            Object thisObject = chain.getThisObject();
+            Method declaredMethod = cls.getDeclaredMethod("getEditButton", new Class[0]);
+            declaredMethod.setAccessible(true);
+            View view = (View) declaredMethod.invoke(thisObject, new Object[0]);
+            if (view != null && view.getAlpha() != 0.0f) {
+                view.setAlpha(0.0f);
+                LogUtil.logAlwaysOnce("qs-edit-hide", "[控制中心编辑] 已对「编辑」按钮设 alpha(0f)（完全透明但保留点击）");
+            }
+        } catch (Throwable th) {
+            LogUtil.logAlways("[控制中心编辑] 命中处理异常: " + th);
+        }
+        return null;
+    }
+
+    /* JADX INFO: Access modifiers changed from: private */
+    /* JADX INFO: renamed from: applyPinGlass, reason: merged with bridge method [inline-methods] */
+    public void lambda$installPinGlassHook$0(View view, final ClassLoader classLoader) {
+        try {
+            ArrayList<View> arrayList = new ArrayList<>(Constants.PIN_KEY_IDS.length);
+            collectPinKeys(view, arrayList);
+            for (final View view2 : arrayList) {
+                view2.post(new Runnable() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda11
+                    @Override // java.lang.Runnable
+                    public final void run() {
+                        MainHook.this.lambda$applyPinGlass$14(view2, classLoader);
+                    }
+                });
+            }
+            LogUtil.logAlways("[密码玻璃] 数字键匹配 " + arrayList.size() + "/" + Constants.PIN_KEY_IDS.length);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[密码玻璃] 应用失败: " + th);
+        }
+    }
+
+    private void collectPinKeys(View view, List<View> list) {
+        String strResName = resName(view);
+        if (strResName != null && Arrays.asList(Constants.PIN_KEY_IDS).contains(strResName)) {
+            list.add(view);
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup viewGroup = (ViewGroup) view;
+            for (int i = 0; i < viewGroup.getChildCount(); i++) {
+                collectPinKeys(viewGroup.getChildAt(i), list);
             }
         }
     }
 
-    /** 遍历数字键并逐个应用材质（post 到布局完成后再量尺寸） */
-    private void applyPinGlass(View root, ClassLoader cl) {
+    private String resName(View view) {
         try {
-            List<View> keys = new ArrayList<>(Constants.PIN_KEY_IDS.length);
-            collectPinKeys(root, keys);
-            for (View key : keys) {
-                key.post(() -> applyPinKeyMaterial(key, cl));
+            int id = view.getId();
+            if (id == -1 || id == -1) {
+                return null;
             }
-            LogUtil.logAlways("[密码玻璃] 数字键匹配 " + keys.size()
-                    + "/" + Constants.PIN_KEY_IDS.length);
-        } catch (Throwable t) {
-            LogUtil.logAlways("[密码玻璃] 应用失败: " + t);
-        }
-    }
-
-    private void collectPinKeys(View v, List<View> out) {
-        String name = resName(v);
-        if (name != null && Arrays.asList(Constants.PIN_KEY_IDS).contains(name)) out.add(v);
-        if (v instanceof ViewGroup) {
-            ViewGroup g = (ViewGroup) v;
-            for (int i = 0; i < g.getChildCount(); i++) collectPinKeys(g.getChildAt(i), out);
-        }
-    }
-
-    private String resName(View v) {
-        try {
-            int id = v.getId();
-            return (id != View.NO_ID && id != -1) ? v.getResources().getResourceEntryName(id) : null;
-        } catch (Throwable t) {
+            return view.getResources().getResourceEntryName(id);
+        } catch (Throwable unused) {
             return null;
         }
     }
 
-    /** 给单个数字键插入圆形柔光材质层 */
-    private void applyPinKeyMaterial(View key, ClassLoader cl) {
+    /* JADX INFO: Access modifiers changed from: private */
+    /* JADX INFO: renamed from: applyPinKeyMaterial, reason: merged with bridge method [inline-methods] */
+    public void lambda$applyPinGlass$14(final View view, ClassLoader classLoader) {
         try {
-            if (!(key instanceof ViewGroup)) return;
-            ViewGroup keyGroup = (ViewGroup) key;
-            int diameter = Math.min(key.getWidth(), key.getHeight());
-            if (diameter <= 0) return;
-            // 幂等：视图重建时先移除旧材质层
-            for (int i = keyGroup.getChildCount() - 1; i >= 0; i--) {
-                if (Constants.PIN_MATERIAL_TAG.equals(keyGroup.getChildAt(i).getTag())) {
-                    keyGroup.removeViewAt(i);
+            if (view instanceof ViewGroup) {
+                ViewGroup viewGroup = (ViewGroup) view;
+                int iMin = Math.min(view.getWidth(), view.getHeight());
+                if (iMin <= 0) {
+                    return;
                 }
+                for (int childCount = viewGroup.getChildCount() - 1; childCount >= 0; childCount--) {
+                    if (Constants.PIN_MATERIAL_TAG.equals(viewGroup.getChildAt(childCount).getTag())) {
+                        viewGroup.removeViewAt(childCount);
+                    }
+                }
+                final ImageView imageView = new ImageView(view.getContext());
+                imageView.setTag(Constants.PIN_MATERIAL_TAG);
+                imageView.setClickable(false);
+                imageView.setFocusable(false);
+                imageView.setImportantForAccessibility(2);
+                GradientDrawable gradientDrawable = new GradientDrawable();
+                gradientDrawable.setColor(Color.argb(1, 255, 255, 255));
+                imageView.setImageDrawable(gradientDrawable);
+                GradientDrawable gradientDrawable2 = new GradientDrawable();
+                gradientDrawable2.setShape(1);
+                gradientDrawable2.setColor(-1);
+                imageView.setForeground(new RippleDrawable(ColorStateList.valueOf(1090519039), null, gradientDrawable2));
+                imageView.setClipToOutline(true);
+                imageView.setOutlineProvider(new ViewOutlineProvider() { // from class: com.abel.hyperosglass.MainHook.4
+                    @Override // android.view.ViewOutlineProvider
+                    public void getOutline(View view2, Outline outline) {
+                        outline.setOval(0, 0, view2.getWidth(), view2.getHeight());
+                    }
+                });
+                viewGroup.addView(imageView, 0, new ViewGroup.LayoutParams(iMin, iMin));
+                view.setBackground(null);
+                placePinMaterial(view, imageView);
+                view.addOnLayoutChangeListener(new View.OnLayoutChangeListener() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda1
+                    @Override // android.view.View.OnLayoutChangeListener
+                    public final void onLayoutChange(View view2, int i, int i2, int i3, int i4, int i5, int i6, int i7, int i8) {
+                        MainHook.this.lambda$applyPinKeyMaterial$15(view, imageView, view2, i, i2, i3, i4, i5, i6, i7, i8);
+                    }
+                });
+                view.setOnTouchListener(new View.OnTouchListener() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda2
+                    @Override // android.view.View.OnTouchListener
+                    public final boolean onTouch(View view2, MotionEvent motionEvent) {
+                        return MainHook.lambda$applyPinKeyMaterial$16(imageView, view2, motionEvent);
+                    }
+                });
+                configurePinLabel(viewGroup);
+                applyPinBackdropMaterial(imageView, 14, 80, -1);
+                applyPinGlassMaterial(imageView, classLoader, 36, 0.14f);
             }
-            final ImageView material = new ImageView(key.getContext());
-            material.setTag(Constants.PIN_MATERIAL_TAG);
-            material.setClickable(false);
-            material.setFocusable(false);
-            material.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
-            // 背景合成器要求视图先有 drawable 内容才会注册
-            GradientDrawable tint = new GradientDrawable();
-            tint.setColor(Color.argb(1, 255, 255, 255));
-            material.setImageDrawable(tint);
-            GradientDrawable mask = new GradientDrawable();
-            mask.setShape(GradientDrawable.OVAL);
-            mask.setColor(Color.WHITE);
-            material.setForeground(new RippleDrawable(
-                    ColorStateList.valueOf(0x40FFFFFF), null, mask));
-            material.setClipToOutline(true);
-            material.setOutlineProvider(new android.view.ViewOutlineProvider() {
-                @Override
-                public void getOutline(View target, Outline outline) {
-                    outline.setOval(0, 0, target.getWidth(), target.getHeight());
-                }
-            });
-            keyGroup.addView(material, 0, new ViewGroup.LayoutParams(diameter, diameter));
-            // NumPadKey 原生背景自带按压放大动画，移除后只保留材质层的圆形水波纹
-            key.setBackground(null);
-            placePinMaterial(key, material);
-            key.addOnLayoutChangeListener(
-                    (v, l, t, r, b, ol, ot, or, ob) -> placePinMaterial(key, material));
-            key.setOnTouchListener((v, event) -> {
-                material.setPressed(event.getActionMasked() == MotionEvent.ACTION_DOWN
-                        || event.getActionMasked() == MotionEvent.ACTION_MOVE);
-                return false;
-            });
-            configurePinLabel(keyGroup);
-            applyPinBackdropMaterial(material, Constants.PIN_BACKDROP_OPACITY,
-                    Constants.PIN_BACKDROP_BLUR_RADIUS, Constants.PIN_BACKDROP_COLOR);
-            applyPinGlassMaterial(material, cl, Constants.PIN_DEFAULT_BLUR_RADIUS,
-                    Constants.PIN_DEFAULT_LUMINANCE);
-        } catch (Throwable t) {
-            LogUtil.logAlways("[密码玻璃] 单键材质失败: " + t);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[密码玻璃] 单键材质失败: " + th);
         }
     }
 
-    private void placePinMaterial(View key, View material) {
-        int size = Math.min(key.getWidth(), key.getHeight());
-        if (size <= 0) return;
-        ViewGroup.LayoutParams lp = material.getLayoutParams();
-        lp.width = size;
-        lp.height = size;
-        material.setLayoutParams(lp);
-        int left = (key.getWidth() - size) / 2;
-        int top = (key.getHeight() - size) / 2;
-        material.layout(left, top, left + size, top + size);
-        material.invalidateOutline();
+    /* JADX INFO: Access modifiers changed from: private */
+    public /* synthetic */ void lambda$applyPinKeyMaterial$15(View view, ImageView imageView, View view2, int i, int i2, int i3, int i4, int i5, int i6, int i7, int i8) {
+        placePinMaterial(view, imageView);
     }
 
-    /** 数字键字母副标：缩小一点，避免溢出圆形材质 */
-    private void configurePinLabel(View v) {
-        if (v instanceof TextView && Constants.PIN_LABEL_ID.equals(resName(v))) {
-            TextView tv = (TextView) v;
-            tv.setEllipsize(null);
-            tv.setSingleLine(false);
-            tv.setMaxLines(1);
-            tv.setHorizontallyScrolling(false);
-            tv.setTextScaleX(0.86f);
-            tv.setIncludeFontPadding(false);
+    static /* synthetic */ boolean lambda$applyPinKeyMaterial$16(ImageView imageView, View view, MotionEvent motionEvent) {
+        imageView.setPressed(motionEvent.getActionMasked() == 0 || motionEvent.getActionMasked() == 2);
+        return false;
+    }
+
+    private void placePinMaterial(View view, View view2) {
+        int iMin = Math.min(view.getWidth(), view.getHeight());
+        if (iMin <= 0) {
+            return;
         }
-        if (v instanceof ViewGroup) {
-            ViewGroup g = (ViewGroup) v;
-            for (int i = 0; i < g.getChildCount(); i++) configurePinLabel(g.getChildAt(i));
+        ViewGroup.LayoutParams layoutParams = view2.getLayoutParams();
+        layoutParams.width = iMin;
+        layoutParams.height = iMin;
+        view2.setLayoutParams(layoutParams);
+        int width = (view.getWidth() - iMin) / 2;
+        int height = (view.getHeight() - iMin) / 2;
+        view2.layout(width, height, width + iMin, iMin + height);
+        view2.invalidateOutline();
+    }
+
+    private void configurePinLabel(View view) {
+        if ((view instanceof TextView) && Constants.PIN_LABEL_ID.equals(resName(view))) {
+            TextView textView = (TextView) view;
+            textView.setEllipsize(null);
+            textView.setSingleLine(false);
+            textView.setMaxLines(1);
+            textView.setHorizontallyScrolling(false);
+            textView.setTextScaleX(0.86f);
+            textView.setIncludeFontPadding(false);
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup viewGroup = (ViewGroup) view;
+            for (int i = 0; i < viewGroup.getChildCount(); i++) {
+                configurePinLabel(viewGroup.getChildAt(i));
+            }
         }
     }
 
-    /** 窗口背景合成器（HyperOS 平台接口，必须早于 MiGlassCompat 调用） */
-    private void applyPinBackdropMaterial(View v, int opacity, int blurRadius, int color) {
+    private void applyPinBackdropMaterial(View view, int i, int i2, int i3) {
         try {
-            Class<?> vc = View.class;
-            vc.getMethod("clearMiBackgroundBlendColor").invoke(v);
-            vc.getMethod("setPassWindowBlurEnabled", boolean.class).invoke(v, true);
-            vc.getMethod("setMiViewBlurMode", int.class).invoke(v, Constants.PIN_GLASS_BLUR_MODE);
-            vc.getMethod("setMiBackgroundBlurMode", int.class)
-                    .invoke(v, Constants.PIN_GLASS_BLUR_MODE);
-            vc.getMethod("setMiBackgroundBlurRadius", int.class).invoke(v,
-                    Math.min(blurRadius, Constants.PIN_MAX_BACKDROP_BLUR_RADIUS));
-            vc.getMethod("addMiBackgroundBlendColor", int.class, int.class).invoke(v,
-                    Color.argb(opacity * 255 / 100, Color.red(color), Color.green(color),
-                            Color.blue(color)),
-                    Constants.PIN_GLASS_BLEND_MODE);
-        } catch (Throwable t) {
-            LogUtil.logAlways("[密码玻璃] backdrop 材质失败: " + t);
+            View.class.getMethod("clearMiBackgroundBlendColor", new Class[0]).invoke(view, new Object[0]);
+            View.class.getMethod("setPassWindowBlurEnabled", Boolean.TYPE).invoke(view, true);
+            View.class.getMethod("setMiViewBlurMode", Integer.TYPE).invoke(view, 1);
+            View.class.getMethod("setMiBackgroundBlurMode", Integer.TYPE).invoke(view, 1);
+            View.class.getMethod("setMiBackgroundBlurRadius", Integer.TYPE).invoke(view, Integer.valueOf(Math.min(i2, Constants.PIN_MAX_BACKDROP_BLUR_RADIUS)));
+            View.class.getMethod("addMiBackgroundBlendColor", Integer.TYPE, Integer.TYPE).invoke(view, Integer.valueOf(Color.argb((i * 255) / 100, Color.red(i3), Color.green(i3), Color.blue(i3))), Integer.valueOf(Constants.PIN_GLASS_BLEND_MODE));
+        } catch (Throwable th) {
+            LogUtil.logAlways("[密码玻璃] backdrop 材质失败: " + th);
         }
     }
 
-    /** HyperOS 4 柔光玻璃：MiGlassCompat 三件套 */
-    private void applyPinGlassMaterial(View v, ClassLoader cl, int blurRadius, float luminance) {
+    private void applyPinGlassMaterial(View view, ClassLoader classLoader, int i, float f) {
         try {
-            Class<?> glass = Class.forName(Constants.MI_GLASS_COMPAT_CLASS, false, cl);
-            int small = Math.max(0, Math.min(blurRadius, Constants.PIN_MAX_BLUR_RADIUS));
-            float[] params = Constants.PIN_GLASS_PARAMS.clone();
-            params[Constants.PIN_LUMINANCE_INDEX] =
-                    Math.max(0f, Math.min(luminance, Constants.PIN_MAX_LUMINANCE));
-            glass.getMethod("setMiGlassBlurRadius", View.class, int.class, int.class)
-                    .invoke(null, v, small,
-                            Math.min(small * 2, Constants.PIN_MAX_LARGE_BLUR_RADIUS));
-            glass.getMethod("setMiViewMaterialTypeCompat", int.class, View.class)
-                    .invoke(null, Constants.PIN_GLASS_MATERIAL_TYPE, v);
-            glass.getMethod("setMiGlassCompat", View.class, float[].class)
-                    .invoke(null, v, params);
-        } catch (Throwable t) {
-            LogUtil.logAlways("[密码玻璃] 柔光材质失败: " + t);
+            Class<?> cls = Class.forName(Constants.MI_GLASS_COMPAT_CLASS, false, classLoader);
+            int iMax = Math.max(0, Math.min(i, 100));
+            float[] fArr = (float[]) Constants.PIN_GLASS_PARAMS.clone();
+            fArr[4] = Math.max(0.0f, Math.min(f, 0.4f));
+            cls.getMethod("setMiGlassBlurRadius", View.class, Integer.TYPE, Integer.TYPE).invoke(null, view, Integer.valueOf(iMax), Integer.valueOf(Math.min(iMax * 2, Constants.PIN_MAX_LARGE_BLUR_RADIUS)));
+            cls.getMethod("setMiViewMaterialTypeCompat", Integer.TYPE, View.class).invoke(null, 1, view);
+            cls.getMethod("setMiGlassCompat", View.class, float[].class).invoke(null, view, fArr);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[密码玻璃] 柔光材质失败: " + th);
         }
     }
 
-    /** 热重载（autoHotReload）：设置变化后立即重新读取 */
-    @Override
-    public void onHotReloaded(XposedModuleInterface.HotReloadedParam param) {
+    public void onHotReloaded(XposedModuleInterface.HotReloadedParam hotReloadedParam) {
         try {
             reloadPrefs();
             LogUtil.logAlways("热重载完成，设置已刷新");
+        } catch (Throwable unused) {
+        }
+    }
+
+    /* JADX INFO: Access modifiers changed from: private */
+    public void reloadPrefs() {
+        if (this.sPrefs == null) {
+            return;
+        }
+        try {
+            Bundle bundle = new Bundle();
+            for (int i = 0; i < Constants.ALL_PREF_KEYS.length; i++) {
+                bundle.putBoolean(Constants.ALL_PREF_KEYS[i], this.sPrefs.getBoolean(Constants.ALL_PREF_KEYS[i], Constants.ALL_PREF_DEFAULTS[i]));
+            }
+            applyRealPrefs(bundle);
+        } catch (Throwable th) {
+            LogUtil.logAlways("读取设置失败: " + th);
+        }
+    }
+
+    /* JADX INFO: Access modifiers changed from: private */
+    public boolean trySyncRealPrefsOnce() {
+        Bundle bundleCall;
+        try {
+            Object objCurrentApplication = currentApplication();
+            if ((objCurrentApplication instanceof Context) && (bundleCall = ((Context) objCurrentApplication).getContentResolver().call(Uri.parse(Constants.STATUS_URI), Constants.METHOD_GET_PREFS, (String) null, (Bundle) null)) != null && bundleCall.getBoolean("ok", false)) {
+                applyRealPrefs(bundleCall);
+                return true;
+            }
+        } catch (Throwable unused) {
+        }
+        return false;
+    }
+
+    private void syncRealPrefsAsync() {
+        if (!sSyncRunning.compareAndSet(false, true)) {
+            sSyncDirty = true;
+            return;
+        }
+        Thread thread = new Thread(new Runnable() { // from class: com.abel.hyperosglass.MainHook.5
+            @Override // java.lang.Runnable
+            public void run() {
+                do {
+                    try {
+                        MainHook.sSyncDirty = false;
+                        int i = 0;
+                        while (true) {
+                            if (i < 40) {
+                                if (MainHook.this.trySyncRealPrefsOnce()) {
+                                    break;
+                                }
+                                try {
+                                    Thread.sleep(800L);
+                                } catch (Throwable unused) {
+                                }
+                                i++;
+                            } else {
+                                LogUtil.logAlways("设置(真实值同步) 模块 App 不可达，本轮放弃（最多 40 次）");
+                                break;
+                            }
+                        }
+                    } catch (Throwable th) {
+                        MainHook.sSyncRunning.set(false);
+                        throw th;
+                    }
+                } while (MainHook.sSyncDirty);
+                MainHook.sSyncRunning.set(false);
+            }
+        });
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private void applyRealPrefs(Bundle bundle) {
+        try {
+            boolean z = bundle.getBoolean(Constants.PREFS_SINK_ENABLED, true);
+            boolean z2 = bundle.getBoolean(Constants.PREFS_GLASS_ENABLED, true);
+            boolean z3 = bundle.getBoolean(Constants.PREFS_HIDE_LOCK_FOD, true);
+            boolean z4 = bundle.getBoolean(Constants.PREFS_HIDE_DISMISS_BTN, true);
+            boolean z5 = bundle.getBoolean(Constants.PREFS_FOCUS_GLASS, true);
+            boolean z6 = bundle.getBoolean(Constants.PREFS_AOD_BATTERY_SYNC, true);
+            boolean z7 = bundle.getBoolean(Constants.PREFS_PIN_GLASS, true);
+            boolean z8 = bundle.getBoolean(Constants.PREFS_QS_EDIT_HIDE, true);
+            boolean z9 = bundle.getBoolean(Constants.PREFS_NO_FOLD_HISTORY, true);
+            boolean z10 = bundle.getBoolean(Constants.PREFS_NO_NOTIF_LIMIT, true);
+            boolean z11 = bundle.getBoolean(Constants.PREFS_KEEP_NOTIF, true);
+            boolean z12 = bundle.getBoolean(Constants.PREFS_HIDE_BT_UNLOCK, true);
+            boolean z13 = bundle.getBoolean(Constants.PREFS_MUTE_SCREEN_ON, true);
+            boolean z14 = bundle.getBoolean(Constants.PREFS_CANCEL_VIBRATE_SCREEN_ON, true);
+            boolean z15 = bundle.getBoolean(Constants.PREFS_ALLOW_MANAGE_ALL, true);
+            boolean z16 = bundle.getBoolean(Constants.PREFS_ENABLE_LOG, false);
+            this.sSinkEnabled = z;
+            this.sGlassEnabled = z2;
+            this.sHideLockFod = z3;
+            sHideLockFodFlag.set(z3);
+            this.sHideDismissBtn = z4;
+            sHideDismissFlag.set(z4);
+            this.sFocusGlass = z5;
+            sFocusGlassFlag.set(z5);
+            sAodBatterySyncFlag.set(z6);
+            sPinGlassFlag.set(z7);
+            sQsEditHideFlag.set(z8);
+            sNoFoldHistoryFlag.set(z9);
+            sNoNotifLimitFlag.set(z10);
+            sKeepNotifFlag.set(z11);
+            sHideBtUnlockFlag.set(z12);
+            sMuteScreenOnFlag.set(z13);
+            sCancelVibrateScreenOnFlag.set(z14);
+            sAllowManageAllFlag.set(z15);
+            LogUtil.setEnabled(z16);
+            LogUtil.logAlways("设置(真实值同步)：sink=" + z + "，glass=" + z2 + "，hideLockFod=" + z3 + "，hideDismiss=" + z4 + "，focusGlass=" + z5 + "，aodBattery=" + z6 + "，qsEditHide=" + z8 + "，noFoldHistory=" + z9 + "，noNotifLimit=" + z10 + "，keepNotif=" + z11 + "，hideBtUnlock=" + z12 + "，muteScreenOn=" + z13 + "，allowManageAll=" + z15 + "，日志=" + z16);
+        } catch (Throwable th) {
+            LogUtil.logAlways("设置(真实值同步) 应用失败: " + th);
+        }
+    }
+
+    private static Object currentApplication() {
+        try {
+            return Class.forName("android.app.ActivityThread").getMethod("currentApplication", new Class[0]).invoke(null, new Object[0]);
+        } catch (Throwable unused) {
+            return null;
+        }
+    }
+
+    private void installPluginClassLoaderHooks(ClassLoader classLoader) {
+        if (classLoader == null) {
+            return;
+        }
+        try {
+            Method declaredMethod = Class.forName(Constants.PLUGIN_FACTORY_CLASS, false, classLoader).getDeclaredMethod(Constants.PLUGIN_CREATE_CLASSLOADER_METHOD, new Class[0]);
+            declaredMethod.setAccessible(true);
+            hook(declaredMethod).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("plugin-classloader").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook.6
+                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    Object objProceed = chain.proceed();
+                    if (objProceed instanceof ClassLoader) {
+                        MainHook.this.tryHookQsEditIn((ClassLoader) objProceed);
+                    }
+                    return objProceed;
+                }
+            });
+            LogUtil.logAlways("[QS编辑] 已挂钩 PluginFactory.createClassLoader（插件加载时补挂）");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[QS编辑] 插件工厂挂钩失败: " + th);
+        }
+    }
+
+    /**
+     * 三方主题液态玻璃增强（移植自 HyperChanger，合并进 glass_enabled 开关）。
+     * 换用三方/全局主题后 MIUI 会把 defaultTheme 置 false，导致系统材质层与模糊层
+     * 切回主题自带样式、柔光玻璃消失。这里在各判定点强制「仍处于默认主题」，玻璃得以保留。
+     * 所有 guard 在 intercept 时统一受 sGlassEnabled 控制：开关关闭即完全还原系统行为。
+     * 本方法对传入的任何 classloader 都尝试安装，加载不到的类静默跳过，
+     * 因此用 systemui 默认 loader 与插件 loader 各调一次即可覆盖两侧。
+     */
+    private void installThirdPartyThemeGlassHooks(ClassLoader classLoader) {
+        if (classLoader == null) {
+            return;
+        }
+        // 1) ThemeUtils.getDefaultPluginTheme / getDefaultSysUiTheme → true
+        try {
+            Class<?> themeUtils = Class.forName(Constants.TPG_THEME_UTILS_CLASS, false, classLoader);
+            String[] getters = {"getDefaultPluginTheme", "getDefaultSysUiTheme"};
+            for (String m : getters) {
+                try {
+                    hook(themeUtils.getMethod(m)).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .setId("tpg-getter-" + m).intercept(new XposedInterface.Hooker() {
+                                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                                    if (MainHook.this.sGlassEnabled) {
+                                        return true;
+                                    }
+                                    return chain.proceed();
+                                }
+                            });
+                } catch (Throwable ignored) {
+                }
+            }
+            // 2) ThemeUtils.updateDefaultPluginTheme / updateDefaultSysUiTheme → 执行后强制写回 true
+            String[] updaters = {"updateDefaultPluginTheme", "updateDefaultSysUiTheme"};
+            for (String m : updaters) {
+                try {
+                    hook(themeUtils.getMethod(m)).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .setId("tpg-update-" + m).intercept(new XposedInterface.Hooker() {
+                                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                                    Object r = chain.proceed();
+                                    if (MainHook.this.sGlassEnabled) {
+                                        forceThemeUtilsFlags(themeUtils);
+                                    }
+                                    return r;
+                                }
+                            });
+                } catch (Throwable ignored) {
+                }
+            }
+            LogUtil.logAlways("[三方主题玻璃] 已挂钩 ThemeUtils getter/updater");
+        } catch (Throwable th) {
+            LogUtil.log("[三方主题玻璃] ThemeUtils 挂钩失败(本 loader 无此类): " + th);
+        }
+
+        // 3) MiuiMaterialUtils.onDefaultThemeChanged(Boolean) → 强制 true
+        try {
+            Class<?> materialUtils = Class.forName(Constants.TPG_MATERIAL_UTILS_CLASS, false, classLoader);
+            hook(materialUtils.getMethod("onDefaultThemeChanged", Boolean.TYPE)).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("tpg-onDefaultThemeChanged").intercept(new XposedInterface.Hooker() {
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            if (MainHook.this.sGlassEnabled) {
+                                return chain.proceed(new Object[]{Boolean.TRUE});
+                            }
+                            return chain.proceed();
+                        }
+                    });
+            LogUtil.logAlways("[三方主题玻璃] 已挂钩 MiuiMaterialUtils.onDefaultThemeChanged");
+        } catch (Throwable th) {
+            LogUtil.log("[三方主题玻璃] MiuiMaterialUtils 挂钩失败(本 loader 无此类): " + th);
+        }
+
+        // 4) MiBlurCompat.getBackgroundMaterialOpenedInDefaultTheme(Context) → true
+        try {
+            Class<?> blurCompat = Class.forName(Constants.TPG_BLUR_COMPAT_CLASS, false, classLoader);
+            hook(blurCompat.getMethod("getBackgroundMaterialOpenedInDefaultTheme", android.content.Context.class))
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("tpg-getBgMaterialOpenedInDefaultTheme").intercept(new XposedInterface.Hooker() {
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            if (MainHook.this.sGlassEnabled) {
+                                return true;
+                            }
+                            return chain.proceed();
+                        }
+                    });
+            LogUtil.logAlways("[三方主题玻璃] 已挂钩 MiBlurCompat.getBackgroundMaterialOpenedInDefaultTheme");
+        } catch (Throwable th) {
+            LogUtil.log("[三方主题玻璃] MiBlurCompat 挂钩失败(本 loader 无此类): " + th);
+        }
+
+        // 5) MiuiDefaultThemeControllerImpl.isDefaultTheme() → true
+        try {
+            Class<?> controller = Class.forName(Constants.TPG_DEFAULT_THEME_CONTROLLER_CLASS, false, classLoader);
+            hook(controller.getMethod("isDefaultTheme")).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("tpg-isDefaultTheme").intercept(new XposedInterface.Hooker() {
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            if (MainHook.this.sGlassEnabled) {
+                                return true;
+                            }
+                            return chain.proceed();
+                        }
+                    });
+            LogUtil.logAlways("[三方主题玻璃] 已挂钩 MiuiDefaultThemeControllerImpl.isDefaultTheme");
+        } catch (Throwable th) {
+            LogUtil.log("[三方主题玻璃] MiuiDefaultThemeControllerImpl 挂钩失败(本 loader 无此类): " + th);
+        }
+
+        // 6) ConfigurationControllerImpl.onConfigurationChanged → 执行后强制 sDefaultSysUiTheme=true
+        try {
+            Class<?> configController = Class.forName(Constants.TPG_CONFIG_CONTROLLER_CLASS, false, classLoader);
+            final Field sDefaultField = Class.forName(Constants.TPG_MIUI_THEME_UTILS_CLASS, false, classLoader)
+                    .getDeclaredField("sDefaultSysUiTheme");
+            sDefaultField.setAccessible(true);
+            hook(configController.getMethod("onConfigurationChanged", android.content.res.Configuration.class))
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("tpg-configChanged").intercept(new XposedInterface.Hooker() {
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            Object r = chain.proceed();
+                            if (MainHook.this.sGlassEnabled) {
+                                sDefaultField.setBoolean(null, true);
+                            }
+                            return r;
+                        }
+                    });
+            LogUtil.logAlways("[三方主题玻璃] 已挂钩 ConfigurationControllerImpl.onConfigurationChanged");
+        } catch (Throwable th) {
+            LogUtil.log("[三方主题玻璃] ConfigurationControllerImpl 挂钩失败(本 loader 无此类): " + th);
+        }
+    }
+
+    private static void forceThemeUtilsFlags(Class<?> themeClass) {
+        try {
+            Field f1 = themeClass.getDeclaredField("defaultPluginTheme");
+            f1.setAccessible(true);
+            f1.setBoolean(null, true);
+            Field f2 = themeClass.getDeclaredField("defaultSysUiTheme");
+            f2.setAccessible(true);
+            f2.setBoolean(null, true);
         } catch (Throwable ignored) {
         }
     }
 
-    // ============================================================
-    // 设置读取（框架直供，无跨进程调用、无重试）
-    // ============================================================
-    private void reloadPrefs() {
-        if (sPrefs == null) return;
+    private void installMediaIslandDefense(ClassLoader classLoader) {
         try {
-            // ponytail: 与 applyRealPrefs 合并为单一真值表。原 ~40 行逐键读取
-            // 与 applyRealPrefs 完全重复，且易漏新键（v3.11 新增的 xmsf/health
-            // 就漏在 applyRealPrefs 里 → 冷启动不生效）。现统一走 ALL_PREF_KEYS 遍历。
-            android.os.Bundle out = new android.os.Bundle();
-            for (int i = 0; i < Constants.ALL_PREF_KEYS.length; i++) {
-                out.putBoolean(Constants.ALL_PREF_KEYS[i],
-                        sPrefs.getBoolean(Constants.ALL_PREF_KEYS[i], Constants.ALL_PREF_DEFAULTS[i]));
-            }
-            applyRealPrefs(out);
-        } catch (Throwable t) {
-            LogUtil.logAlways("读取设置失败: " + t);
-        }
-    }
-
-    /** 后台同步真实设置（v3.3.4 修复「所有开关失效」）。
-     *  根因：getRemotePreferences 只镜像模块 App 默认上下文（CE）的写入，而设置页
-     *  写的是 DE（device-protected）存储 → SystemUI 永远读到默认值，开关全失效。
-     *  本方法经 StatusProvider（模块 App uid 直接读 DE 文件）拿真实值并应用：
-     *   - 模块加载即尝试（模块 App 通常已在运行）；失败重试，最多 10 次 × 1s；
-     *   - 成功读取一次即返回（无论是否与默认相同），绝不长期驻留。 */
-    private static final Object sRetryLock = new Object();
-    private static boolean sFallbackStarted = false;
-
-    private void startPrefsSync() {
-        synchronized (sRetryLock) {
-            if (sFallbackStarted) return;
-            sFallbackStarted = true;
-        }
-        Thread t = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                for (int n = 0; n < 10; n++) {
-                    try {
-                        Object app = currentApplication();
-                        if (app instanceof android.content.Context) {
-                            android.os.Bundle out = ((android.content.Context) app)
-                                    .getContentResolver().call(
-                                            android.net.Uri.parse(Constants.STATUS_URI),
-                                            Constants.METHOD_GET_PREFS, null, null);
-                            if (out != null) {
-                                applyRealPrefs(out);
-                                return;
+            Class<?> cls = Class.forName(Constants.MEDIA_ISLAND_BINDER_CLASS, false, classLoader);
+            Class<?> cls2 = Class.forName(Constants.MEDIA_ISLAND_VIEW_HOLDER_CLASS, false, classLoader);
+            try {
+                hook(cls.getDeclaredMethod("attach", cls2, cls2)).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("media-island-attach-guard").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook.7
+                    public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                        try {
+                            return chain.proceed();
+                        } catch (Throwable th) {
+                            if (!LogUtil.hitOnce("island-attach")) {
+                                return null;
                             }
+                            LogUtil.logAlways("[防御] attach 内崩溃已吞掉（MiPalette）: " + th);
+                            return null;
                         }
-                    } catch (Throwable ignored) {
                     }
-                    try {
-                        Thread.sleep(1000L);
-                    } catch (Throwable ignored) {
-                    }
-                }
-                LogUtil.logAlways("设置(真实值同步) 模块 App 不可达，放弃（最多 10 次，防后台常驻）");
-            }
-        });
-        t.setDaemon(true);
-        t.start();
-    }
-
-    /** 应用 StatusProvider 返回的真实设置值（成功一次即停） */
-    private void applyRealPrefs(android.os.Bundle out) {
-        try {
-            boolean sink = out.getBoolean(Constants.PREFS_SINK_ENABLED,
-                    Constants.DEFAULT_SINK_ENABLED);
-            boolean glass = out.getBoolean(Constants.PREFS_GLASS_ENABLED,
-                    Constants.DEFAULT_GLASS_ENABLED);
-            boolean fod = out.getBoolean(Constants.PREFS_HIDE_LOCK_FOD,
-                    Constants.DEFAULT_HIDE_LOCK_FOD);
-            boolean dismiss = out.getBoolean(Constants.PREFS_HIDE_DISMISS_BTN,
-                    Constants.DEFAULT_HIDE_DISMISS_BTN);
-            boolean focus = out.getBoolean(Constants.PREFS_FOCUS_GLASS,
-                    Constants.DEFAULT_FOCUS_GLASS);
-            boolean aod = out.getBoolean(Constants.PREFS_AOD_BATTERY_SYNC,
-                    Constants.DEFAULT_AOD_BATTERY_SYNC);
-            boolean pinGlass = out.getBoolean(Constants.PREFS_PIN_GLASS,
-                    Constants.DEFAULT_PIN_GLASS);
-            boolean qsEditHide = out.getBoolean(Constants.PREFS_QS_EDIT_HIDE,
-                    Constants.DEFAULT_QS_EDIT_HIDE);
-            boolean noFoldHistory = out.getBoolean(Constants.PREFS_NO_FOLD_HISTORY,
-                    Constants.DEFAULT_NO_FOLD_HISTORY);
-            boolean noGroup = out.getBoolean(Constants.PREFS_NO_GROUP,
-                    Constants.DEFAULT_NO_GROUP);
-            boolean noNotifLimit = out.getBoolean(Constants.PREFS_NO_NOTIF_LIMIT,
-                    Constants.DEFAULT_NO_NOTIF_LIMIT);
-            boolean keepNotif = out.getBoolean(Constants.PREFS_KEEP_NOTIF,
-                    Constants.DEFAULT_KEEP_NOTIF);
-            boolean hideBtUnlock = out.getBoolean(Constants.PREFS_HIDE_BT_UNLOCK,
-                    Constants.DEFAULT_HIDE_BT_UNLOCK);
-            boolean muteScreenOn = out.getBoolean(Constants.PREFS_MUTE_SCREEN_ON,
-                    Constants.DEFAULT_MUTE_SCREEN_ON);
-            boolean cancelVibrateScreenOn = out.getBoolean(Constants.PREFS_CANCEL_VIBRATE_SCREEN_ON,
-                    Constants.DEFAULT_CANCEL_VIBRATE_SCREEN_ON);
-            boolean redirectNotifSet = out.getBoolean(Constants.PREFS_REDIRECT_NOTIF_SET,
-                    Constants.DEFAULT_REDIRECT_NOTIF_SET);
-            boolean allowManageAll = out.getBoolean(Constants.PREFS_ALLOW_MANAGE_ALL,
-                    Constants.DEFAULT_ALLOW_MANAGE_ALL);
-            boolean unlockAllFocus = out.getBoolean(Constants.PREFS_UNLOCK_ALL_FOCUS,
-                    Constants.DEFAULT_UNLOCK_ALL_FOCUS);
-            boolean log = out.getBoolean(Constants.PREFS_ENABLE_LOG,
-                    Constants.DEFAULT_ENABLE_LOG);
-            boolean preventWhitelist = out.getBoolean(
-                    Constants.PREFS_PREVENT_BATTERY_WHITELIST,
-                    Constants.DEFAULT_PREVENT_BATTERY_WHITELIST);
-            sSinkEnabled = sink;
-            sGlassEnabled = glass;
-            // v3.3.7：真实值同步后同样补写一次（此时插件副本通常已挂钩）
-            if (glass) reassertAllThemeUtilsFields();
-            sHideLockFod = fod;
-            sHideLockFodFlag.set(fod);
-            sHideDismissBtn = dismiss;
-            sHideDismissFlag.set(dismiss);
-            sFocusGlass = focus;
-            sFocusGlassFlag.set(focus);
-            sAodBatterySyncFlag.set(aod);
-            sPinGlassFlag.set(pinGlass);
-            sQsEditHideFlag.set(qsEditHide);
-            sNoFoldHistoryFlag.set(noFoldHistory);
-            sNoGroupFlag.set(noGroup);
-            sNoNotifLimitFlag.set(noNotifLimit);
-            sKeepNotifFlag.set(keepNotif);
-            sHideBtUnlockFlag.set(hideBtUnlock);
-            sMuteScreenOnFlag.set(muteScreenOn);
-            sCancelVibrateScreenOnFlag.set(cancelVibrateScreenOn);
-            sRedirectNotifSetFlag.set(redirectNotifSet);
-            sAllowManageAllFlag.set(allowManageAll);
-            sUnlockAllFocusFlag.set(unlockAllFocus);
-            sPreventBatteryWhitelistFlag.set(preventWhitelist);
-            // v3.12 补充：真实值同步路径此前漏读这两个键（reloadPrefs 有、applyRealPrefs 无），
-            // 导致各自进程冷启动时不生效。现此处为唯一真值表，必须含全部开关。
-            boolean xmsfFocusSign = out.getBoolean(Constants.PREFS_XMSF_FOCUS_SIGN,
-                    Constants.DEFAULT_XMSF_FOCUS_SIGN);
-            boolean healthFocusAllowAll = out.getBoolean(Constants.PREFS_HEALTH_FOCUS_ALLOW_ALL,
-                    Constants.DEFAULT_HEALTH_FOCUS_ALLOW_ALL);
-            sXmsfFocusSignFlag.set(xmsfFocusSign);
-            sHealthFocusAllowAllFlag.set(healthFocusAllowAll);
-            LogUtil.setEnabled(log);
-            LogUtil.logAlways("设置(真实值同步)：sink=" + sink + "，glass=" + glass
-                    + "，hideLockFod=" + fod + "，hideDismiss=" + dismiss
-                    + "，focusGlass=" + focus + "，aodBattery=" + aod
-                    + "，qsEditHide=" + qsEditHide + "，noFoldHistory=" + noFoldHistory
-                    + "，noGroup=" + noGroup
-                    + "，noNotifLimit=" + noNotifLimit + "，keepNotif=" + keepNotif
-                    + "，hideBtUnlock=" + hideBtUnlock + "，muteScreenOn=" + muteScreenOn
-                    + "，redirectNotifSet=" + redirectNotifSet
-                    + "，allowManageAll=" + allowManageAll
-                    + "，unlockAllFocus=" + unlockAllFocus
-                    + "，xmsfFocusSign=" + xmsfFocusSign
-                    + "，healthFocusAllowAll=" + healthFocusAllowAll
-                    + "，日志=" + log);
-        } catch (Throwable t) {
-            LogUtil.logAlways("设置(真实值同步) 应用失败: " + t);
-        }
-    }
-
-    /** 纯反射拿当前进程 Application（android.app.ActivityThread 为 hide） */
-    private static Object currentApplication() {
-        try {
-            Class<?> at = Class.forName("android.app.ActivityThread");
-            return at.getMethod("currentApplication").invoke(null);
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
-    // ============================================================
-    // 强制玻璃：挂钩 ThemeUtils（v3.0 插件 classloader 修复版）
-    // ============================================================
-    /**
-     * v3.0 核心修复：ThemeUtils 位于插件 APK（MIUISystemUIPlugin）的独立
-     * PathClassLoader，宿主 onPackageLoaded 的 Class.forName 必然失败。
-     * 改为 hook 宿主侧 PluginInstance$PluginFactory.createClassLoader()——
-     * 宿主加载插件 APK 时创建插件 classloader 的唯一入口（dex 确认：
-     * 先查 PluginInstanceInjector.sClassLoaders 缓存，未命中则新建
-     * PathClassLoader 装载插件 APK）。在该方法回调中拿返回的插件
-     * ClassLoader，再 Class.forName(ThemeUtils) 补挂两个 getter。
-     * 精准命中单个宿主方法，不 hook loadClass、不轮询。
-     */
-    private void installGlassHooks(ClassLoader cl) {
-        try {
-            if (cl == null) return;
-            // 1) 先直接试宿主 loader（少数版本插件类可能并入宿主 dex）
-            tryHookThemeUtilsIn(cl);
-            tryHookMiBlurCompatIn(cl);
-            // 2) hook 插件工厂 createClassLoader：插件加载时拿到 loader 补挂
-            final Class<?> factory =
-                    Class.forName(Constants.PLUGIN_FACTORY_CLASS, false, cl);
-            final Method create = factory.getDeclaredMethod(
-                    Constants.PLUGIN_CREATE_CLASSLOADER_METHOD);
-            create.setAccessible(true);
-            hook(create)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("glass-plugin-classloader")
-                    .intercept(new XposedInterface.Hooker() {
-                        @Override
-                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                            Object loader = chain.proceed(); // 插件 ClassLoader（新建或缓存）
-                            if (loader instanceof ClassLoader) {
-                                tryHookThemeUtilsIn((ClassLoader) loader);
-                                // v3.3.9：补挂 MiBlurCompat（线 A 总闸门，仅液态模式强制 true）。
-                                tryHookMiBlurCompatIn((ClassLoader) loader);
-                                // v3.7：补挂控制中心「编辑」按钮隐藏（插件 loader）
-                                tryHookQsEditIn((ClassLoader) loader);
-                            }
-                            return loader;
-                        }
-                    });
-            LogUtil.logAlways("[玻璃] 已挂钩 PluginFactory.createClassLoader（插件加载时补挂 ThemeUtils + MiBlurCompat）");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[玻璃] 插件工厂挂钩失败: " + t);
-        }
-    }
-
-    /** 用指定 ClassLoader 找 ThemeUtils 并挂 getter + setter（幂等，成功一次即止）
-     *  v3.3.5：getter 恒 true（no-op）改为钩 setter 强制字段 true —— 真正闸门是
-     *  defaultSysUiTheme/defaultPluginTheme 字段，由 setDefault* 写入。 */
-    private void tryHookThemeUtilsIn(ClassLoader loader) {
-        try {
-            if (loader == null) return;
-            final Class<?> c = Class.forName(Constants.TARGET_CLASS, false, loader);
-            if (c == null) return;
-            synchronized (glassHooked) {
-                if (glassHooked.contains(c)) {
-                    return; // 已挂过，幂等跳过；不再为每次插件 loader 复用重复打日志（避免日志风暴 + 跨进程推送耗电）
-                }
-                glassHooked.add(c);
-            }
-            LogUtil.logAlwaysOnce("tu-loader",
-                    "[玻璃] 已从插件 loader 拿到 ThemeUtils: " + loader);
-            for (String name : Constants.TARGET_METHODS) {
-                try {
-                    Method m = findBooleanMethod(c, name);
-                    if (m == null) {
-                        LogUtil.log("[玻璃] ThemeUtils." + name + " 未找到（跳过）");
-                        continue;
-                    }
-                    hook(m)
-                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                            .setId("glass_" + name)
-                            .intercept(new XposedInterface.Hooker() {
-                                @Override
-                                public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                                    // 热路径：只读 volatile 布尔，绝不写日志/IO。
-                                    // 柔光玻璃开关关闭时放行原逻辑。
-                                    if (sGlassEnabled) return Boolean.TRUE;
-                                    return chain.proceed();
-                                }
-                            });
-                    LogUtil.logAlwaysOnce("tu-get-" + name,
-                            "[玻璃] 已挂钩 ThemeUtils." + name + "（玻璃开启时强制 true）");
-                } catch (Throwable t) {
-                    LogUtil.logAlways("[玻璃] ThemeUtils." + name + " 挂钩失败: " + t);
-                }
-            }
-            // v3.3.5：钩 setter，玻璃开启时强制入参 true → 字段恒 true → 保留玻璃
-            for (String name : Constants.TARGET_SETTER_METHODS) {
-                try {
-                    Method m = findVoidBooleanMethod(c, name);
-                    if (m == null) {
-                        LogUtil.log("[玻璃] ThemeUtils." + name + " 未找到（跳过）");
-                        continue;
-                    }
-                    hook(m)
-                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                            .setId("glass_set_" + name)
-                            .intercept(new XposedInterface.Hooker() {
-                                @Override
-                                public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                                    if (sGlassEnabled) {
-                                        if (LogUtil.hitOnce("glass-set")) {
-                                            LogUtil.logAlways("[玻璃] setDefault*Theme 强制 true"
-                                                    + "（保留柔光玻璃，原入参被覆盖）");
-                                        }
-                                        return chain.proceed(new Object[]{true});
-                                    }
-                                    return chain.proceed();
-                                }
-                            });
-                    LogUtil.logAlwaysOnce("tu-set-" + name,
-                            "[玻璃] 已挂钩 ThemeUtils." + name + "（玻璃开启时强制 true）");
-                } catch (Throwable t) {
-                    LogUtil.logAlways("[玻璃] ThemeUtils." + name + " 挂钩失败: " + t);
-                }
-            }
-            // v3.3.6：钩 updateDefault*Theme() —— 从源头阻断 false 写入。
-            // 这类方法是 setDefault*(false) 的唯一来源（字节码实证 5af870/5af83c：
-            //   setDefault*Theme(!new File("/data/system/theme/<pkg>").exists())，
-            //   文件存在 → false → 玻璃关）。第三方主题一应用即生成该文件。
-            // 这两个 ()V 方法体积较大（17 code units）不会被 ART 内联，挂钩可靠性
-            // 高于 getter/setter；玻璃开启时直接跳过整个方法体，字段保持 true。
-            for (String name : Constants.TARGET_UPDATE_METHODS) {
-                try {
-                    Method m = findVoidNoArgMethod(c, name);
-                    if (m == null) {
-                        LogUtil.log("[玻璃] ThemeUtils." + name + " 未找到（跳过）");
-                        continue;
-                    }
-                    hook(m)
-                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                            .setId("glass_upd_" + name)
-                            .intercept(new XposedInterface.Hooker() {
-                                @Override
-                                public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                                    if (sGlassEnabled) {
-                                        if (LogUtil.hitOnce("glass-upd")) {
-                                            LogUtil.logAlways("[玻璃] " + name
-                                                    + " 已跳过（第三方主题不得把默认主题置 false）");
-                                        }
-                                        // 跳过原方法体 → setter 不再被调用 → 字段不会
-                                        // 被写成 true，必须自己写（防御 ART 内联副本）。
-                                        pokeDefaultThemeFieldsTrue(c);
-                                        return null; // ()V
-                                    }
-                                    return chain.proceed();
-                                }
-                            });
-                    LogUtil.logAlwaysOnce("tu-upd-" + name,
-                            "[玻璃] 已挂钩 ThemeUtils." + name + "（玻璃开启时跳过）");
-                } catch (Throwable t) {
-                    LogUtil.logAlways("[玻璃] ThemeUtils." + name + " 挂钩失败: " + t);
-                }
-            }
-            // v3.3.7：挂钩成功后立刻把两个默认主题字段置 true。
-            // getter 仅 3 code units 会被 ART 内联，内联副本直接 sget 字段、不过 hook；
-            // 而 v3.3.6 跳过 updateDefault* 后 setter 不再触发，字段会停在 <clinit>
-            // 初值（原厂为 false，样本 APK 里的 true 是 Magisk 补丁追加的）。
-            // 这里主动写一次，使「字段 true」与「getter 强制 true」双保险。
-            if (sGlassEnabled) pokeDefaultThemeFieldsTrue(c);
-        } catch (Throwable t) {
-            // 类不在本 loader（正常：插件 loader 尚未就绪），静默等待 createClassLoader 回调
-        }
-    }
-
-    /** material_style 缓存（v3.3.10 功耗）。合法值含 -1（关闭），故用 ts==0 判未初始化。 */
-    private static volatile int sMaterialStyle = 0;
-    private static volatile long sMaterialStyleTs = 0L;
-
-    /**
-     * 读 Settings.Secure material_style，带 2 秒 TTL 缓存。
-     * v3.3.10：本方法是材质总闸门，控制中心/通知渲染时会被反复调用；原来每次都
-     * Settings.Secure.getInt 走一次 Binder 到 SettingsProvider。切换材质是分钟级
-     * 低频操作，TTL 缓存足够，省掉热路径上的全部 IPC。
-     * ponytail: TTL 缓存，切材质后最多 2s 生效；要「切完立刻生效」就改成注册
-     * ContentObserver 失效缓存（多 ~10 行 + 生命周期管理，当前没必要）。
-     */
-    private static int materialStyle(android.content.Context ctx) {
-        long now = android.os.SystemClock.elapsedRealtime();
-        long ts = sMaterialStyleTs;
-        int v = sMaterialStyle;
-        if (ts == 0L || now - ts > 2000L) {
-            try {
-                v = Settings.Secure.getInt(ctx.getContentResolver(), "material_style", 0);
-            } catch (Throwable t) {
-                v = 0;
-            }
-            sMaterialStyle = v;
-            sMaterialStyleTs = now;
-        }
-        return v;
-    }
-
-    /** v3.3.9：钩 MiBlurCompat.getBackgroundMaterialOpenedInDefaultTheme（线 A 总闸门）。
-     *  静态方法 (Context)Z，PUBLIC STATIC FINAL，46 code units 不会被 ART 内联。
-     *  仅当系统当前 material_style == 1（Bionics / 柔光玻璃）时才强制 true，避免关闭/磨砂
-     *  模式下被强制玻璃导致磁贴形状/背景错乱。其余模式调用原逻辑，保留系统材质判据。
-     *  按 Class 对象身份去重（同 ThemeUtils 的多 ClassLoader 副本陷阱）。 */
-    private void tryHookMiBlurCompatIn(ClassLoader loader) {
-        try {
-            if (loader == null) return;
-            final Class<?> c = Class.forName(Constants.TARGET_MI_BLUR_COMPAT_CLASS, false, loader);
-            if (c == null) return;
-            synchronized (miBlurCompatHooked) {
-                if (miBlurCompatHooked.contains(c)) return;
-                miBlurCompatHooked.add(c);
-            }
-            LogUtil.logAlwaysOnce("miblur-loader",
-                    "[玻璃] 已从插件 loader 拿到 MiBlurCompat: " + loader);
-            for (String name : Constants.TARGET_MI_BLUR_COMPAT_METHODS) {
-                try {
-                    // 找 PUBLIC STATIC + (Context)Z + 返回 boolean 的方法
-                    Method m = findStaticBooleanMethodWithContextParam(c, name);
-                    if (m == null) {
-                        LogUtil.log("[玻璃] MiBlurCompat." + name + " 未找到（跳过）");
-                        continue;
-                    }
-                    hook(m)
-                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                            .setId("glass_miblur_" + name)
-                            .intercept(new XposedInterface.Hooker() {
-                                @Override
-                                public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                                    if (sGlassEnabled) {
-                                        try {
-                                            Object arg0 = chain.getArg(0);
-                                            if (arg0 instanceof android.content.Context) {
-                                                if (materialStyle((android.content.Context) arg0) == 1) {
-                                                    if (LogUtil.hitOnce("miblur-hit")) {
-                                                        LogUtil.logAlways("[玻璃] MiBlurCompat."
-                                                                + name + " 液态模式强制 true"
-                                                                + "（第三方主题不得关玻璃）");
-                                                    }
-                                                    return Boolean.TRUE;
-                                                }
-                                            }
-                                        } catch (Throwable ignored) {
-                                            // 读设置失败时回退到原逻辑
-                                        }
-                                    }
-                                    return chain.proceed();
-                                }
-                            });
-                    LogUtil.logAlwaysOnce("miblur-" + name,
-                            "[玻璃] 已挂钩 MiBlurCompat." + name + "（仅液态模式强制 true）");
-                } catch (Throwable t) {
-                    LogUtil.logAlways("[玻璃] MiBlurCompat." + name + " 挂钩失败: " + t);
-                }
-            }
-        } catch (Throwable t) {
-            // 类不在本 loader（正常），静默等待 createClassLoader 回调
-        }
-    }
-
-    /** 遍历类及父类找 public 无参 boolean 方法 */
-    private static Method findBooleanMethod(Class<?> c, String name) {
-        for (Method m : c.getMethods()) {
-            if (m.getName().equals(name)
-                    && m.getParameterCount() == 0
-                    && m.getReturnType() == boolean.class) {
-                return m;
-            }
-        }
-        return null;
-    }
-
-    /** 遍历类及父类找 (Z)V setter（v3.3.5 玻璃字段写入钩子用）
-     *  用 getDeclaredMethods：setDefaultSysUiTheme 是 private（仅 updateDefault* 内部调用），
-     *  getMethods() 只返回 public → 漏掉；必须 declared + 父类链。 */
-    private static Method findVoidBooleanMethod(Class<?> c, String name) {
-        Class<?> cur = c;
-        while (cur != null && cur != Object.class) {
-            for (Method m : cur.getDeclaredMethods()) {
-                if (m.getName().equals(name)
-                        && m.getParameterCount() == 1
-                        && m.getParameterTypes()[0] == boolean.class
-                        && m.getReturnType() == void.class) {
-                    return m;
-                }
-            }
-            cur = cur.getSuperclass();
-        }
-        return null;
-    }
-
-    /** 遍历类及父类找 ()V 无参方法（v3.3.6 updateDefault*Theme 钩子用） */
-    private static Method findVoidNoArgMethod(Class<?> c, String name) {
-        Class<?> cur = c;
-        while (cur != null && cur != Object.class) {
-            for (Method m : cur.getDeclaredMethods()) {
-                if (m.getName().equals(name)
-                        && m.getParameterCount() == 0
-                        && m.getReturnType() == void.class) {
-                    return m;
-                }
-            }
-            cur = cur.getSuperclass();
-        }
-        return null;
-    }
-
-    /** v3.3.8：找 PUBLIC STATIC + (android.content.Context)Z + 返回 boolean 的方法
-     *  （用于 MiBlurCompat.getBackgroundMaterialOpenedInDefaultTheme）。
-     *  遍历类+父类 + declared，覆盖 static 私有或 protected 情形。 */
-    private static Method findStaticBooleanMethodWithContextParam(Class<?> c, String name) {
-        Class<?> cur = c;
-        while (cur != null && cur != Object.class) {
-            for (Method m : cur.getDeclaredMethods()) {
-                if (m.getName().equals(name)
-                        && java.lang.reflect.Modifier.isStatic(m.getModifiers())
-                        && m.getParameterCount() == 1
-                        && m.getParameterTypes()[0] == android.content.Context.class
-                        && m.getReturnType() == boolean.class) {
-                    return m;
-                }
-            }
-            cur = cur.getSuperclass();
-        }
-        return null;
-    }
-
-    /** v3.3.7：把 ThemeUtils 的两个默认主题静态字段直接写成 true。
-     *  幂等：已是 true 则跳过（setter 也有 if-eq 短路，重复写无害且不打日志）。
-     *  目的：覆盖「getter 被 ART 内联 → 调用方直接读字段」的那条路径。
-     *  注意：反射读写 static 字段会触发该类 <clinit>；ThemeUtils.<clinit> 仅做
-     *  new-instance + 反射取 MiuiResources.mPackage，无副作用，安全。 */
-    private static void pokeDefaultThemeFieldsTrue(Class<?> c) {
-        for (String fn : Constants.TARGET_THEME_FIELDS) {
-            try {
-                Field f = c.getDeclaredField(fn);
-                if (f.getType() != boolean.class) continue;
-                f.setAccessible(true);
-                if (f.getBoolean(null)) continue; // 已是 true，不打扰
-                f.setBoolean(null, true);
-                if (LogUtil.hitOnce("poke-ok")) {
-                    LogUtil.logAlways("[玻璃] 字段 " + fn + " 已置 true（防御 ART 内联副本）");
-                }
-            } catch (Throwable t) {
-                if (LogUtil.hitOnce("poke-fail")) {
-                    LogUtil.logAlways("[玻璃] 字段 " + fn + " 置 true 失败: " + t);
-                }
-            }
-        }
-    }
-
-    /** v3.3.7：把所有已挂钩副本的默认主题字段重 poke 为 true。
-     *  场景：用户关闭玻璃开关期间，updateDefault* 钩子放行 → 系统走原逻辑把字段
-     *  写成 false；重新打开开关时不会自动触发 updateDefault*，字段会一直停在
-     *  false，ART 内联副本读到 false → 玻璃不回来。开关翻「开」时主动补写。
-     *  幂等且廉价：字段已是 true 时直接跳过（setter 的 if-eq 同理会短路）。 */
-    private void reassertAllThemeUtilsFields() {
-        if (!sGlassEnabled) return;
-        synchronized (glassHooked) {
-            for (Class<?> c : glassHooked) {
-                try {
-                    pokeDefaultThemeFieldsTrue(c);
-                } catch (Throwable ignored) {
-                }
-            }
-        }
-    }
-
-    // ============================================================
-    // 媒体岛崩溃防御（v3.0.1 吞异常版）
-    // ============================================================
-    /**
-     * 设备系统 bug（真机确认，v2.1.4 时代即存在）：播放媒体时
-     * MiuiIslandMediaViewBinderImpl 两个方法引用 miuix.mipalette.MiPalette：
-     *   1) attach() —— 无条件调用 MiPalette.init()，触发 <clinit> →
-     *      System.loadLibrary("libMiMainColor.so") 被 native namespace
-     *      clns-13 拒绝 → UnsatisfiedLinkError；
-     *   2) setMusicBgShader(MediaData, Drawable) —— bindMediaData() 调用，
-     *      引用 MiPalette.getMainColorHCT/getPaletteColor；<clinit> 失败后
-     *      类被 JVM 标记为 ErrnoState，此处抛 NoClassDefFoundError。
-     * 两者都在 SystemUI 主线程 → 播放媒体即崩溃循环。系统原版即崩
-     * （与模块功能无关），必须防御，否则模块不可用。
-     *
-     * v2.1.10 旧防御「短路 attach」→ 音乐胶囊弹窗只剩进度条（attach 未执行）。
-     * v3.0.1 改为「吞异常」：try/catch 包住 chain.proceed()，方法前半段
-     * （holder/前景色/进度条绑定）正常执行，仅在 MiPalette 崩溃处吞掉异常
-     * 返回 null —— 不崩溃、弹窗内容尽量完整。两个方法独立防御。
-     */
-    private void installMediaIslandDefense(ClassLoader cl) {
-        try {
-            final Class<?> binder =
-                    Class.forName(Constants.MEDIA_ISLAND_BINDER_CLASS, false, cl);
-            final Class<?> holder =
-                    Class.forName(Constants.MEDIA_ISLAND_VIEW_HOLDER_CLASS, false, cl);
-
-            // 1) attach(MiuiIslandMediaViewHolder, MiuiIslandMediaViewHolder)
-            try {
-                final Method attach = binder.getDeclaredMethod(
-                        Constants.MEDIA_ISLAND_ATTACH_METHOD, holder, holder);
-                hook(attach)
-                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                        .setId("media-island-attach-guard")
-                        .intercept(new XposedInterface.Hooker() {
-                            @Override
-                            public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                                try {
-                                    return chain.proceed();
-                                } catch (Throwable t) {
-                                    // 系统 bug 每次播放媒体都会崩 → 必须 hitOnce，
-                                    // 否则每次崩溃都拼字符串 + 写日志
-                                    if (LogUtil.hitOnce("island-attach")) {
-                                        LogUtil.logAlways("[防御] attach 内崩溃已吞掉（MiPalette）: " + t);
-                                    }
-                                    return null;
-                                }
-                            }
-                        });
+                });
                 LogUtil.logAlways("[防御] 已挂钩 attach（吞异常版）");
-            } catch (Throwable t) {
-                LogUtil.logAlways("[防御] attach 挂钩失败: " + t);
+            } catch (Throwable th) {
+                LogUtil.logAlways("[防御] attach 挂钩失败: " + th);
             }
-
-            // 2) setMusicBgShader(MediaData, Drawable)——bindMediaData 触发的主崩溃点
             try {
-                final Method shader = findTwoArgMethod(binder, "setMusicBgShader");
-                if (shader == null) {
+                Method methodFindTwoArgMethod = findTwoArgMethod(cls, "setMusicBgShader");
+                if (methodFindTwoArgMethod == null) {
                     LogUtil.log("[防御] setMusicBgShader 未找到（跳过）");
                 } else {
-                    shader.setAccessible(true);
-                    hook(shader)
-                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                            .setId("media-island-shader-guard")
-                            .intercept(new XposedInterface.Hooker() {
-                                @Override
-                                public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                                try {
-                                    return chain.proceed();
-                                } catch (Throwable t) {
-                                    if (LogUtil.hitOnce("island-shader")) {
-                                        LogUtil.logAlways("[防御] setMusicBgShader 内崩溃已吞掉"
-                                                + "（MiPalette）: " + t);
-                                    }
+                    methodFindTwoArgMethod.setAccessible(true);
+                    hook(methodFindTwoArgMethod).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("media-island-shader-guard").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook.8
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            try {
+                                return chain.proceed();
+                            } catch (Throwable th2) {
+                                if (!LogUtil.hitOnce("island-shader")) {
                                     return null;
                                 }
-                                }
-                            });
+                                LogUtil.logAlways("[防御] setMusicBgShader 内崩溃已吞掉（MiPalette）: " + th2);
+                                return null;
+                            }
+                        }
+                    });
                     LogUtil.logAlways("[防御] 已挂钩 setMusicBgShader（吞异常版）");
                 }
-            } catch (Throwable t) {
-                LogUtil.logAlways("[防御] setMusicBgShader 挂钩失败: " + t);
+            } catch (Throwable th2) {
+                LogUtil.logAlways("[防御] setMusicBgShader 挂钩失败: " + th2);
             }
-        } catch (Throwable t) {
-            LogUtil.logAlways("[防御] 媒体岛防御挂钩失败（类未加载等）: " + t);
+        } catch (Throwable th3) {
+            LogUtil.logAlways("[防御] 媒体岛防御挂钩失败（类未加载等）: " + th3);
         }
     }
 
-    /** 找指定类的 2 参方法（签名按字节码：MediaData + Drawable，避免显式类型解析） */
-    private static Method findTwoArgMethod(Class<?> c, String name) {
-        for (Method m : c.getDeclaredMethods()) {
-            if (m.getName().equals(name) && m.getParameterCount() == 2) {
-                return m;
+    private static Method findTwoArgMethod(Class<?> cls, String str) {
+        for (Method method : cls.getDeclaredMethods()) {
+            if (method.getName().equals(str) && method.getParameterCount() == 2) {
+                return method;
             }
         }
         return null;
     }
 
-    // ============================================================
-    // 通知展开按钮颜色（v3.0.8 完整恢复 v1.6.2 机制）
-    // ============================================================
-    /**
-     * v1.6.2 完整语义（git 9519087，用户确认白透正确）：
-     *  - hook View.setBackground(Drawable) + View.setBackgroundTintList(ColorStateList)
-     *    全局，回调内宽泛匹配「展开按钮」：类名含 expandbutton/expandicon/
-     *    chevron/arrowbutton，或 id 名含 expand_button/expandbutton/chevron/
-     *    expand_arrow → 替换为白透药丸 / 清 tint；
-     *  - 命中类记住（sConfirmedViewClass），无关类进快路径缓存（≤300），
-     *    不重复查资源名；
-     *  - **每次染色都拦截替换** → 主题任何时刻染深色都被覆盖 → 必然白透。
-     * v3.0.8 修正 v3.0.7 两处错误：
-     *   1) 匹配从「仅 id == expand_button_pill」放宽回 v1.6.2 双关键词
-     *      （黑透根因：目标 view 不是 expand_button_pill 这个 id）；
-     *   2) 参数替换改回 LibXposed 正确姿势：组装新数组 chain.proceed(newArgs)
-     *      （v3.0.7 用 getArgs().set() 再无参 proceed，参数未生效）。
-     * 加 v2.1.1 教训排除：id 名以 volume_ 开头（音量面板）绝不命中。
-     */
-    private void installExpandButtonColor(ClassLoader cl) {
+    private void installExpandButtonColor(ClassLoader classLoader) {
+        if (classLoader == null) {
+            return;
+        }
         try {
-            if (cl == null) return;
-            // 1) setBackground(Drawable)：每次染色拦截替换为白透药丸
             try {
-                final Method setBg = android.view.View.class.getMethod(
-                        "setBackground", android.graphics.drawable.Drawable.class);
-                hook(setBg)
-                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                        .setId("expand-button-color-bg")
-                        .intercept(new XposedInterface.Hooker() {
-                            @Override
-                            public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                                if (!sGlassEnabled) return chain.proceed();
-                                Object self = chain.getThisObject();
-                                if (self instanceof View) {
-                                    View v = (View) self;
-                                    if (isExpandView(v)) {
-                                        // 组装新参数数组 proceed（LibXposed 正确姿势）
-                                        Object[] newArgs = new Object[]{
-                                                makeGlassPill(v.getResources())};
-                                        if (LogUtil.hitOnce("expand-bg")) {
-                                            LogUtil.logAlways("[展开按钮] setBackground 拦截替换为白透 类="
-                                                    + v.getClass().getName() + " id=0x"
-                                                    + Integer.toHexString(v.getId()));
-                                        }
-                                        return chain.proceed(newArgs);
-                                    }
+                hook(View.class.getMethod("setBackground", Drawable.class)).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("expand-button-color-bg").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook.9
+                    public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                        if (!MainHook.this.sGlassEnabled) {
+                            return chain.proceed();
+                        }
+                        Object thisObject = chain.getThisObject();
+                        if (thisObject instanceof View) {
+                            View view = (View) thisObject;
+                            if (MainHook.isExpandView(view)) {
+                                Object[] objArr = {MainHook.makeGlassPill(view.getResources())};
+                                if (LogUtil.hitOnce("expand-bg")) {
+                                    LogUtil.logAlways("[展开按钮] setBackground 拦截替换为白透 类=" + view.getClass().getName() + " id=0x" + Integer.toHexString(view.getId()));
                                 }
-                                return chain.proceed();
+                                return chain.proceed(objArr);
                             }
-                        });
+                        }
+                        return chain.proceed();
+                    }
+                });
                 LogUtil.logAlways("[展开按钮] 已挂钩 setBackground（v1.6.2 宽泛匹配拦截）");
-            } catch (Throwable t) {
-                LogUtil.logAlways("[展开按钮] setBackground 挂钩失败: " + t);
+            } catch (Throwable th) {
+                LogUtil.logAlways("[展开按钮] setBackground 挂钩失败: " + th);
             }
-            // 2) setBackgroundTintList(ColorStateList)：命中则清 tint
             try {
-                final Method setTint = android.view.View.class.getMethod(
-                        "setBackgroundTintList", android.content.res.ColorStateList.class);
-                hook(setTint)
-                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                        .setId("expand-button-color-tint")
-                        .intercept(new XposedInterface.Hooker() {
-                            @Override
-                            public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                                if (!sGlassEnabled) return chain.proceed();
-                                Object self = chain.getThisObject();
-                                if (self instanceof View) {
-                                    View v = (View) self;
-                                    if (isExpandView(v)) {
-                                        Object[] newArgs = new Object[]{null}; // 清 tint
-                                        if (LogUtil.hitOnce("expand-tint")) {
-                                            LogUtil.logAlways("[展开按钮] setBackgroundTintList 拦截清 tint 类="
-                                                    + v.getClass().getName() + " id=0x"
-                                                    + Integer.toHexString(v.getId()));
-                                        }
-                                        return chain.proceed(newArgs);
-                                    }
+                hook(View.class.getMethod("setBackgroundTintList", ColorStateList.class)).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("expand-button-color-tint").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook.10
+                    public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                        if (!MainHook.this.sGlassEnabled) {
+                            return chain.proceed();
+                        }
+                        Object thisObject = chain.getThisObject();
+                        if (thisObject instanceof View) {
+                            View view = (View) thisObject;
+                            if (MainHook.isExpandView(view)) {
+                                Object[] objArr = {null};
+                                if (LogUtil.hitOnce("expand-tint")) {
+                                    LogUtil.logAlways("[展开按钮] setBackgroundTintList 拦截清 tint 类=" + view.getClass().getName() + " id=0x" + Integer.toHexString(view.getId()));
                                 }
-                                return chain.proceed();
+                                return chain.proceed(objArr);
                             }
-                        });
+                        }
+                        return chain.proceed();
+                    }
+                });
                 LogUtil.logAlways("[展开按钮] 已挂钩 setBackgroundTintList（v1.6.2 宽泛匹配拦截）");
-            } catch (Throwable t) {
-                LogUtil.logAlways("[展开按钮] setBackgroundTintList 挂钩失败: " + t);
+            } catch (Throwable th2) {
+                LogUtil.logAlways("[展开按钮] setBackgroundTintList 挂钩失败: " + th2);
             }
-        } catch (Throwable t) {
-            LogUtil.logAlways("[展开按钮] 挂钩失败: " + t);
+        } catch (Throwable th3) {
+            LogUtil.logAlways("[展开按钮] 挂钩失败: " + th3);
         }
     }
 
-    /** 展开按钮的资源 id 缓存。0=未解析，-1=解析失败（走 id 名兜底），>0=目标 id。
-     *  解析一次后全局复用，之后判命中只需一次 int 比较。 */
-    private static volatile int sExpandPillId = 0;
-    /** 展开按钮的 View 类缓存（命中 id 后再比对类，避免 getName 字符串比较） */
-    private static volatile Class<?> sExpandViewClass = null;
-
-    /** v3.3.6：判断 View 是否「通知栏展开按钮」。
-     *  旧版用关键词宽泛匹配（expandbutton / expandicon / chevron / arrowbutton），
-     *  会误命中控制中心的 chevron 箭头等图标 → 背景被替换成白透药丸 → 出现
-     *  「方底 / 圆底混杂、颜色不一致」（快速切换材质时控制中心重建即触发）。
-     *  改为「类名 + id」双条件精确匹配，实测命中
-     *  com.android.internal.widget.NotificationOptimizedLinearLayout + expand_button_pill。
-     *
-     *  v3.3.11 常驻开销（本方法跑在 View.setBackground / setBackgroundTintList 全局
-     *  钩子里，SystemUI 内每次给 View 设背景都会进来）：
-     *   旧实现为做缓存，每次调用都拼一次键字符串（类名 + "#" + id）→ 每次分配
-     *   StringBuilder + String，再两次 Set 查找。滚动通知栏时是每秒几百次级别的
-     *   分配，纯属 GC 压力。
-     *   新实现先把目标 id 解析成一个 int（只解析一次），之后 99.9% 的 View 在
-     *   「id != 目标」这一次 int 比较上就退出——零分配、O(1)，连 Set 都不需要，
-     *   两个缓存集合一并删掉。
-     *   只有 id 解析失败的 ROM 才回退到旧的「id 名反查」慢路径（功能不丢）。 */
-    private static boolean isExpandView(View v) {
+    /* JADX INFO: Access modifiers changed from: private */
+    public static boolean isExpandView(View view) {
         try {
-            int id = v.getId();
-            if (id == View.NO_ID) return false;
-            int target = sExpandPillId;
-            if (target == 0) {
-                target = resolveExpandPillId(v);
-                if (target == 0) return false; // 连兜底都没解析到，本次放行
+            int id = view.getId();
+            if (id == -1) {
+                return false;
             }
-            if (target < 0) {
-                // id 解析失败：回退到「id 名反查」慢路径（每种 View 只走一次后即被
-                // 上面的 int 快路径取代；ROM 上 id 名与 getIdentifier 都失败时才会
-                // 反复走这里，属异常 ROM，保功能优先）
-                return matchExpandByResourceName(v);
+            int iResolveExpandPillId = sExpandPillId;
+            if (iResolveExpandPillId == 0 && (iResolveExpandPillId = resolveExpandPillId(view)) == 0) {
+                return false;
             }
-            if (id != target) return false;          // ← 快路径：零分配，绝大多数在这里返回
-            Class<?> cached = sExpandViewClass;
-            if (cached != null) return v.getClass() == cached;
-            if (Constants.EXPAND_BUTTON_VIEW_CLASS.equals(v.getClass().getName())) {
-                sExpandViewClass = v.getClass();
+            if (iResolveExpandPillId < 0) {
+                return matchExpandByResourceName(view);
+            }
+            if (id != iResolveExpandPillId) {
+                return false;
+            }
+            Class<?> cls = sExpandViewClass;
+            if (cls != null) {
+                return view.getClass() == cls;
+            }
+            if (Constants.EXPAND_BUTTON_VIEW_CLASS.equals(view.getClass().getName())) {
+                sExpandViewClass = view.getClass();
                 return true;
             }
             return false;
-        } catch (Throwable t) {
+        } catch (Throwable unused) {
             return false;
         }
     }
 
-    /** 解析 expand_button_pill 的资源 id（只解析一次）。返回 0=完全失败走兜底，
-     *  -1=id 解析失败（ROM 差异），>0=目标 id。 */
-    private static int resolveExpandPillId(View v) {
+    private static int resolveExpandPillId(View view) {
         try {
-            android.content.Context ctx = v.getContext();
-            int id = ctx.getResources().getIdentifier(
-                    Constants.EXPAND_BUTTON_PILL_ID_NAME, "id", ctx.getPackageName());
-            if (id == 0) {
-                // 兜底：按宿主包名再试一次（插件 Context 的 packageName 可能不同）
-                id = ctx.getResources().getIdentifier(
-                        Constants.EXPAND_BUTTON_PILL_ID_NAME, "id", Constants.TARGET_PKG);
+            Context context = view.getContext();
+            int identifier = context.getResources().getIdentifier(Constants.EXPAND_BUTTON_PILL_ID_NAME, "id", context.getPackageName());
+            if (identifier == 0) {
+                identifier = context.getResources().getIdentifier(Constants.EXPAND_BUTTON_PILL_ID_NAME, "id", Constants.TARGET_PKG);
             }
-            sExpandPillId = (id == 0 ? -1 : id);
-            LogUtil.log("[展开按钮] 目标 id 解析: " + Constants.EXPAND_BUTTON_PILL_ID_NAME
-                    + " = " + (id == 0 ? "失败，走 id 名兜底" : ("0x" + Integer.toHexString(id))));
+            sExpandPillId = identifier == 0 ? -1 : identifier;
+            LogUtil.log("[展开按钮] 目标 id 解析: expand_button_pill = " + (identifier == 0 ? "失败，走 id 名兜底" : "0x" + Integer.toHexString(identifier)));
             return sExpandPillId;
-        } catch (Throwable t) {
+        } catch (Throwable unused) {
             sExpandPillId = -1;
             return -1;
         }
     }
 
-    /** 兜底判定：类名 + id 资源名双条件匹配（getIdentifier 不可用时使用） */
-    private static boolean matchExpandByResourceName(View v) {
-        return Constants.EXPAND_BUTTON_VIEW_CLASS.equals(v.getClass().getName())
-                && Constants.EXPAND_BUTTON_PILL_ID_NAME.equals(viewIdName(v));
-    }
-
-    /** 取 View 的 id 资源名（失败返回十六进制兜底） */
-    private static String viewIdName(View v) {
-        try {
-            int id = v.getId();
-            if (id == View.NO_ID) return "NO_ID";
-            String name = v.getResources().getResourceEntryName(id);
-            return name != null ? name : ("0x" + Integer.toHexString(id));
-        } catch (Throwable t) {
-            return "0x" + Integer.toHexString(v.getId());
+    private static boolean matchExpandByResourceName(View view) {
+        if (Constants.EXPAND_BUTTON_VIEW_CLASS.equals(view.getClass().getName())) {
+            return Constants.EXPAND_BUTTON_PILL_ID_NAME.equals(viewIdNameOrNull(view));
         }
+        return false;
     }
 
-    /** 白透药丸 drawable（v1.6.2 值，跟随深浅模式） */
-    private static android.graphics.drawable.Drawable makeGlassPill(
-            android.content.res.Resources res) {
-        boolean night = (res.getConfiguration().uiMode
-                & android.content.res.Configuration.UI_MODE_NIGHT_MASK)
-                == android.content.res.Configuration.UI_MODE_NIGHT_YES;
-        int color = night ? Constants.EXPAND_PILL_BG_DARK : Constants.EXPAND_PILL_BG_LIGHT;
-        android.graphics.drawable.GradientDrawable d = new android.graphics.drawable.GradientDrawable();
-        d.setShape(android.graphics.drawable.GradientDrawable.RECTANGLE);
-        d.setColor(color);
-        float r = 14f * res.getDisplayMetrics().density;
-        d.setCornerRadius(r);
-        return d;
-    }
-
-    // ============================================================
-    // 锁屏指纹图标/动画隐藏（v3.1.0，用户 smali 方案）
-    // ============================================================
-    /**
-     * 精准方案（与用户 smali patch 语义等价，dexdump 确认签名）：
-     *   - getFingerIconResource(Context;)I：
-     *       mKeyguardAuthen==true → 返回隐藏资源 id（0x7f080000，运行时验证
-     *       可解析才使用，避免 ROM 差异崩溃；验证失败走原逻辑）；
-     *   - getRecognizingAnimItem()L.../MiuiGxzwAnimItem;：
-     *       mKeyguardAuthen==true → 返回 mAnimItemMap.get(Integer.valueOf(0))
-     *       （key=0 空动画条目），识别动画不再播放。
-     * 仅锁屏（mKeyguardAuthen=true）生效；支付/应用内指纹（false）放行原逻辑。
-     * 字段 mKeyguardAuthen/mAnimItemMap 均为 PUBLIC（dexdump 确认），反射缓存。
-     */
-    private void installLockFodHooks(ClassLoader cl) {
+    private static String viewIdNameOrNull(View view) {
+        String resourceEntryName;
         try {
-            final Class<?> mgr = Class.forName(Constants.MIUI_GXZW_ANIM_MANAGER_CLASS, false, cl);
-            // 1) getFingerIconResource(Z)I
-            try {
-                final Method getRes = mgr.getDeclaredMethod(
-                        Constants.FOD_GET_FINGER_ICON_RES_METHOD, boolean.class);
-                hook(getRes)
-                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                        .setId("lockscreen-fod-icon-hide")
-                        .intercept(new XposedInterface.Hooker() {
-                            @Override
-                            public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                                if (!sHideLockFodFlag.get()) return chain.proceed();
-                                if (!isLockFodAuthen(chain.getThisObject())) return chain.proceed();
-                                // 运行时验证隐藏资源可解析（ROM 兜底）；Context 取 mContext 字段
-                                android.content.Context ctx = lockFodContext(chain.getThisObject());
-                                if (ctx != null && isHideResValid(ctx)) {
-                                    if (LogUtil.hitOnce("fod-icon")) {
-                                        LogUtil.logAlways("[锁屏指纹] getFingerIconResource 命中"
-                                                + "（mKeyguardAuthen=true）→ 返回隐藏资源 0x7f080000");
-                                    }
-                                    return Integer.valueOf(Constants.FOD_HIDE_RES_ID);
-                                }
-                                return chain.proceed();
-                            }
-                        });
-                LogUtil.logAlways("[锁屏指纹] 已挂钩 getFingerIconResource(Z)I");
-            } catch (Throwable t) {
-                LogUtil.logAlways("[锁屏指纹] getFingerIconResource 挂钩失败: " + t);
+            int id = view.getId();
+            if (id == -1 || (resourceEntryName = view.getResources().getResourceEntryName(id)) == null || resourceEntryName.length() == 0 || resourceEntryName.startsWith("0x")) {
+                return null;
             }
-            // 2) getRecognizingAnimItem()MiuiGxzwAnimItem
-            try {
-                final Method getAnim = mgr.getDeclaredMethod(
-                        Constants.FOD_GET_RECOGNIZING_ANIM_METHOD);
-                hook(getAnim)
-                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                        .setId("lockscreen-fod-anim-hide")
-                        .intercept(new XposedInterface.Hooker() {
-                            @Override
-                            public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                                if (!sHideLockFodFlag.get()) return chain.proceed();
-                                if (!isLockFodAuthen(chain.getThisObject())) return chain.proceed();
-                                Object item = lockFodAnimZeroItem(chain.getThisObject());
-                                if (LogUtil.hitOnce("fod-anim")) {
-                                    LogUtil.logAlways("[锁屏指纹] getRecognizingAnimItem 命中"
-                                            + "（mKeyguardAuthen=true）→ 返回空动画条目 "
-                                            + (item == null ? "null" : item.getClass().getName()));
-                                }
-                                return item; // 可能为 null：无动画
-                            }
-                        });
-                LogUtil.logAlways("[锁屏指纹] 已挂钩 getRecognizingAnimItem()");
-            } catch (Throwable t) {
-                LogUtil.logAlways("[锁屏指纹] getRecognizingAnimItem 挂钩失败: " + t);
-            }
-        } catch (Throwable t) {
-            LogUtil.logAlways("[锁屏指纹] 类未找到（MiuiGxzwAnimManager 不存在）: " + t);
-        }
-    }
-
-    /** 反射读 mKeyguardAuthen（PUBLIC 字段，缓存 Field） */
-    private static volatile java.lang.reflect.Field sFodAuthenField = null;
-
-    private static boolean isLockFodAuthen(Object self) {
-        try {
-            if (self == null) return false;
-            java.lang.reflect.Field f = sFodAuthenField;
-            if (f == null) {
-                f = self.getClass().getField(Constants.FOD_KEYGUARD_AUTHEN_FIELD);
-                sFodAuthenField = f;
-            }
-            return (Boolean) f.get(self);
-        } catch (Throwable t) {
-            return false; // 读不到：放行（不影响支付）
-        }
-    }
-
-    /** 反射读 mAnimItemMap.get(Integer.valueOf(0)) */
-    private static volatile java.lang.reflect.Field sFodAnimMapField = null;
-
-    private static Object lockFodAnimZeroItem(Object self) {
-        try {
-            if (self == null) return null;
-            java.lang.reflect.Field f = sFodAnimMapField;
-            if (f == null) {
-                f = self.getClass().getField(Constants.FOD_ANIM_ITEM_MAP_FIELD);
-                sFodAnimMapField = f;
-            }
-            Object map = f.get(self);
-            if (!(map instanceof java.util.Map)) return null;
-            return ((java.util.Map<?, ?>) map).get(Integer.valueOf(0));
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
-    /** 反射读 mContext（PUBLIC 字段，缓存 Field），用于隐藏资源可解析验证 */
-    private static volatile java.lang.reflect.Field sFodCtxField = null;
-
-    private static android.content.Context lockFodContext(Object self) {
-        try {
-            if (self == null) return null;
-            java.lang.reflect.Field f = sFodCtxField;
-            if (f == null) {
-                f = self.getClass().getField("mContext");
-                sFodCtxField = f;
-            }
-            Object ctx = f.get(self);
-            return ctx instanceof android.content.Context ? (android.content.Context) ctx : null;
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
-    /** 运行时验证 0x7f080000 可解析（避免 ROM 差异导致 getDrawable 崩溃） */
-    private static volatile Boolean sHideResValid = null;
-
-    private static boolean isHideResValid(android.content.Context ctx) {
-        Boolean ok = sHideResValid;
-        if (ok != null) return ok.booleanValue();
-        try {
-            String name = ctx.getResources().getResourceEntryName(Constants.FOD_HIDE_RES_ID);
-            sHideResValid = Boolean.TRUE;
-            LogUtil.logAlways("[锁屏指纹] 隐藏资源 0x7f080000 可解析（" + name + "）");
-            return true;
-        } catch (Throwable t) {
-            sHideResValid = Boolean.FALSE;
-            LogUtil.logAlways("[锁屏指纹] 隐藏资源 0x7f080000 不可解析，回退原逻辑: " + t);
-            return false;
-        }
-    }
-
-    // ============================================================
-    // 隐藏通知「清除通知」按钮（v3.3.3：图标 INVISIBLE + 容器下移屏底外）
-    // ============================================================
-    /**
-     * 隐藏「清除通知」按钮（双保险，每次 attach 都执行）。
-     *   - 按钮 CircleAndTickAnimView id = notification_dismiss_view（0x7f0b0865）；
-     *   - v3.2.0 旧方案：父容器平移 155dp/-550dp + alpha=0 —— 透明容器仍参与触摸
-     *     分发，落到上部通知区后无声拦截第 1~2 条通知的「展开按钮」点击（已弃）；
-     *   - v3.3.2 方案：仅图标 INVISIBLE —— 但一次性 sDone 守卫导致通知栏刷新
-     *     重建按钮行后新实例不再隐藏（用户实测按钮「又回来了」）；
-     *   - v3.3.3 加固：去掉 sDone，**每次 attach 都执行**：
-     *       1) 图标本身 INVISIBLE（占位不变、触摸分发跳过、通知不回流）；
-     *       2) 父容器整体下移到屏幕底部之外（translationY=+屏高，向下不遮任何
-     *          通知）——即使 MIUI 之后显式 setVisibility(VISIBLE) 也在屏外不可见。
-     *   - 时机：hook View.onAttachedToWindow 全局 + 按钮 id 过滤（attach 事件低频、
-     *     回调仅 O(1) id 比对、零副作用其他 view）。
-     */
-    private void installHideDismissButtonHook(ClassLoader cl) {
-        try {
-            // onAttachedToWindow 是 protected 方法，必须 getDeclaredMethod + setAccessible
-            final Method oat = View.class.getDeclaredMethod("onAttachedToWindow");
-            oat.setAccessible(true);
-            hook(oat)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("notif-dismiss-btn-hide")
-                    .intercept(new XposedInterface.Hooker() {
-                        private volatile int sId;      // 0=未解析
-
-                        @Override
-                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                            if (!sHideDismissFlag.get()) return chain.proceed();
-                            Object self = chain.getThisObject();
-                            if (!(self instanceof View)) return chain.proceed();
-                            View v = (View) self;
-                            int target = sId;
-                            if (target == 0) {
-                                try {
-                                    android.content.Context ctx = v.getContext();
-                                    if (ctx == null) return chain.proceed();
-                                    target = ctx.getResources().getIdentifier(
-                                            Constants.NOTIF_DISMISS_VIEW_ID_NAME,
-                                            "id", Constants.TARGET_PKG);
-                                    if (target == 0) return chain.proceed();
-                                    sId = target;
-                                    LogUtil.logAlways("[清除按钮] 按钮 id 解析: "
-                                            + Constants.NOTIF_DISMISS_VIEW_ID_NAME
-                                            + " = " + target);
-                                } catch (Throwable t) {
-                                    return chain.proceed();
-                                }
-                            }
-                            if (v.getId() == target) {
-                                try {
-                                    // v3.3.3 加固：清除按钮行会被通知栏刷新重建（新实例重新
-                                    // attach），v3.3.2 的一次性 sDone 只隐藏首个实例 → 按钮
-                                    // 「又回来了」。现改为**每次 attach 都执行**（attach 低频
-                                    // + O(1) id 比对，零副作用），双保险：
-                                    //   1) 图标本身 INVISIBLE（占位不变、触摸分发跳过）；
-                                    //   2) 父容器整体下移到屏幕底部之外（translationY=+屏高，
-                                    //      向下移动不遮任何通知）——即使 MIUI 之后显式
-                                    //      setVisibility(VISIBLE) 也依然在屏外不可见。
-                                    View targetV = v;
-                                    android.view.ViewParent p = v.getParent();
-                                    if (p instanceof View) targetV = (View) p;
-                                    float density = targetV.getResources().getDisplayMetrics().density;
-                                    int screenH = targetV.getResources().getDisplayMetrics().heightPixels;
-                                    targetV.setTranslationX(0f);
-                                    targetV.setTranslationY(screenH + 20f * density);
-                                    v.setVisibility(View.INVISIBLE);
-                                    if (LogUtil.hitOnce("dismiss-hide")) {
-                                        LogUtil.logAlways("[清除按钮] 已隐藏：图标 INVISIBLE + 容器下移到屏底之外（+"
-                                                + screenH + "px）按钮类=" + v.getClass().getName()
-                                                + " 容器类=" + targetV.getClass().getName());
-                                    }
-                                } catch (Throwable ignored) {
-                                }
-                            }
-                            return chain.proceed();
-                        }
-                    });
-            LogUtil.logAlways("[清除按钮] 已挂钩 View.onAttachedToWindow（id 精准过滤，每次 attach 隐藏）");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[清除按钮] 挂钩失败: " + t);
-        }
-    }
-
-    // ============================================================
-    // 柔光玻璃焦点通知（v3.2.0 用户 smali 方案：Focus→NotificationRow）
-    // ============================================================
-    /**
-     * 用户 smali patch 语义（dexdump 确认 classes2.dex）：
-     *   - 4 个 FocusNotificationGlass*Effect.apply 内部引用
-     *     FocusNotificationBlurEffect.INSTANCE.apply(row, ctx) 做模糊，
-     *     且 glassParamsArray 首次为 null 时从 0x7f0300a8
-     *     (focus_notification_glass_params_normal) 解析玻璃参数；
-     *   - 用户 patch：FocusNotificationBlurEffect → NotificationRowBlurEffect、
-     *     0x7f0300a8 → 0x7f0300ce (notification_glass_params_normal)。
-     * 模块实现（等价、更稳）：
-     *   1) hook FocusNotificationBlurEffect.apply(row, ctx) 短路，
-     *      改调 NotificationRowBlurEffect.INSTANCE.apply(row, ctx)（两结构一致）；
-     *   2) 预填 4 个 Focus 类的 PUBLIC STATIC glassParamsArray 为
-     *      notification_glass_params_normal（getIdentifier 运行时解析，防 RRO/ROM 差异）。
-     */
-    private void installFocusGlassHooks(ClassLoader cl) {
-        // 1) blur 替换
-        try {
-            final Class<?> fb = Class.forName(Constants.FOCUS_BLUR_CLASS, false, cl);
-            final Class<?> rowCls = Class.forName(
-                    "com.android.systemui.statusbar.notification.row.ExpandableNotificationRow",
-                    false, cl);
-            final Method fapply = fb.getDeclaredMethod("apply", rowCls, android.content.Context.class);
-            hook(fapply)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("focus-glass-blur-swap")
-                    .intercept(new XposedInterface.Hooker() {
-                        @Override
-                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                            if (!sFocusGlassFlag.get()) return chain.proceed();
-                            Object row = chain.getArg(0);
-                            Object ctx = chain.getArg(1);
-                            try {
-                                Class<?> nrb = Class.forName(Constants.ROW_BLUR_CLASS, false, cl);
-                                Object inst = nrb.getField("INSTANCE").get(null);
-                                nrb.getMethod("apply", rowCls, android.content.Context.class)
-                                        .invoke(inst, row, ctx);
-                                return null; // 短路 focus blur
-                            } catch (Throwable t) {
-                                return chain.proceed(); // 失败退回原逻辑
-                            }
-                        }
-                    });
-            LogUtil.logAlways("[焦点玻璃] 已挂钩 FocusNotificationBlurEffect.apply → NotificationRowBlurEffect");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[焦点玻璃] blur 替换挂钩失败: " + t);
-        }
-        // 2) 预填 glassParamsArray（普通通知玻璃参数）。
-        //    onPackageLoaded 时尽力预填一次；同时 hook 4 个 Focus 类 apply
-        //    懒填充兜底（用 apply 的 Context 参数，避免 application context 时机问题）。
-        try {
-            final android.content.Context app = currentAppContext();
-            if (app != null) {
-                fillFocusGlassParams(app, cl);
-            }
-            for (final String clsName : Constants.FOCUS_GLASS_CLASSES) {
-                try {
-                    final Class<?> c = Class.forName(clsName, false, cl);
-                    final Method apply = c.getDeclaredMethod("apply",
-                            Object.class, android.content.Context.class);
-                    apply.setAccessible(true);
-                    hook(apply)
-                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                            .setId("focus-glass-params-lazy")
-                            .intercept(new XposedInterface.Hooker() {
-                                private boolean sFilled;
-
-                                @Override
-                                public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                                    // v3.3.11：填过之后就只剩一次非 volatile 布尔读，
-                                    // 不再每次都读 AtomicBoolean（apply 随通知渲染高频调用）
-                                    if (sFilled) return chain.proceed();
-                                    if (sFocusGlassFlag.get()) {
-                                        sFilled = true;
-                                        Object ctx0 = chain.getArg(1);
-                                        if (ctx0 instanceof android.content.Context) {
-                                            fillFocusGlassParams((android.content.Context) ctx0, cl);
-                                        }
-                                    }
-                                    return chain.proceed();
-                                }
-                            });
-                } catch (Throwable ignored) {
-                }
-            }
-            LogUtil.logAlways("[焦点玻璃] 已挂钩 4 个 Focus 类 apply（懒填充兜底）");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[焦点玻璃] glassParamsArray 处理失败: " + t);
-        }
-    }
-
-    /** 用 Context 解析 notification_glass_params_normal 并预填 4 个 Focus 类 glassParamsArray */
-    private static void fillFocusGlassParams(android.content.Context ctx, ClassLoader cl) {
-        try {
-            final int rid = ctx.getResources().getIdentifier(
-                    Constants.NORMAL_GLASS_PARAMS_RES, "array", Constants.TARGET_PKG);
-            if (rid == 0) return;
-            String[] ss = ctx.getResources().getStringArray(rid);
-            final float[] fa = new float[ss.length];
-            for (int i = 0; i < ss.length; i++) {
-                try {
-                    fa[i] = Float.parseFloat(ss[i]);
-                } catch (Throwable ignored) {
-                    fa[i] = 0f;
-                }
-            }
-            for (String clsName : Constants.FOCUS_GLASS_CLASSES) {
-                try {
-                    Class<?> c = Class.forName(clsName, false, cl);
-                    java.lang.reflect.Field f = c.getField("glassParamsArray");
-                    f.set(null, fa);
-                } catch (Throwable ignored) {
-                }
-            }
-            LogUtil.logAlways("[焦点玻璃] 已填充 glassParamsArray（"
-                    + Constants.NORMAL_GLASS_PARAMS_RES + " len=" + fa.length + "）");
-        } catch (Throwable ignored) {
-        }
-    }
-
-    /** 纯反射拿当前进程 Application Context（ActivityThread 为 hide） */
-    private static android.content.Context currentAppContext() {
-        try {
-            Object app = currentApplication();
-            if (app instanceof android.content.Context) return (android.content.Context) app;
-        } catch (Throwable ignored) {
+            return resourceEntryName;
+        } catch (Throwable unused) {
         }
         return null;
     }
 
-    // ============================================================
-    // 通知下沉（参照 HyperChanger；每个目标类独立去重）
-    // ============================================================
-    private void installNotificationSinkHooks(ClassLoader cl) {
-        // 通知下沉：hook 总是挂载（onPackageLoaded 时 sSinkEnabled 可能还是默认，
-        // 框架直供的设置会即时刷新，回调里判断开关实时生效）。
-        LogUtil.logAlways("[下沉] installNotificationSinkHooks 开始，sSinkEnabled=" + sSinkEnabled);
+    private static String viewIdName(View view) {
+        String strViewIdNameOrNull = viewIdNameOrNull(view);
+        return strViewIdNameOrNull != null ? strViewIdNameOrNull : "0x" + Integer.toHexString(view.getId());
+    }
 
-        // 1) 通知不使用「指纹让位」额外 shelf 空间 -> 通知铺满/下沉
+    /* JADX INFO: Access modifiers changed from: private */
+    public static Drawable makeGlassPill(Resources resources) {
+        int i = (resources.getConfiguration().uiMode & 48) == 32 ? Constants.EXPAND_PILL_BG_DARK : Constants.EXPAND_PILL_BG_LIGHT;
+        GradientDrawable gradientDrawable = new GradientDrawable();
+        gradientDrawable.setShape(0);
+        gradientDrawable.setColor(i);
+        gradientDrawable.setCornerRadius(resources.getDisplayMetrics().density * 14.0f);
+        return gradientDrawable;
+    }
+
+    private void installLockFodHooks(ClassLoader classLoader) {
+        try {
+            Class<?> cls = Class.forName(Constants.MIUI_GXZW_ANIM_MANAGER_CLASS, false, classLoader);
+            try {
+                hook(cls.getDeclaredMethod(Constants.FOD_GET_FINGER_ICON_RES_METHOD, Boolean.TYPE)).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("lockscreen-fod-icon-hide").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook.11
+                    public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                        if (MainHook.sHideLockFodFlag.get() && MainHook.isLockFodAuthen(chain.getThisObject())) {
+                            Context contextLockFodContext = MainHook.lockFodContext(chain.getThisObject());
+                            if (contextLockFodContext != null && MainHook.isHideResValid(contextLockFodContext)) {
+                                if (LogUtil.hitOnce("fod-icon")) {
+                                    LogUtil.logAlways("[锁屏指纹] getFingerIconResource 命中（mKeyguardAuthen=true）→ 返回隐藏资源 0x7f080000");
+                                }
+                                return Integer.valueOf(Constants.FOD_HIDE_RES_ID);
+                            }
+                            return chain.proceed();
+                        }
+                        return chain.proceed();
+                    }
+                });
+                LogUtil.logAlways("[锁屏指纹] 已挂钩 getFingerIconResource(Z)I");
+            } catch (Throwable th) {
+                LogUtil.logAlways("[锁屏指纹] getFingerIconResource 挂钩失败: " + th);
+            }
+            try {
+                hook(cls.getDeclaredMethod(Constants.FOD_GET_RECOGNIZING_ANIM_METHOD, new Class[0])).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("lockscreen-fod-anim-hide").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook.12
+                    public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                        if (MainHook.sHideLockFodFlag.get() && MainHook.isLockFodAuthen(chain.getThisObject())) {
+                            Object objLockFodAnimZeroItem = MainHook.lockFodAnimZeroItem(chain.getThisObject());
+                            if (LogUtil.hitOnce("fod-anim")) {
+                                LogUtil.logAlways("[锁屏指纹] getRecognizingAnimItem 命中（mKeyguardAuthen=true）→ 返回空动画条目 " + (objLockFodAnimZeroItem == null ? "null" : objLockFodAnimZeroItem.getClass().getName()));
+                            }
+                            return objLockFodAnimZeroItem;
+                        }
+                        return chain.proceed();
+                    }
+                });
+                LogUtil.logAlways("[锁屏指纹] 已挂钩 getRecognizingAnimItem()");
+            } catch (Throwable th2) {
+                LogUtil.logAlways("[锁屏指纹] getRecognizingAnimItem 挂钩失败: " + th2);
+            }
+        } catch (Throwable th3) {
+            LogUtil.logAlways("[锁屏指纹] 类未找到（MiuiGxzwAnimManager 不存在）: " + th3);
+        }
+    }
+
+    /* JADX INFO: Access modifiers changed from: private */
+    public static boolean isLockFodAuthen(Object obj) {
+        if (obj == null) {
+            return false;
+        }
+        try {
+            Field field = sFodAuthenField;
+            if (field == null) {
+                field = obj.getClass().getField(Constants.FOD_KEYGUARD_AUTHEN_FIELD);
+                sFodAuthenField = field;
+            }
+            return ((Boolean) field.get(obj)).booleanValue();
+        } catch (Throwable unused) {
+            return false;
+        }
+    }
+
+    /* JADX INFO: Access modifiers changed from: private */
+    public static Object lockFodAnimZeroItem(Object obj) {
+        if (obj == null) {
+            return null;
+        }
+        try {
+            Field field = sFodAnimMapField;
+            if (field == null) {
+                field = obj.getClass().getField(Constants.FOD_ANIM_ITEM_MAP_FIELD);
+                sFodAnimMapField = field;
+            }
+            Object obj2 = field.get(obj);
+            if (obj2 instanceof Map) {
+                return ((Map) obj2).get(0);
+            }
+            return null;
+        } catch (Throwable unused) {
+            return null;
+        }
+    }
+
+    /* JADX INFO: Access modifiers changed from: private */
+    public static Context lockFodContext(Object obj) {
+        if (obj == null) {
+            return null;
+        }
+        try {
+            Field field = sFodCtxField;
+            if (field == null) {
+                field = obj.getClass().getField(Constants.MUTE_ALERT_CONTEXT_FIELD);
+                sFodCtxField = field;
+            }
+            Object obj2 = field.get(obj);
+            if (obj2 instanceof Context) {
+                return (Context) obj2;
+            }
+        } catch (Throwable unused) {
+        }
+        return null;
+    }
+
+    /* JADX INFO: Access modifiers changed from: private */
+    public static boolean isHideResValid(Context context) {
+        Boolean bool = sHideResValid;
+        if (bool != null) {
+            return bool.booleanValue();
+        }
+        try {
+            String resourceEntryName = context.getResources().getResourceEntryName(Constants.FOD_HIDE_RES_ID);
+            sHideResValid = Boolean.TRUE;
+            LogUtil.logAlways("[锁屏指纹] 隐藏资源 0x7f080000 可解析（" + resourceEntryName + "）");
+            return true;
+        } catch (Throwable th) {
+            sHideResValid = Boolean.FALSE;
+            LogUtil.logAlways("[锁屏指纹] 隐藏资源 0x7f080000 不可解析，回退原逻辑: " + th);
+            return false;
+        }
+    }
+
+    private void installHideDismissButtonHook(ClassLoader classLoader) {
+        try {
+            Method declaredMethod = View.class.getDeclaredMethod("onAttachedToWindow", new Class[0]);
+            declaredMethod.setAccessible(true);
+            hook(declaredMethod).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("notif-dismiss-btn-hide").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook.13
+                private volatile int sId;
+
+                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    if (!MainHook.sHideDismissFlag.get()) {
+                        return chain.proceed();
+                    }
+                    Object thisObject = chain.getThisObject();
+                    if (!(thisObject instanceof View)) {
+                        return chain.proceed();
+                    }
+                    View view = (View) thisObject;
+                    int identifier = this.sId;
+                    if (identifier == 0) {
+                        try {
+                            Context context = view.getContext();
+                            if (context == null) {
+                                return chain.proceed();
+                            }
+                            identifier = context.getResources().getIdentifier(Constants.NOTIF_DISMISS_VIEW_ID_NAME, "id", Constants.TARGET_PKG);
+                            if (identifier == 0) {
+                                return chain.proceed();
+                            }
+                            this.sId = identifier;
+                            LogUtil.logAlways("[清除按钮] 按钮 id 解析: notification_dismiss_view = " + identifier);
+                        } catch (Throwable unused) {
+                            return chain.proceed();
+                        }
+                    }
+                    if (view.getId() == identifier) {
+                        try {
+                            Object parent = view.getParent();
+                            View view2 = parent instanceof View ? (View) parent : view;
+                            float f = view2.getResources().getDisplayMetrics().density;
+                            int i = view2.getResources().getDisplayMetrics().heightPixels;
+                            view2.setTranslationX(0.0f);
+                            view2.setTranslationY(i + (f * 20.0f));
+                            view.setVisibility(4);
+                            if (LogUtil.hitOnce("dismiss-hide")) {
+                                LogUtil.logAlways("[清除按钮] 已隐藏：图标 INVISIBLE + 容器下移到屏底之外（+" + i + "px）按钮类=" + view.getClass().getName() + " 容器类=" + view2.getClass().getName());
+                            }
+                        } catch (Throwable unused2) {
+                        }
+                    }
+                    return chain.proceed();
+                }
+            });
+            LogUtil.logAlways("[清除按钮] 已挂钩 View.onAttachedToWindow（id 精准过滤，每次 attach 隐藏）");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[清除按钮] 挂钩失败: " + th);
+        }
+    }
+
+    private void installFocusGlassHooks(final ClassLoader classLoader) {
+        try {
+            Class<?> cls = Class.forName(Constants.FOCUS_BLUR_CLASS, false, classLoader);
+            final Class<?> cls2 = Class.forName("com.android.systemui.statusbar.notification.row.ExpandableNotificationRow", false, classLoader);
+            hook(cls.getDeclaredMethod("apply", cls2, Context.class)).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("focus-glass-blur-swap").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook.14
+                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    if (!MainHook.sFocusGlassFlag.get()) {
+                        return chain.proceed();
+                    }
+                    Object arg = chain.getArg(0);
+                    Object arg2 = chain.getArg(1);
+                    try {
+                        Class<?> cls3 = Class.forName(Constants.ROW_BLUR_CLASS, false, classLoader);
+                        cls3.getMethod("apply", cls2, Context.class).invoke(cls3.getField("INSTANCE").get(null), arg, arg2);
+                        return null;
+                    } catch (Throwable unused) {
+                        return chain.proceed();
+                    }
+                }
+            });
+            LogUtil.logAlways("[焦点玻璃] 已挂钩 FocusNotificationBlurEffect.apply → NotificationRowBlurEffect");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[焦点玻璃] blur 替换挂钩失败: " + th);
+        }
+        try {
+            Context contextCurrentAppContext = currentAppContext();
+            if (contextCurrentAppContext != null) {
+                fillFocusGlassParams(contextCurrentAppContext, classLoader);
+            }
+            for (String str : Constants.FOCUS_GLASS_CLASSES) {
+                try {
+                    Method declaredMethod = Class.forName(str, false, classLoader).getDeclaredMethod("apply", Object.class, Context.class);
+                    declaredMethod.setAccessible(true);
+                    hook(declaredMethod).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("focus-glass-params-lazy").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook.15
+                        private boolean sFilled;
+
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            if (this.sFilled) {
+                                return chain.proceed();
+                            }
+                            if (MainHook.sFocusGlassFlag.get()) {
+                                this.sFilled = true;
+                                Object arg = chain.getArg(1);
+                                if (arg instanceof Context) {
+                                    MainHook.fillFocusGlassParams((Context) arg, classLoader);
+                                }
+                            }
+                            return chain.proceed();
+                        }
+                    });
+                } catch (Throwable unused) {
+                }
+            }
+            LogUtil.logAlways("[焦点玻璃] 已挂钩 4 个 Focus 类 apply（懒填充兜底）");
+        } catch (Throwable th2) {
+            LogUtil.logAlways("[焦点玻璃] glassParamsArray 处理失败: " + th2);
+        }
+    }
+
+    /* JADX INFO: Access modifiers changed from: private */
+    public static void fillFocusGlassParams(Context context, ClassLoader classLoader) {
+        try {
+            int identifier = context.getResources().getIdentifier(Constants.NORMAL_GLASS_PARAMS_RES, "array", Constants.TARGET_PKG);
+            if (identifier == 0) {
+                return;
+            }
+            String[] stringArray = context.getResources().getStringArray(identifier);
+            int length = stringArray.length;
+            float[] fArr = new float[length];
+            for (int i = 0; i < stringArray.length; i++) {
+                try {
+                    fArr[i] = Float.parseFloat(stringArray[i]);
+                } catch (Throwable unused) {
+                    fArr[i] = 0.0f;
+                }
+            }
+            for (String str : Constants.FOCUS_GLASS_CLASSES) {
+                try {
+                    Class.forName(str, false, classLoader).getField("glassParamsArray").set(null, fArr);
+                } catch (Throwable unused2) {
+                }
+            }
+            LogUtil.logAlways("[焦点玻璃] 已填充 glassParamsArray（notification_glass_params_normal len=" + length + "）");
+        } catch (Throwable unused3) {
+        }
+    }
+
+    private static Context currentAppContext() {
+        try {
+            Object objCurrentApplication = currentApplication();
+            if (objCurrentApplication instanceof Context) {
+                return (Context) objCurrentApplication;
+            }
+            return null;
+        } catch (Throwable unused) {
+            return null;
+        }
+    }
+
+    private void installNotificationSinkHooks(ClassLoader classLoader) {
+        LogUtil.logAlways("[下沉] installNotificationSinkHooks 开始，sSinkEnabled=" + this.sSinkEnabled);
         try {
             if (sinkHooked.add(Constants.FOD_SHELF_SPACE_FLOW_CLASS)) {
-                final Class<?> f1 =
-                        Class.forName(Constants.FOD_SHELF_SPACE_FLOW_CLASS, false, cl);
-                hook(f1.getDeclaredMethod("invokeSuspend", Object.class))
-                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                        .setId("lockscreen-notification-ignore-shelf")
-                        .intercept(new XposedInterface.Hooker() {
-                            @Override
-                            public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                                // 与 HyperChanger 一致：开启下沉 -> 返回 false 短路
-                                if (sSinkEnabled) {
-                                    if (LogUtil.hitOnce("sink-flow1")) {
-                                        LogUtil.logAlways("[下沉] flow1 被调用，sink=" + sSinkEnabled
-                                                + " -> 返回 false（下沉）");
-                                    }
-                                    return Boolean.FALSE;
-                                }
-                                return chain.proceed();
+                hook(Class.forName(Constants.FOD_SHELF_SPACE_FLOW_CLASS, false, classLoader).getDeclaredMethod("invokeSuspend", Object.class)).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("lockscreen-notification-ignore-shelf").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook.16
+                    public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                        if (MainHook.this.sSinkEnabled) {
+                            if (LogUtil.hitOnce("sink-flow1")) {
+                                LogUtil.logAlways("[下沉] flow1 被调用，sink=" + MainHook.this.sSinkEnabled + " -> 返回 false（下沉）");
                             }
-                        });
+                            return Boolean.FALSE;
+                        }
+                        return chain.proceed();
+                    }
+                });
                 LogUtil.logAlways("[下沉] 已挂钩 useExtraShelfSpace 通知下沉");
             }
-        } catch (Throwable t) {
-            LogUtil.logAlways("[下沉] useExtraShelfSpace 挂钩失败（类未找到等 loadClass）: " + t);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[下沉] useExtraShelfSpace 挂钩失败（类未找到等 loadClass）: " + th);
             sinkHooked.remove(Constants.FOD_SHELF_SPACE_FLOW_CLASS);
         }
-
-        // 2) 通知位置计算：把「已录入指纹」位改为 false，走标准位置
         try {
             if (sinkHooked.add(Constants.FOD_NOTIFICATION_POSITION_FLOW_CLASS)) {
-                final Class<?> f2 = Class.forName(
-                        Constants.FOD_NOTIFICATION_POSITION_FLOW_CLASS, false, cl);
-                hook(f2.getDeclaredMethod("invokeSuspend", Object.class))
-                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                        .setId("lockscreen-notification-sink-position")
-                        .intercept(new XposedInterface.Hooker() {
-                            @Override
-                            public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                                if (sSinkEnabled) {
-                                    try {
-                                        // 字节码确认：L$1 声明为 Object，运行时实际是
-                                        // Object[]（check-cast [Ljava/lang/Object;），
-                                        // 下标 6 为「已录入指纹」。Field 引用缓存复用
-                                        // （getDeclaredField+setAccessible 每次开销大，
-                                        // 锁屏通知渲染高频调用 → v3.0.9 缓存）。
-                                        Field f = sFlow2Field;
-                                        if (f == null) {
-                                            f = f2.getDeclaredField("L$1");
-                                            f.setAccessible(true);
-                                            sFlow2Field = f;
-                                        }
-                                        Object vals = f.get(chain.getThisObject());
-                                        if (vals instanceof Object[]) {
-                                            Object[] arr = (Object[]) vals;
-                                            if (LogUtil.hitOnce("sink-flow2")) {
-                                                LogUtil.logAlways("[下沉] flow2 被调用，sink="
-                                                        + sSinkEnabled + "，L$1=Object[] len="
-                                                        + arr.length);
-                                            }
-                                            if (arr.length > Constants.FOD_FLOW_HAS_ENROLLED_INDEX) {
-                                                arr[Constants.FOD_FLOW_HAS_ENROLLED_INDEX] = false;
-                                            }
-                                        } else if (LogUtil.hitOnce("sink-flow2-nonarray")) {
-                                            // v3.3.11：flow2 是锁屏通知位置计算，刷新时高频
-                                            // 调用；三个分支都必须限流，否则 ROM 上 L$1 不是
-                                            // 数组时每次调用一条日志（Binder + 落盘），锁屏
-                                            // 期间持续耗电。统一用 hitOnce：字面量 key 零分配，
-                                            // 且字符串拼接只在真输出时发生。
-                                            LogUtil.logAlways("[下沉] flow2 L$1 非数组: "
-                                                    + (vals == null ? "null"
-                                                    : vals.getClass().getName()));
-                                        }
-                                    } catch (Throwable t) {
-                                        if (LogUtil.hitOnce("sink-flow2-fail")) {
-                                            LogUtil.logAlways("[下沉] flow2 改 L$1 失败: " + t);
-                                        }
-                                    }
+                final Class<?> cls = Class.forName(Constants.FOD_NOTIFICATION_POSITION_FLOW_CLASS, false, classLoader);
+                hook(cls.getDeclaredMethod("invokeSuspend", Object.class)).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("lockscreen-notification-sink-position").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook.17
+                    public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                        String name;
+                        if (MainHook.this.sSinkEnabled) {
+                            try {
+                                Field declaredField = MainHook.sFlow2Field;
+                                if (declaredField == null) {
+                                    declaredField = cls.getDeclaredField("L$1");
+                                    declaredField.setAccessible(true);
+                                    MainHook.sFlow2Field = declaredField;
                                 }
-                                return chain.proceed();
+                                Object obj = declaredField.get(chain.getThisObject());
+                                if (obj instanceof Object[]) {
+                                    Object[] objArr = (Object[]) obj;
+                                    if (LogUtil.hitOnce("sink-flow2")) {
+                                        LogUtil.logAlways("[下沉] flow2 被调用，sink=" + MainHook.this.sSinkEnabled + "，L$1=Object[] len=" + objArr.length);
+                                    }
+                                    if (objArr.length > 6) {
+                                        objArr[6] = false;
+                                    }
+                                } else if (LogUtil.hitOnce("sink-flow2-nonarray")) {
+                                    StringBuilder sb = new StringBuilder("[下沉] flow2 L$1 非数组: ");
+                                    if (obj == null) {
+                                        name = "null";
+                                    } else {
+                                        name = obj.getClass().getName();
+                                    }
+                                    LogUtil.logAlways(sb.append(name).toString());
+                                }
+                            } catch (Throwable th2) {
+                                if (LogUtil.hitOnce("sink-flow2-fail")) {
+                                    LogUtil.logAlways("[下沉] flow2 改 L$1 失败: " + th2);
+                                }
                             }
-                        });
+                        }
+                        return chain.proceed();
+                    }
+                });
                 LogUtil.logAlways("[下沉] 已挂钩 通知位置 flow");
             }
-        } catch (Throwable t) {
-            LogUtil.logAlways("[下沉] 通知位置 flow 挂钩失败（类未找到等 loadClass）: " + t);
+        } catch (Throwable th2) {
+            LogUtil.logAlways("[下沉] 通知位置 flow 挂钩失败（类未找到等 loadClass）: " + th2);
             sinkHooked.remove(Constants.FOD_NOTIFICATION_POSITION_FLOW_CLASS);
         }
     }
 
-    /** flow2 的 L$1 字段缓存（首次反射后复用，v3.0.9 性能优化） */
-    private static volatile Field sFlow2Field = null;
-
-    // ============================================================
-    // 息屏电池状态同步（v3.4，整合自「锁屏状态栏调整」AodStatusBar）
-    // ============================================================
-    /**
-     * AOD 息屏下把电池停在「系统状态栏同款」内显样式（跟随系统设置），并隐藏运营商/
-     * 信号/WiFi，仅保留电池；锁屏（亮屏）状态栏的所有图标保持系统原生，模块不触碰。
-     * 整合自独立任务 AodStatusBar（com.abel.aodstatusbar），4 个 hook：
-     *  ① combine：AOD 下把 fullAod 置 true，使 keyguard_status_bar 整体 isVisible=true
-     *     （否则系统原生 AOD 把整个状态栏含电池都隐藏）；
-     *  ② 电池 toggleAodMode：进入 AOD 时把 true 强制 false，电池呈系统状态栏内显样式；
-     *  ③ animateFullAod：a=false→AOD、a=true→锁屏/亮屏，维护 sDozing 状态。
-     * 设计：本模块仅对电池做样式驱动（toggleAodMode→跟随系统状态栏样式），
-     * 不隐藏/不干预运营商(left_side)、信号/WiFi(statusIcons) 等任何状态栏元素；
-     * AOD 与锁屏状态栏完全跟随系统原生，模块零干预。
-     * 全部受 sAodBatterySyncFlag 门控，关闭即完全透传。
-     */
-    private void installAodBatteryHooks(ClassLoader cl) {
+    private void installAodBatteryHooks(ClassLoader classLoader) {
         LogUtil.logAlways("[息屏电池] installAodBatteryHooks 调用, flag=" + sAodBatterySyncFlag.get());
-        installAodCombineHook(cl);
-        installAodBatteryModeHook(cl);
-        installAodFullAodHook(cl);
+        installAodCombineHook(classLoader);
+        installAodBatteryModeHook(classLoader);
+        installAodFullAodHook(classLoader);
     }
 
-    /** ① AOD 下 fullAod=true 使状态栏可见；记录 dozing。受开关门控。 */
-    private void installAodCombineHook(ClassLoader cl) {
+    private void installAodCombineHook(ClassLoader classLoader) {
         try {
-            Class<?> c = Class.forName(Constants.AOD_COMBINE_CLASS, false, cl);
-            Method m = c.getDeclaredMethod("invoke", Object.class, Object.class, Object.class);
-            m.setAccessible(true);
-            hook(m)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("aod-battery-combine")
-                    .intercept(chain -> {
-                        if (!sAodBatterySyncFlag.get()) return chain.proceed();
-                        Object o = chain.getArg(1);
-                        if (o instanceof Object[] arr && arr.length == Constants.AOD_ARR_LEN) {
-                            boolean dozing = Boolean.TRUE.equals(arr[Constants.AOD_IDX_DOZING]);
-                            sAodDozing = dozing;
-                            LogUtil.log("[息屏电池] combine dozing=" + dozing
-                                    + " fullAod=" + arr[Constants.AOD_IDX_FULL_AOD]);
-                            if (dozing && !Boolean.TRUE.equals(arr[Constants.AOD_IDX_FULL_AOD])) {
-                                arr[Constants.AOD_IDX_FULL_AOD] = Boolean.TRUE;
-                                LogUtil.log("[息屏电池] combine 强制 fullAod=true（AOD 状态栏可见）");
-                            }
-                        }
-                        return chain.proceed();
-                    });
+            Method declaredMethod = Class.forName(Constants.AOD_COMBINE_CLASS, false, classLoader).getDeclaredMethod("invoke", Object.class, Object.class, Object.class);
+            declaredMethod.setAccessible(true);
+            hook(declaredMethod).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("aod-battery-combine").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda19
+                public final Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    return MainHook.lambda$installAodCombineHook$17(chain);
+                }
+            });
             LogUtil.logAlways("[息屏电池] 已挂钩 combine（AOD 下状态栏可见）");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[息屏电池] combine 挂钩失败: " + t);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[息屏电池] combine 挂钩失败: " + th);
         }
     }
 
-    /** ② 进入 AOD 时强制 toggleAodMode(false) → 系统状态栏同款电池样式。受开关门控。 */
-    private void installAodBatteryModeHook(ClassLoader cl) {
+    static /* synthetic */ Object lambda$installAodCombineHook$17(XposedInterface.Chain chain) throws Throwable {
+        if (!sAodBatterySyncFlag.get()) {
+            return chain.proceed();
+        }
+        Object arg = chain.getArg(1);
+        if (arg instanceof Object[]) {
+            Object[] objArr = (Object[]) arg;
+            if (objArr.length == 9) {
+                boolean zEquals = Boolean.TRUE.equals(objArr[3]);
+                sAodDozing = zEquals;
+                LogUtil.log("[息屏电池] combine dozing=" + zEquals + " fullAod=" + objArr[6]);
+                if (zEquals && !Boolean.TRUE.equals(objArr[6])) {
+                    objArr[6] = Boolean.TRUE;
+                    LogUtil.log("[息屏电池] combine 强制 fullAod=true（AOD 状态栏可见）");
+                }
+            }
+        }
+        return chain.proceed();
+    }
+
+    private void installAodBatteryModeHook(ClassLoader classLoader) {
         try {
-            Class<?> c = Class.forName(Constants.AOD_BATTERY_CLASS, false, cl);
-            Method m = c.getDeclaredMethod("toggleAodMode", boolean.class);
-            m.setAccessible(true);
-            hook(m)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("aod-battery-mode")
-                    .intercept(chain -> {
-                        if (!sAodBatterySyncFlag.get()) return chain.proceed();
-                        boolean z = Boolean.TRUE.equals(chain.getArg(0));
-                        if (z) {
-                            // 进入 AOD：早期可靠信号，并强制系统样式
-                            sAodDozing = true;
-                            LogUtil.log("[息屏电池] 进入AOD: toggleAodMode(true)→强制false（系统状态栏样式）");
-                            Object[] args = chain.getArgs().toArray();
-                            args[0] = Boolean.FALSE;
-                            return chain.proceed(args);
-                        }
-                        // 退出 AOD（锁屏/亮屏）：复位 sDozing，否则锁屏状态栏会被持续误隐藏
-                        sAodDozing = false;
-                        LogUtil.log("[息屏电池] 退出AOD: toggleAodMode(false), sAodDozing=false");
-                        return chain.proceed();
-                    });
-            LogUtil.logAlways("[息屏电池] 已挂钩 " + Constants.AOD_BATTERY_CLASS + ".toggleAodMode");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[息屏电池] toggleAodMode 挂钩失败: " + t);
+            Method declaredMethod = Class.forName(Constants.AOD_BATTERY_CLASS, false, classLoader).getDeclaredMethod("toggleAodMode", Boolean.TYPE);
+            declaredMethod.setAccessible(true);
+            hook(declaredMethod).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("aod-battery-mode").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda0
+                public final Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    return MainHook.lambda$installAodBatteryModeHook$18(chain);
+                }
+            });
+            LogUtil.logAlways("[息屏电池] 已挂钩 com.android.systemui.statusbar.views.MiuiBatteryMeterView.toggleAodMode");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[息屏电池] toggleAodMode 挂钩失败: " + th);
         }
     }
 
-    /** ③ animateFullAod(a, animate)：a=false→AOD、a=true→锁屏/亮屏，维护 sDozing。 */
-    private void installAodFullAodHook(ClassLoader cl) {
+    static /* synthetic */ Object lambda$installAodBatteryModeHook$18(XposedInterface.Chain chain) throws Throwable {
+        if (!sAodBatterySyncFlag.get()) {
+            return chain.proceed();
+        }
+        if (Boolean.TRUE.equals(chain.getArg(0))) {
+            sAodDozing = true;
+            LogUtil.log("[息屏电池] 进入AOD: toggleAodMode(true)→强制false（系统状态栏样式）");
+            Object[] array = chain.getArgs().toArray();
+            array[0] = Boolean.FALSE;
+            return chain.proceed(array);
+        }
+        sAodDozing = false;
+        LogUtil.log("[息屏电池] 退出AOD: toggleAodMode(false), sAodDozing=false");
+        return chain.proceed();
+    }
+
+    private void installAodFullAodHook(ClassLoader classLoader) {
         try {
-            Class<?> c = Class.forName(Constants.AOD_KSVC_INJECT_CLASS, false, cl);
-            Method m = null;
-            Class<?> walk = c;
-            while (walk != null && m == null) {
-                for (Method mm : walk.getDeclaredMethods()) {
-                    if (mm.getName().equals("animateFullAod")
-                            && mm.getParameterTypes().length == 2) {
-                        m = mm;
+            Method method = null;
+            for (Class<?> cls = Class.forName(Constants.AOD_KSVC_INJECT_CLASS, false, classLoader); cls != null && method == null; cls = cls.getSuperclass()) {
+                for (Method method2 : cls.getDeclaredMethods()) {
+                    if (method2.getName().equals("animateFullAod") && method2.getParameterTypes().length == 2) {
+                        method = method2;
                         break;
                     }
                 }
-                walk = walk.getSuperclass();
             }
-            if (m == null) {
+            if (method == null) {
                 LogUtil.logAlways("[息屏电池] 未找到 animateFullAod（含父类链）");
                 return;
             }
-            m.setAccessible(true);
-            final String sig = m.getDeclaringClass().getName();
-            hook(m)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("aod-battery-fullaod")
-                    .intercept(chain -> {
-                        if (!sAodBatterySyncFlag.get()) return chain.proceed();
-                        boolean a = Boolean.TRUE.equals(chain.getArg(0));
-                        sAodDozing = !a; // a=false→AOD(true)；a=true→锁屏/亮屏(false)
-                        LogUtil.log("[息屏电池] animateFullAod(a=" + a + ") → sAodDozing=" + sAodDozing);
-                        return chain.proceed();
-                    });
-            LogUtil.logAlways("[息屏电池] 已挂钩 " + sig + ".animateFullAod");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[息屏电池] animateFullAod 挂钩失败: " + t);
+            method.setAccessible(true);
+            String name = method.getDeclaringClass().getName();
+            hook(method).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("aod-battery-fullaod").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda10
+                public final Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    return MainHook.lambda$installAodFullAodHook$19(chain);
+                }
+            });
+            LogUtil.logAlways("[息屏电池] 已挂钩 " + name + ".animateFullAod");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[息屏电池] animateFullAod 挂钩失败: " + th);
         }
     }
 
-    // ④ 可见性隐藏已取消：AOD/锁屏状态栏完全跟随系统原生，模块不隐藏运营商/信号/WiFi。
-    //   电池仍由 ①②③ 驱动为系统状态栏同款样式（toggleAodMode→系统样式）。
-
-    // ============================================================
-    // 跨应用焦点通知（v3.11 移植 HyperCeiler，忠实按上游实现）
-    //   - xmsf：解锁焦点通知白名单签名验证（AuthSession.getAuthError 错误码清零 → 视为成功）
-    //   - health：允许所有应用发送焦点通知到手表/手环（handleNotificationPosted 清 ongoing
-    //             + NotificationFilterHelper.isNotificationSpotlightAppInWhiteList 恒 true）
-    // 两个作用域 com.xiaomi.xmsf / com.mi.health 已在 scope.list 声明。
-    // ============================================================
-
-    /** 小米服务框架：解锁焦点通知白名单签名验证。
-     *  反射定位 com.xiaomi.xms.auth.AuthSession 的 getAuthError/getAuthSuccess 与
-     *  AuthError 的 int 错误码字段；命中开关时把错误码清零并直接返回成功 Bundle，
-     *  解除白名单应用的签名校验（HyperCeiler xmsf/UnlockFoucsAuth 等价）。 */
-    private void installXmsfFocusHooks(ClassLoader cl) {
-        try {
-            final Class<?> authSession =
-                    Class.forName("com.xiaomi.xms.auth.AuthSession", false, cl);
-            final Class<?> authError =
-                    Class.forName("com.xiaomi.xms.auth.AuthError", false, cl);
-
-            Method getAuthError = null;
-            Method getAuthSuccess = null;
-            for (Method m : authSession.getDeclaredMethods()) {
-                if (m.getParameterCount() == 1
-                        && m.getParameterTypes()[0] == authError
-                        && m.getReturnType() == android.os.Bundle.class) {
-                    getAuthError = m;
-                } else if (m.getParameterCount() == 0
-                        && m.getReturnType() == android.os.Bundle.class) {
-                    getAuthSuccess = m;
-                }
-            }
-            java.lang.reflect.Field errField = null;
-            for (java.lang.reflect.Field f : authError.getDeclaredFields()) {
-                if (f.getType() == int.class) {
-                    errField = f;
-                    break;
-                }
-            }
-            final java.lang.reflect.Field errorField = errField;
-            if (getAuthError == null || getAuthSuccess == null || errorField == null) {
-                LogUtil.logAlways("[xmsf焦点] 未命中 AuthSession 方法/字段，跳过");
-                return;
-            }
-            getAuthError.setAccessible(true);
-            getAuthSuccess.setAccessible(true);
-            errorField.setAccessible(true);
-
-            final Method success = getAuthSuccess;
-            hook(getAuthError)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("xmsf-focus-sign")
-                    .intercept(chain -> {
-                        if (!sXmsfFocusSignFlag.get()) return chain.proceed();
-                        try {
-                            Object error = chain.getArg(0);
-                            errorField.set(error, 0); // 错误码清零
-                            return success.invoke(chain.getThisObject()); // 直接返回成功 Bundle
-                        } catch (Throwable t) {
-                            return chain.proceed();
-                        }
-                    });
-            LogUtil.logAlways("[xmsf焦点] 已挂钩 AuthSession.getAuthError（签名验证绕过）");
-        } catch (Throwable t) {
-            LogUtil.logAlways("[xmsf焦点] 挂钩失败: " + t);
+    static /* synthetic */ Object lambda$installAodFullAodHook$19(XposedInterface.Chain chain) throws Throwable {
+        if (!sAodBatterySyncFlag.get()) {
+            return chain.proceed();
         }
+        boolean zEquals = Boolean.TRUE.equals(chain.getArg(0));
+        sAodDozing = !zEquals;
+        LogUtil.log("[息屏电池] animateFullAod(a=" + zEquals + ") → sAodDozing=" + sAodDozing);
+        return chain.proceed();
     }
-
-    /** 小米运动健康：允许所有应用发送焦点通知到手表/手环（HyperCeiler health/UnlockFoucsAuth）。 */
-    private void installHealthFocusHooks(ClassLoader cl) {
-        // 路径 A：handleNotificationPosted 中清掉焦点歌词通知的 FLAG_ONGOING_EVENT，使其在手表/手环常驻
-        try {
-            Class<?> svc = Class.forName(
-                    "com.xiaomi.fitness.notify.BaseNotifySyncService", false, cl);
-            Method posted = null;
-            for (Method m : svc.getDeclaredMethods()) {
-                if ("handleNotificationPosted".equals(m.getName())
-                        && m.getParameterCount() == 1
-                        && android.service.notification.StatusBarNotification.class
-                        .isAssignableFrom(m.getParameterTypes()[0])) {
-                    posted = m;
-                    break;
-                }
-            }
-            if (posted != null) {
-                posted.setAccessible(true);
-                hook(posted)
-                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                        .setId("health-focus-posted")
-                        .intercept(chain -> {
-                            if (sHealthFocusAllowAllFlag.get()) {
-                                try {
-                                    Object sbn = chain.getArg(0);
-                                    if (sbn instanceof android.service.notification.StatusBarNotification) {
-                                        android.app.Notification n =
-                                                ((android.service.notification.StatusBarNotification) sbn)
-                                                        .getNotification();
-                                        if ("channel_id_focusNotifLyrics".equals(n.getChannelId())) {
-                                            n.flags &= ~android.app.Notification.FLAG_ONGOING_EVENT;
-                                        }
-                                    }
-                                } catch (Throwable ignored) {
-                                }
-                            }
-                            return chain.proceed();
-                        });
-                LogUtil.logAlways("[health焦点] 已挂钩 BaseNotifySyncService.handleNotificationPosted");
-            } else {
-                LogUtil.logAlways("[health焦点] 未命中 handleNotificationPosted");
-            }
-        } catch (Throwable t) {
-            LogUtil.logAlways("[health焦点] handleNotificationPosted 挂钩失败: " + t);
-        }
-
-        // 路径 B：isNotificationSpotlightAppInWhiteList 恒返回 true（解除白名单，允许所有应用）
-        try {
-            Class<?> helper = Class.forName(
-                    "com.xiaomi.fitness.notify.util.NotificationFilterHelper", false, cl);
-            Method white = null;
-            for (Method m : helper.getDeclaredMethods()) {
-                if ("isNotificationSpotlightAppInWhiteList".equals(m.getName())
-                        && m.getParameterCount() == 1) {
-                    white = m;
-                    break;
-                }
-            }
-            if (white != null) {
-                white.setAccessible(true);
-                hook(white)
-                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                        .setId("health-focus-whitelist")
-                        .intercept(chain -> sHealthFocusAllowAllFlag.get()
-                                ? Boolean.TRUE : chain.proceed());
-                LogUtil.logAlways("[health焦点] 已挂钩 NotificationFilterHelper.isNotificationSpotlightAppInWhiteList");
-            } else {
-                LogUtil.logAlways("[health焦点] 未命中 isNotificationSpotlightAppInWhiteList");
-            }
-        } catch (Throwable t) {
-            LogUtil.logAlways("[health焦点] 白名单挂钩失败: " + t);
-        }
-    }
-
-    // ============================================================
-    // 禁止恢复电池优化白名单（移植 HyperCeiler PowerKeeper.prevent_recovery_of_battery_optimization_whitelist）
-    //
-    // 原理：com.miui.powerkeeper 会周期性把应用重新加回「电池优化白名单」
-    //  （即撤销用户的电池优化设置）。挂钩 CommonAdapter.addPowerSaveWhitelistApps(String[])，
-    //  当一次性批量恢复（入参数组长度 > 1）时直接返回 null 拦截，
-    //  仅放行单应用调用（避免误伤正常逻辑）。
-    // ============================================================
-
-    private void installPowerKeeperHooks(ClassLoader cl) {
-        try {
-            Class<?> adapter = Class.forName(
-                    "com.miui.powerkeeper.utils.CommonAdapter", false, cl);
-            Method add = null;
-            for (Method m : adapter.getDeclaredMethods()) {
-                if ("addPowerSaveWhitelistApps".equals(m.getName())
-                        && m.getParameterCount() == 1
-                        && m.getParameterTypes()[0].equals(String[].class)) {
-                    add = m;
-                    break;
-                }
-            }
-            if (add != null) {
-                add.setAccessible(true);
-                hook(add)
-                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                        .setId("powerkeeper-prevent-whitelist")
-                        .intercept(chain -> {
-                            if (!sPreventBatteryWhitelistFlag.get()) return chain.proceed();
-                            try {
-                                Object a0 = chain.getArg(0);
-                                if (a0 instanceof String[]) {
-                                    String[] arr = (String[]) a0;
-                                    if (arr.length > 1) {
-                                        LogUtil.logAlways("[电池白名单] 拦截批量恢复（"
-                                                + arr.length + " 个），保持用户电池优化设置");
-                                        return null;
-                                    }
-                                }
-                            } catch (Throwable ignored) {
-                            }
-                            return chain.proceed();
-                        });
-                LogUtil.logAlways("[电池白名单] 已挂钩 CommonAdapter.addPowerSaveWhitelistApps");
-            } else {
-                LogUtil.logAlways("[电池白名单] 未命中 addPowerSaveWhitelistApps(String[])");
-            }
-        } catch (Throwable t) {
-            LogUtil.logAlways("[电池白名单] 挂钩失败: " + t);
-        }
-    }
-
 }
