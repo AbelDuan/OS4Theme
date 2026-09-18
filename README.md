@@ -2,7 +2,7 @@
 
 澎湃OS 4 / HyperOS 4 主题增强 **LSPosed 模块**。应用第三方主题后保留系统界面的「柔光玻璃」模糊，并提供通知、锁屏等多项体验增强。
 
-- 当前版本：**v3.8**（`versionCode` 78）
+- 当前版本：**v3.36**（`versionCode` 107）
 - 包名：`com.abel.hyperosglass`
 - 框架：LibXposed API **102**（`minApiVersion=100`、`targetApiVersion=102`）
 
@@ -49,6 +49,15 @@
 - **v3.3.10 / v3.3.11 功耗纪律**：全模块无定时器 / 轮询 / 广播 / ContentObserver，待机开销≈0。热路径判定回调只读 volatile 布尔或 O(1) 缓存，绝不写日志；日志统一「once 语义」（同 key 全进程仅记 1 条，命中事件零字符串分配）+ Xposed 日志 300 行总量上限；`material_style` 读取带 2s TTL 缓存（原实现每次 Binder 到 SettingsProvider）。「重启系统界面」用 `killall com.android.systemui`（SIGTERM，失败自动 SIGKILL 兜底）替代 `am crash`——不产生 dropbox 崩溃记录、logcat 无崩溃栈，SystemUI 为 persistent 进程，死亡后由 AMS 立即拉起。
 
 **关键修复（v3.0）**：`ThemeUtils` 在插件独立 ClassLoader 中，宿主 `onPackageLoaded` 的 `Class.forName` 必然失败（v2.1.x 移除 loadClass 拦截后玻璃 hook 从未挂上）。改为 hook 宿主侧 `PluginInstance$PluginFactory.createClassLoader()`——宿主加载插件 APK 时创建 ClassLoader 的唯一入口，在其回调中拿到插件 ClassLoader 后补挂。多 ClassLoader 副本用 `WeakHashMap` 按 **Class 对象身份**去重（旧版按类名字符串去重会漏挂控制中心所在的插件副本）。
+
+**关键修复（v3.36）：作用域必须覆盖插件进程**。玻璃判定点在两个进程里各有一份，只覆盖 `com.android.systemui` 不够：
+
+| 进程 | 判定点 |
+|---|---|
+| `com.android.systemui` | `MiuiMaterialUtils.onDefaultThemeChanged`、`MiuiThemeUtils.sDefaultSysUiTheme` |
+| `miui.systemui.plugin`（控制中心/通知栏插件进程） | `miui.systemui.util.ThemeUtils`、`MiBlurCompat.getBackgroundMaterialOpenedInDefaultTheme`、`MiuiDefaultThemeControllerImpl.isDefaultTheme` |
+
+后三个类只存在于 `MIUISystemUIPlugin.apk`（`MiuiSystemUI.apk` 里没有）。v3.35 只在 SystemUI 进程把状态强制成「默认主题」，插件进程仍按三方主题渲染，两侧不一致 → 控制中心磁贴画成**方形**。修复：`scope.list` 增加 `miui.systemui.plugin` + `module.prop` 加 `staticScope=true`，并在 `onPackageLoaded` 里对插件进程**只**安装三方主题玻璃的 guard（`Constants.TARGET_PLUGIN_PKG`）。
 
 **设置同步**：开关由 LSPosed `getRemotePreferences` 直供（开机即生效）；模块 App 与 SystemUI 通过 DE + CE 双写 + `StatusProvider`（ContentProvider）同步真实值，解决旧版「所有开关失效」问题。
 

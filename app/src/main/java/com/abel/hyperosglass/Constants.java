@@ -108,7 +108,11 @@ public final class Constants {
     public static final String STATUS_AUTHORITY = "com.abel.hyperosglass.status";
     public static final String STATUS_URI = "content://com.abel.hyperosglass.status";
     public static final String TARGET_PKG = "com.android.systemui";
-    public static final String VERSION = "3.35";
+    // 控制中心/通知栏的插件进程。三方主题玻璃真正的判定点（miui.systemui.util.ThemeUtils /
+    // MiBlurCompat / MiuiDefaultThemeControllerImpl）在插件 APK 里各有一份、跑在这个进程，
+    // 只在 SystemUI 进程里强制"默认主题"会造成两侧状态不一致（磁贴变方），必须一并注入。
+    public static final String TARGET_PLUGIN_PKG = "miui.systemui.plugin";
+    public static final String VERSION = "3.36";
     public static final String[] BLE_UNLOCK_TEXT_BT = {"蓝牙", "bluetooth"};
     public static final String[] BLE_UNLOCK_TEXT_UNLOCK = {"解锁", "unlock"};
     public static final String[] PIN_KEY_IDS = {"key0", "key1", "key2", "key3", "key4", "key5", "key6", "key7", "key8", "key9"};

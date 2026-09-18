@@ -88,7 +88,7 @@ public class MainHook extends XposedModule {
             LogUtil.attach(this);
             reloadPrefs();
             syncRealPrefsAsync();
-            LogUtil.logAlways("==== 模块已加载 v3.34（LibXposed API " + getApiVersion() + "，进程=" + moduleLoadedParam.getProcessName() + "）====");
+            LogUtil.logAlways("==== 模块已加载 v" + Constants.VERSION + "（LibXposed API " + getApiVersion() + "，进程=" + moduleLoadedParam.getProcessName() + "）====");
         } catch (Throwable th) {
             LogUtil.logAlways("onModuleLoaded 异常: " + th);
         }
@@ -114,6 +114,9 @@ public class MainHook extends XposedModule {
                 installPinGlassHook(defaultClassLoader);
                 installQsEditHideHook(defaultClassLoader);
                 installNotifEnhanceHooks(defaultClassLoader);
+                installThirdPartyThemeGlassHooks(defaultClassLoader);
+            } else if (Constants.TARGET_PLUGIN_PKG.equals(packageName)) {
+                // 插件进程：只补三方主题玻璃的判定点，其余 hook 都不属于这个进程
                 installThirdPartyThemeGlassHooks(defaultClassLoader);
             }
         } catch (Throwable th) {

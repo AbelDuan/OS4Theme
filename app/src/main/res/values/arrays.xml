@@ -2,5 +2,6 @@
 <resources>
     <array name="xposed_scope">
         <item>com.android.systemui</item>
+        <item>miui.systemui.plugin</item>
     </array>
 </resources>
