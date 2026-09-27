@@ -43,6 +43,12 @@ public class MainHook extends XposedModule {
     private volatile SharedPreferences sPrefs;
     private static final Set<String> sinkHooked = new HashSet();
     private static final Set<Class<?>> qsEditHooked = Collections.newSetFromMap(new WeakHashMap());
+    /** 已装过三方主题玻璃 guard 的插件 classloader（插件类只在这个 loader 里可见） */
+    private static final Set<ClassLoader> sGlassLoaders = Collections.newSetFromMap(new WeakHashMap());
+    /** 插件 loader 里解析到的 miui.systemui.util.ThemeUtils（用于强制静态主题标志） */
+    private static volatile Class<?> sPluginThemeUtilsClass = null;
+    /** ClassLoader.loadClass 兜底 guard 是否已装（插件类可能在任意 loader 里首次加载） */
+    private static volatile boolean sClassLoadGuardInstalled = false;
     private static final AtomicBoolean sHideLockFodFlag = new AtomicBoolean(true);
     private static final AtomicBoolean sHideDismissFlag = new AtomicBoolean(true);
     private static final AtomicBoolean sFocusGlassFlag = new AtomicBoolean(true);
@@ -105,6 +111,7 @@ public class MainHook extends XposedModule {
             if (Constants.TARGET_PKG.equals(packageName)) {
                 installNotificationSinkHooks(defaultClassLoader);
                 installPluginClassLoaderHooks(defaultClassLoader);
+                installPluginClassLoadGuard();
                 installMediaIslandDefense(defaultClassLoader);
                 installExpandButtonColor(defaultClassLoader);
                 installLockFodHooks(defaultClassLoader);
@@ -1084,7 +1091,14 @@ public class MainHook extends XposedModule {
                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
                     Object objProceed = chain.proceed();
                     if (objProceed instanceof ClassLoader) {
-                        MainHook.this.tryHookQsEditIn((ClassLoader) objProceed);
+                        ClassLoader pluginLoader = (ClassLoader) objProceed;
+                        MainHook.this.tryHookQsEditIn(pluginLoader);
+                        // ROM OS4.0.21 起控制中心插件类在 systemui 进程内经这个 loader 加载，
+                        // 不再有独立的 miui.systemui.plugin 进程：三方主题玻璃 guard 必须在这里补挂，
+                        // 否则插件侧的 ThemeUtils / MiuiDefaultThemeControllerImpl 判定点无人接管。
+                        if (sGlassLoaders.add(pluginLoader)) {
+                            MainHook.this.installThirdPartyThemeGlassHooks(pluginLoader);
+                        }
                     }
                     return objProceed;
                 }
@@ -1110,6 +1124,10 @@ public class MainHook extends XposedModule {
         // 1) ThemeUtils.getDefaultPluginTheme / getDefaultSysUiTheme → true
         try {
             Class<?> themeUtils = Class.forName(Constants.TPG_THEME_UTILS_CLASS, false, classLoader);
+            sPluginThemeUtilsClass = themeUtils;
+            if (sGlassEnabled) {
+                forceThemeUtilsFlags(themeUtils);
+            }
             String[] getters = {"getDefaultPluginTheme", "getDefaultSysUiTheme"};
             for (String m : getters) {
                 try {
@@ -1117,6 +1135,10 @@ public class MainHook extends XposedModule {
                             .setId("tpg-getter-" + m).intercept(new XposedInterface.Hooker() {
                                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
                                     if (MainHook.this.sGlassEnabled) {
+                                        Class<?> cls = sPluginThemeUtilsClass;
+                                        if (cls != null) {
+                                            forceThemeUtilsFlags(cls);
+                                        }
                                         return true;
                                     }
                                     return chain.proceed();
@@ -1171,9 +1193,7 @@ public class MainHook extends XposedModule {
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                     .setId("tpg-getBgMaterialOpenedInDefaultTheme").intercept(new XposedInterface.Hooker() {
                         public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                            if (MainHook.this.sGlassEnabled) {
-                                return true;
-                            }
+                            // v3.37：不再强制 true（见下）；三方主题自己的材质原样透传
                             return chain.proceed();
                         }
                     });
@@ -1189,6 +1209,10 @@ public class MainHook extends XposedModule {
                     .setId("tpg-isDefaultTheme").intercept(new XposedInterface.Hooker() {
                         public Object intercept(XposedInterface.Chain chain) throws Throwable {
                             if (MainHook.this.sGlassEnabled) {
+                                Class<?> cls = sPluginThemeUtilsClass;
+                                if (cls != null) {
+                                    forceThemeUtilsFlags(cls);
+                                }
                                 return true;
                             }
                             return chain.proceed();
@@ -1216,9 +1240,48 @@ public class MainHook extends XposedModule {
                             return r;
                         }
                     });
+            if (sGlassEnabled) {
+                sDefaultField.setBoolean(null, true);
+            }
             LogUtil.logAlways("[三方主题玻璃] 已挂钩 ConfigurationControllerImpl.onConfigurationChanged");
         } catch (Throwable th) {
             LogUtil.log("[三方主题玻璃] ConfigurationControllerImpl 挂钩失败(本 loader 无此类): " + th);
+        }
+    }
+
+    /**
+     * 插件类可能在任意 classloader 里首次加载（4.0.21 上控制中心插件就跑在 systemui 进程内），
+     * 单靠 PluginFactory.createClassLoader 可能漏掉真正的那个 loader。这里兜底：
+     * 只要有人加载 miui.systemui.util.ThemeUtils，就立刻在那个 loader 上补挂 guard ——
+     * 必须早于插件用它初始化默认主题状态（StateFlow）之前，否则 false 会被缓存住。
+     */
+    private void installPluginClassLoadGuard() {
+        if (sClassLoadGuardInstalled) {
+            return;
+        }
+        try {
+            hook(ClassLoader.class.getMethod("loadClass", String.class))
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("tpg-plugin-classload").intercept(new XposedInterface.Hooker() {
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            Object arg = chain.getArg(0);
+                            if (!(arg instanceof String) || !Constants.TPG_THEME_UTILS_CLASS.equals(arg)) {
+                                return chain.proceed();
+                            }
+                            Object r = chain.proceed();
+                            if (r instanceof Class) {
+                                ClassLoader cl = ((Class<?>) r).getClassLoader();
+                                if (cl != null && sGlassLoaders.add(cl)) {
+                                    MainHook.this.installThirdPartyThemeGlassHooks(cl);
+                                }
+                            }
+                            return r;
+                        }
+                    });
+            sClassLoadGuardInstalled = true;
+            LogUtil.logAlways("[三方主题玻璃] 已挂钩 ClassLoader.loadClass（插件类加载即补挂）");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[三方主题玻璃] 类加载 guard 挂钩失败: " + th);
         }
     }
 

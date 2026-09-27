@@ -5,5 +5,5 @@ description=HyperOS 4 主题增强：三方主题柔光玻璃通知 / 锁屏通�
 minApiVersion=100
 targetApiVersion=102
 staticScope=true
-version=3.36
-versionCode=107
+version=3.37
+versionCode=108

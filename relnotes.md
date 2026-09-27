@@ -1,3 +1,14 @@
+## v3.37 控制中心磁贴恢复圆角玻璃（修 v3.36 之后仍变方）
+
+- 真正原因是「三方主题玻璃」guard 里的 `MiBlurCompat.getBackgroundMaterialOpenedInDefaultTheme(Context)`
+  被强制成 true：控制中心因此改用 MIUI 默认主题的材质与素材，在 OS4.0.21 上就是方块、无光边，
+  顶掉了三方主题自带的圆角玻璃。v3.37 删掉该判定点，完全透传（实测只关它即可恢复圆角+光边）
+- OS4.0.21 起控制中心插件类在 `com.android.systemui` 进程内由 `PluginFactory.createClassLoader`
+  加载（不再有 `miui.systemui.plugin` 独立进程）：新增插件 loader 补挂 + `ClassLoader.loadClass`
+  兜底 + 挂载时立即置位主题标志，保证 guard 早于插件建立默认主题状态
+- 版本 3.37 / versionCode 108
+- 备注：Vector 会缓存模块 dex，改完必须 `cli modules disable/enable` 或重装才生效（详见 NOTES-v3.37）
+
 ## v3.4 息屏电池状态同步
 
 基于 v3.3.11 集成「锁屏状态栏调整」任务的 AOD 电池能力：
