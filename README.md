@@ -12,7 +12,7 @@
 | --- | --- |
 | 系统 | 澎湃OS 4 / HyperOS 4（Android 17，API 37） |
 | 框架 | LSPosed（LibXposed 102，最低框架版本 100） |
-| 作用域 | `com.android.systemui`（系统界面） |
+| 作用域 | `com.android.systemui`（系统界面）+ `miui.systemui.plugin`（控制中心插件，v3.36 起，`staticScope` 自动带上） |
 | 安装 | 最低 `minSdk 33`（Android 13+ 可装），功能针对 HyperOS 4 验证 |
 | 权限 | 设备需 root（KernelSU / Magisk）以重启 SystemUI（设置内提供按钮） |
 
@@ -46,22 +46,30 @@
 - 跳过 `updateDefault*Theme()`（从源头阻断 `false` 写入）；
 - 主动把两个静态字段写成 `true`（防御 ART 把 3-code-unit 的 getter **内联**进调用方、直接读字段而绕过 hook）；
 - **v3.3.9 追加**：hook `MiBlurCompat.getBackgroundMaterialOpenedInDefaultTheme`（玻璃总闸门），**仅当系统 `material_style == 1`（柔光玻璃模式）时**强制返回 `true`，关闭 / 磨砂模式走原逻辑，避免磁贴形状与背景错乱。
+- **v3.37 修正**：v3.35 重建基线时把上面那条 `material_style` 门控弄丢了，于是这个判定点变成无条件返回 `true` —— 它等于告诉控制中心「背景材质按默认主题算」，插件随即改用 MIUI 默认主题的材质与素材；在 OS4.0.21 上那就是**方块、无光边**，把三方主题自带的圆角玻璃顶掉。v3.37 让它完全透传（材质跟随主题），磁贴恢复圆角 + 光边。实测：只保留这一个 guard 磁贴即变方；只把它改成透传、其余 guard 全开则恢复正常。
 - **v3.3.10 / v3.3.11 功耗纪律**：全模块无定时器 / 轮询 / 广播 / ContentObserver，待机开销≈0。热路径判定回调只读 volatile 布尔或 O(1) 缓存，绝不写日志；日志统一「once 语义」（同 key 全进程仅记 1 条，命中事件零字符串分配）+ Xposed 日志 300 行总量上限；`material_style` 读取带 2s TTL 缓存（原实现每次 Binder 到 SettingsProvider）。「重启系统界面」用 `killall com.android.systemui`（SIGTERM，失败自动 SIGKILL 兜底）替代 `am crash`——不产生 dropbox 崩溃记录、logcat 无崩溃栈，SystemUI 为 persistent 进程，死亡后由 AMS 立即拉起。
 
 **关键修复（v3.0）**：`ThemeUtils` 在插件独立 ClassLoader 中，宿主 `onPackageLoaded` 的 `Class.forName` 必然失败（v2.1.x 移除 loadClass 拦截后玻璃 hook 从未挂上）。改为 hook 宿主侧 `PluginInstance$PluginFactory.createClassLoader()`——宿主加载插件 APK 时创建 ClassLoader 的唯一入口，在其回调中拿到插件 ClassLoader 后补挂。多 ClassLoader 副本用 `WeakHashMap` 按 **Class 对象身份**去重（旧版按类名字符串去重会漏挂控制中心所在的插件副本）。
 
-**关键修复（v3.36）：作用域必须覆盖插件进程**。玻璃判定点在两个进程里各有一份，只覆盖 `com.android.systemui` 不够：
+**关键修复（v3.36）：作用域补上插件包名**。玻璃判定点在两个进程里各有一份，只覆盖 `com.android.systemui` 不够：
 
 | 进程 | 判定点 |
 |---|---|
 | `com.android.systemui` | `MiuiMaterialUtils.onDefaultThemeChanged`、`MiuiThemeUtils.sDefaultSysUiTheme` |
 | `miui.systemui.plugin`（控制中心/通知栏插件进程） | `miui.systemui.util.ThemeUtils`、`MiBlurCompat.getBackgroundMaterialOpenedInDefaultTheme`、`MiuiDefaultThemeControllerImpl.isDefaultTheme` |
 
-后三个类只存在于 `MIUISystemUIPlugin.apk`（`MiuiSystemUI.apk` 里没有）。v3.35 只在 SystemUI 进程把状态强制成「默认主题」，插件进程仍按三方主题渲染，两侧不一致 → 控制中心磁贴画成**方形**。修复：`scope.list` 增加 `miui.systemui.plugin` + `module.prop` 加 `staticScope=true`，并在 `onPackageLoaded` 里对插件进程**只**安装三方主题玻璃的 guard（`Constants.TARGET_PLUGIN_PKG`）。
+后三个类只存在于 `MIUISystemUIPlugin.apk`（`MiuiSystemUI.apk` 里没有）。`scope.list` 增加 `miui.systemui.plugin` + `module.prop` 加 `staticScope=true`，并在 `onPackageLoaded` 里对插件进程**只**安装三方主题玻璃的 guard（`Constants.TARGET_PLUGIN_PKG`）。
+
+**关键修正（v3.37）：OS4.0.21 起插件是「进程内」加载的，没有独立插件进程。**
+`ps` 里不再有 `miui.systemui.plugin*` 进程，插件类由 `PluginInstance$PluginFactory.createClassLoader()` 在 `com.android.systemui` 进程内建立 ClassLoader（`/proc/<systemui>/maps` 里能看到 `MIUISystemUIPlugin.apk`），所以只给作用域补包名在 4.0.21 上没有任何作用点。v3.37：
+
+- 在 `createClassLoader` 回调里把三方主题玻璃 guard 直接补挂到插件 loader（按 loader 身份去重，与 v3.0 同一处入口）；
+- 增加 `ClassLoader.loadClass(String)` 兜底：只有类名等于 `miui.systemui.util.ThemeUtils` 时才继续补挂，其余类立即透传，用于覆盖「插件类由其它 loader 首次加载」的情况；
+- 挂载时立即把 `ThemeUtils.defaultPluginTheme / defaultSysUiTheme`、`MiuiThemeUtils.sDefaultSysUiTheme` 写成 `true`，抢在插件建立默认主题状态之前。
 
 **设置同步**：开关由 LSPosed `getRemotePreferences` 直供（开机即生效）；模块 App 与 SystemUI 通过 DE + CE 双写 + `StatusProvider`（ContentProvider）同步真实值，解决旧版「所有开关失效」问题。
 
-**稳定性纪律**：所有回调整体 `try/catch` + `ExceptionMode.PROTECTIVE`；只 hook 具体目标类的具体方法，不 hook 全局 `ClassLoader.loadClass`、不轮询，避免批量命中导致的崩溃 / 卡顿。
+**稳定性纪律**：所有回调整体 `try/catch` + `ExceptionMode.PROTECTIVE`；只 hook 具体目标类的具体方法，不轮询，避免批量命中导致的崩溃 / 卡顿。唯一例外是 v3.37 为了覆盖进程内加载的插件 loader 而加的 `ClassLoader.loadClass(String)` 兜底：入口处只做一次字符串比较，非 `miui.systemui.util.ThemeUtils` 立即 `chain.proceed()`，命中后按 loader 去重只挂一次。
 
 ## 安装与使用
 
@@ -94,6 +102,20 @@
   - `module.prop` — 模块元信息（id=`os4_themer`、版本、框架版本）
   - `java_init.list` — 入口类 `com.abel.hyperosglass.MainHook`
   - `scope.list` — 作用域 `com.android.systemui`
+
+## 调试陷阱（务必先看）
+
+**框架会缓存模块 dex。** Vector / LSPosed 会把模块 dex 缓存在守护进程内存里
+（`/proc/<vectord>/fd/*` 下的 `memfd:obfuscated_dex`）。只替换已安装 APK 里的
+`classes.dex`（或重打包后 `cp` 回去）**不会生效**，必须让框架重新读取：
+
+```bash
+/data/adb/lspd/cli modules disable <pkg>   # 再 enable，框架重新读模块
+/data/adb/lspd/cli modules enable <pkg>
+```
+
+或者直接重装模块（守护进程会随安装重启）。不刷新的话，你观察到的永远是**旧代码**的行为，
+极易把「改动没生效」误判成「改错了方向」。
 
 ## 调试日志
 
