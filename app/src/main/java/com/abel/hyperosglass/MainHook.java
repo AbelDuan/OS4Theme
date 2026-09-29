@@ -43,12 +43,6 @@ public class MainHook extends XposedModule {
     private volatile SharedPreferences sPrefs;
     private static final Set<String> sinkHooked = new HashSet();
     private static final Set<Class<?>> qsEditHooked = Collections.newSetFromMap(new WeakHashMap());
-    /** 已装过三方主题玻璃 guard 的插件 classloader（插件类只在这个 loader 里可见） */
-    private static final Set<ClassLoader> sGlassLoaders = Collections.newSetFromMap(new WeakHashMap());
-    /** 插件 loader 里解析到的 miui.systemui.util.ThemeUtils（用于强制静态主题标志） */
-    private static volatile Class<?> sPluginThemeUtilsClass = null;
-    /** ClassLoader.loadClass 兜底 guard 是否已装（插件类可能在任意 loader 里首次加载） */
-    private static volatile boolean sClassLoadGuardInstalled = false;
     private static final AtomicBoolean sHideLockFodFlag = new AtomicBoolean(true);
     private static final AtomicBoolean sHideDismissFlag = new AtomicBoolean(true);
     private static final AtomicBoolean sFocusGlassFlag = new AtomicBoolean(true);
@@ -94,7 +88,7 @@ public class MainHook extends XposedModule {
             LogUtil.attach(this);
             reloadPrefs();
             syncRealPrefsAsync();
-            LogUtil.logAlways("==== 模块已加载 v" + Constants.VERSION + "（LibXposed API " + getApiVersion() + "，进程=" + moduleLoadedParam.getProcessName() + "）====");
+            LogUtil.logAlways("==== 模块已加载 v3.34（LibXposed API " + getApiVersion() + "，进程=" + moduleLoadedParam.getProcessName() + "）====");
         } catch (Throwable th) {
             LogUtil.logAlways("onModuleLoaded 异常: " + th);
         }
@@ -111,7 +105,6 @@ public class MainHook extends XposedModule {
             if (Constants.TARGET_PKG.equals(packageName)) {
                 installNotificationSinkHooks(defaultClassLoader);
                 installPluginClassLoaderHooks(defaultClassLoader);
-                installPluginClassLoadGuard();
                 installMediaIslandDefense(defaultClassLoader);
                 installExpandButtonColor(defaultClassLoader);
                 installLockFodHooks(defaultClassLoader);
@@ -121,9 +114,6 @@ public class MainHook extends XposedModule {
                 installPinGlassHook(defaultClassLoader);
                 installQsEditHideHook(defaultClassLoader);
                 installNotifEnhanceHooks(defaultClassLoader);
-                installThirdPartyThemeGlassHooks(defaultClassLoader);
-            } else if (Constants.TARGET_PLUGIN_PKG.equals(packageName)) {
-                // 插件进程：只补三方主题玻璃的判定点，其余 hook 都不属于这个进程
                 installThirdPartyThemeGlassHooks(defaultClassLoader);
             }
         } catch (Throwable th) {
@@ -783,6 +773,7 @@ public class MainHook extends XposedModule {
     /* JADX INFO: renamed from: applyPinGlass, reason: merged with bridge method [inline-methods] */
     public void lambda$installPinGlassHook$0(View view, final ClassLoader classLoader) {
         try {
+            applyPinGlassLayout(view);
             ArrayList<View> arrayList = new ArrayList<>(Constants.PIN_KEY_IDS.length);
             collectPinKeys(view, arrayList);
             for (final View view2 : arrayList) {
@@ -812,7 +803,7 @@ public class MainHook extends XposedModule {
         }
     }
 
-    private String resName(View view) {
+    private static String resName(View view) {
         try {
             int id = view.getId();
             if (id == -1 || id == -1) {
@@ -834,6 +825,8 @@ public class MainHook extends XposedModule {
                 if (iMin <= 0) {
                     return;
                 }
+                int extraPx = Math.round(Constants.PIN_KEY_GLASS_EXTRA_RADIUS_DP * view.getResources().getDisplayMetrics().density);
+                int diameter = iMin + extraPx * 2;
                 for (int childCount = viewGroup.getChildCount() - 1; childCount >= 0; childCount--) {
                     if (Constants.PIN_MATERIAL_TAG.equals(viewGroup.getChildAt(childCount).getTag())) {
                         viewGroup.removeViewAt(childCount);
@@ -844,6 +837,7 @@ public class MainHook extends XposedModule {
                 imageView.setClickable(false);
                 imageView.setFocusable(false);
                 imageView.setImportantForAccessibility(2);
+                imageView.setDuplicateParentStateEnabled(true);
                 GradientDrawable gradientDrawable = new GradientDrawable();
                 gradientDrawable.setColor(Color.argb(1, 255, 255, 255));
                 imageView.setImageDrawable(gradientDrawable);
@@ -858,7 +852,9 @@ public class MainHook extends XposedModule {
                         outline.setOval(0, 0, view2.getWidth(), view2.getHeight());
                     }
                 });
-                viewGroup.addView(imageView, 0, new ViewGroup.LayoutParams(iMin, iMin));
+                viewGroup.addView(imageView, 0, new ViewGroup.LayoutParams(diameter, diameter));
+                viewGroup.setClipChildren(false);
+                viewGroup.setClipToPadding(false);
                 view.setBackground(null);
                 placePinMaterial(view, imageView);
                 view.addOnLayoutChangeListener(new View.OnLayoutChangeListener() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda1
@@ -874,7 +870,7 @@ public class MainHook extends XposedModule {
                     }
                 });
                 configurePinLabel(viewGroup);
-                applyPinBackdropMaterial(imageView, 14, 80, -1);
+                applyPinBackdropMaterial(imageView, Constants.PIN_BACKDROP_OPACITY, 80, -1);
                 applyPinGlassMaterial(imageView, classLoader, 36, 0.14f);
             }
         } catch (Throwable th) {
@@ -897,13 +893,15 @@ public class MainHook extends XposedModule {
         if (iMin <= 0) {
             return;
         }
+        int extraPx = Math.round(Constants.PIN_KEY_GLASS_EXTRA_RADIUS_DP * view.getResources().getDisplayMetrics().density);
+        int diameter = iMin + extraPx * 2;
         ViewGroup.LayoutParams layoutParams = view2.getLayoutParams();
-        layoutParams.width = iMin;
-        layoutParams.height = iMin;
+        layoutParams.width = diameter;
+        layoutParams.height = diameter;
         view2.setLayoutParams(layoutParams);
-        int width = (view.getWidth() - iMin) / 2;
-        int height = (view.getHeight() - iMin) / 2;
-        view2.layout(width, height, width + iMin, iMin + height);
+        int width = (view.getWidth() - diameter) / 2;
+        int height = (view.getHeight() - diameter) / 2;
+        view2.layout(width, height, width + diameter, diameter + height);
         view2.invalidateOutline();
     }
 
@@ -949,6 +947,75 @@ public class MainHook extends XposedModule {
             cls.getMethod("setMiGlassCompat", View.class, float[].class).invoke(null, view, fArr);
         } catch (Throwable th) {
             LogUtil.logAlways("[密码玻璃] 柔光材质失败: " + th);
+        }
+    }
+
+    /* 锁屏数字柔光玻璃（移植自 HyperModifier）：放大后的圆盘需要竖向留白，
+       因此在固定高度的 PIN 键盘容器里为 row1~row3 增加底部间距并同步抬高 pin_container 高度。 */
+    private static final Map<View, Integer> sPinRowOrigBottoms = Collections.synchronizedMap(new WeakHashMap<>());
+    private static final Map<View, Integer> sPinContainerOrigHeights = Collections.synchronizedMap(new WeakHashMap<>());
+
+    private void applyPinGlassLayout(View root) {
+        try {
+            int extraGap = Math.round(Constants.PIN_KEY_GLASS_VERTICAL_GAP_DP * root.getResources().getDisplayMetrics().density);
+            int expandedRows = 0;
+            for (View view : descendantsNamed(root, "row1", "row2", "row3")) {
+                ViewGroup.LayoutParams layoutParams = view.getLayoutParams();
+                if (!(layoutParams instanceof ViewGroup.MarginLayoutParams)) {
+                    continue;
+                }
+                ViewGroup.MarginLayoutParams marginLayoutParams = (ViewGroup.MarginLayoutParams) layoutParams;
+                Integer num = sPinRowOrigBottoms.get(view);
+                if (num == null) {
+                    num = marginLayoutParams.bottomMargin;
+                    sPinRowOrigBottoms.put(view, num);
+                }
+                marginLayoutParams.bottomMargin = num + extraGap;
+                view.setLayoutParams(marginLayoutParams);
+                expandedRows++;
+            }
+            if (expandedRows == 0) {
+                return;
+            }
+            for (View view2 : descendantsNamed(root, "pin_container")) {
+                ViewGroup.LayoutParams layoutParams2 = view2.getLayoutParams();
+                if (layoutParams2 == null || layoutParams2.height <= 0) {
+                    continue;
+                }
+                Integer num2 = sPinContainerOrigHeights.get(view2);
+                if (num2 == null) {
+                    num2 = layoutParams2.height;
+                    sPinContainerOrigHeights.put(view2, num2);
+                }
+                layoutParams2.height = num2 + extraGap * expandedRows;
+                view2.setLayoutParams(layoutParams2);
+            }
+        } catch (Throwable th) {
+            LogUtil.logAlways("[密码玻璃] 布局扩展失败: " + th);
+        }
+    }
+
+    private static List<View> descendantsNamed(View view, String... strArr) {
+        ArrayList<View> arrayList = new ArrayList<>();
+        collectDescendantsNamed(view, arrayList, strArr);
+        return arrayList;
+    }
+
+    private static void collectDescendantsNamed(View view, List<View> list, String... strArr) {
+        String resName = resName(view);
+        if (resName != null) {
+            for (String str : strArr) {
+                if (str.equals(resName)) {
+                    list.add(view);
+                    break;
+                }
+            }
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup viewGroup = (ViewGroup) view;
+            for (int i = 0; i < viewGroup.getChildCount(); i++) {
+                collectDescendantsNamed(viewGroup.getChildAt(i), list, strArr);
+            }
         }
     }
 
@@ -1091,14 +1158,7 @@ public class MainHook extends XposedModule {
                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
                     Object objProceed = chain.proceed();
                     if (objProceed instanceof ClassLoader) {
-                        ClassLoader pluginLoader = (ClassLoader) objProceed;
-                        MainHook.this.tryHookQsEditIn(pluginLoader);
-                        // ROM OS4.0.21 起控制中心插件类在 systemui 进程内经这个 loader 加载，
-                        // 不再有独立的 miui.systemui.plugin 进程：三方主题玻璃 guard 必须在这里补挂，
-                        // 否则插件侧的 ThemeUtils / MiuiDefaultThemeControllerImpl 判定点无人接管。
-                        if (sGlassLoaders.add(pluginLoader)) {
-                            MainHook.this.installThirdPartyThemeGlassHooks(pluginLoader);
-                        }
+                        MainHook.this.tryHookQsEditIn((ClassLoader) objProceed);
                     }
                     return objProceed;
                 }
@@ -1124,10 +1184,6 @@ public class MainHook extends XposedModule {
         // 1) ThemeUtils.getDefaultPluginTheme / getDefaultSysUiTheme → true
         try {
             Class<?> themeUtils = Class.forName(Constants.TPG_THEME_UTILS_CLASS, false, classLoader);
-            sPluginThemeUtilsClass = themeUtils;
-            if (sGlassEnabled) {
-                forceThemeUtilsFlags(themeUtils);
-            }
             String[] getters = {"getDefaultPluginTheme", "getDefaultSysUiTheme"};
             for (String m : getters) {
                 try {
@@ -1135,10 +1191,6 @@ public class MainHook extends XposedModule {
                             .setId("tpg-getter-" + m).intercept(new XposedInterface.Hooker() {
                                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
                                     if (MainHook.this.sGlassEnabled) {
-                                        Class<?> cls = sPluginThemeUtilsClass;
-                                        if (cls != null) {
-                                            forceThemeUtilsFlags(cls);
-                                        }
                                         return true;
                                     }
                                     return chain.proceed();
@@ -1193,7 +1245,9 @@ public class MainHook extends XposedModule {
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                     .setId("tpg-getBgMaterialOpenedInDefaultTheme").intercept(new XposedInterface.Hooker() {
                         public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                            // v3.37：不再强制 true（见下）；三方主题自己的材质原样透传
+                            if (MainHook.this.sGlassEnabled) {
+                                return true;
+                            }
                             return chain.proceed();
                         }
                     });
@@ -1209,10 +1263,6 @@ public class MainHook extends XposedModule {
                     .setId("tpg-isDefaultTheme").intercept(new XposedInterface.Hooker() {
                         public Object intercept(XposedInterface.Chain chain) throws Throwable {
                             if (MainHook.this.sGlassEnabled) {
-                                Class<?> cls = sPluginThemeUtilsClass;
-                                if (cls != null) {
-                                    forceThemeUtilsFlags(cls);
-                                }
                                 return true;
                             }
                             return chain.proceed();
@@ -1240,48 +1290,9 @@ public class MainHook extends XposedModule {
                             return r;
                         }
                     });
-            if (sGlassEnabled) {
-                sDefaultField.setBoolean(null, true);
-            }
             LogUtil.logAlways("[三方主题玻璃] 已挂钩 ConfigurationControllerImpl.onConfigurationChanged");
         } catch (Throwable th) {
             LogUtil.log("[三方主题玻璃] ConfigurationControllerImpl 挂钩失败(本 loader 无此类): " + th);
-        }
-    }
-
-    /**
-     * 插件类可能在任意 classloader 里首次加载（4.0.21 上控制中心插件就跑在 systemui 进程内），
-     * 单靠 PluginFactory.createClassLoader 可能漏掉真正的那个 loader。这里兜底：
-     * 只要有人加载 miui.systemui.util.ThemeUtils，就立刻在那个 loader 上补挂 guard ——
-     * 必须早于插件用它初始化默认主题状态（StateFlow）之前，否则 false 会被缓存住。
-     */
-    private void installPluginClassLoadGuard() {
-        if (sClassLoadGuardInstalled) {
-            return;
-        }
-        try {
-            hook(ClassLoader.class.getMethod("loadClass", String.class))
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("tpg-plugin-classload").intercept(new XposedInterface.Hooker() {
-                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                            Object arg = chain.getArg(0);
-                            if (!(arg instanceof String) || !Constants.TPG_THEME_UTILS_CLASS.equals(arg)) {
-                                return chain.proceed();
-                            }
-                            Object r = chain.proceed();
-                            if (r instanceof Class) {
-                                ClassLoader cl = ((Class<?>) r).getClassLoader();
-                                if (cl != null && sGlassLoaders.add(cl)) {
-                                    MainHook.this.installThirdPartyThemeGlassHooks(cl);
-                                }
-                            }
-                            return r;
-                        }
-                    });
-            sClassLoadGuardInstalled = true;
-            LogUtil.logAlways("[三方主题玻璃] 已挂钩 ClassLoader.loadClass（插件类加载即补挂）");
-        } catch (Throwable th) {
-            LogUtil.logAlways("[三方主题玻璃] 类加载 guard 挂钩失败: " + th);
         }
     }
 
