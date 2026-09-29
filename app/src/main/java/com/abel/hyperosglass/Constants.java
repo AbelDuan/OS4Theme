@@ -23,14 +23,14 @@ public final class Constants {
     public static final boolean DEFAULT_GLASS_ENABLED = true;
     public static final boolean DEFAULT_HIDE_BT_UNLOCK = true;
     public static final boolean DEFAULT_HIDE_DISMISS_BTN = true;
-    public static final boolean DEFAULT_HIDE_LOCK_FOD = true;
+    public static final boolean DEFAULT_HIDE_LOCK_FOD = false;
     public static final boolean DEFAULT_KEEP_NOTIF = true;
     public static final boolean DEFAULT_MUTE_SCREEN_ON = true;
     public static final boolean DEFAULT_NO_FOLD_HISTORY = true;
     public static final boolean DEFAULT_NO_NOTIF_LIMIT = true;
     public static final boolean DEFAULT_PIN_GLASS = true;
     public static final boolean DEFAULT_QS_EDIT_HIDE = true;
-    public static final boolean DEFAULT_SINK_ENABLED = true;
+    public static final boolean DEFAULT_SINK_ENABLED = false;
     public static final String ENTRY_SBN_FIELD = "mSbn";
     public static final String EXPAND_BUTTON_PILL_ID_NAME = "expand_button_pill";
     public static final String EXPAND_BUTTON_VIEW_CLASS = "com.android.internal.widget.NotificationOptimizedLinearLayout";
@@ -84,7 +84,7 @@ public final class Constants {
     public static final String NOTIF_PIPELINE_CLASS = "com.android.systemui.statusbar.notification.collection.NotifPipeline";
     public static final int PIN_BACKDROP_BLUR_RADIUS = 80;
     public static final int PIN_BACKDROP_COLOR = -1;
-    public static final int PIN_BACKDROP_OPACITY = 14;
+    public static final int PIN_BACKDROP_OPACITY = 10;
     public static final int PIN_DEFAULT_BLUR_RADIUS = 36;
     public static final float PIN_DEFAULT_LUMINANCE = 0.14f;
     public static final int PIN_GLASS_BLEND_MODE = 101;
@@ -97,6 +97,9 @@ public final class Constants {
     public static final int PIN_MAX_BLUR_RADIUS = 100;
     public static final int PIN_MAX_LARGE_BLUR_RADIUS = 500;
     public static final float PIN_MAX_LUMINANCE = 0.4f;
+    // 锁屏数字柔光玻璃（移植自 HyperModifier）：圆盘超出按键的额外半径(dp) 与按键行竖向间隔(dp)
+    public static final int PIN_KEY_GLASS_EXTRA_RADIUS_DP = 6;
+    public static final int PIN_KEY_GLASS_VERTICAL_GAP_DP = 16;
     public static final String PIN_VIEW_CLASS = "com.android.keyguard.KeyguardPINView";
     public static final String PLUGIN_CREATE_CLASSLOADER_METHOD = "createClassLoader";
     public static final String PLUGIN_FACTORY_CLASS = "com.android.systemui.shared.plugins.PluginInstance$PluginFactory";
@@ -108,7 +111,7 @@ public final class Constants {
     public static final String STATUS_AUTHORITY = "com.abel.hyperosglass.status";
     public static final String STATUS_URI = "content://com.abel.hyperosglass.status";
     public static final String TARGET_PKG = "com.android.systemui";
-    public static final String VERSION = "3.35";
+    public static final String VERSION = "3.37";
     public static final String[] BLE_UNLOCK_TEXT_BT = {"蓝牙", "bluetooth"};
     public static final String[] BLE_UNLOCK_TEXT_UNLOCK = {"解锁", "unlock"};
     public static final String[] PIN_KEY_IDS = {"key0", "key1", "key2", "key3", "key4", "key5", "key6", "key7", "key8", "key9"};
@@ -131,5 +134,5 @@ public final class Constants {
     public static final String PREFS_QS_EDIT_HIDE = "qs_edit_hide";
     public static final String PREFS_ENABLE_LOG = "enable_log";
     public static final String[] ALL_PREF_KEYS = {PREFS_GLASS_ENABLED, PREFS_FOCUS_GLASS, PREFS_AOD_BATTERY_SYNC, PREFS_PIN_GLASS, PREFS_NO_FOLD_HISTORY, PREFS_SINK_ENABLED, PREFS_NO_NOTIF_LIMIT, PREFS_KEEP_NOTIF, PREFS_HIDE_BT_UNLOCK, PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_ALLOW_MANAGE_ALL, PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE, PREFS_ENABLE_LOG};
-    public static final boolean[] ALL_PREF_DEFAULTS = {true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, false};
+    public static final boolean[] ALL_PREF_DEFAULTS = {true, true, true, true, true, false, true, true, true, true, true, true, false, true, true, false};
 }

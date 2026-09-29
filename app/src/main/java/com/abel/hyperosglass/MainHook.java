@@ -773,6 +773,7 @@ public class MainHook extends XposedModule {
     /* JADX INFO: renamed from: applyPinGlass, reason: merged with bridge method [inline-methods] */
     public void lambda$installPinGlassHook$0(View view, final ClassLoader classLoader) {
         try {
+            applyPinGlassLayout(view);
             ArrayList<View> arrayList = new ArrayList<>(Constants.PIN_KEY_IDS.length);
             collectPinKeys(view, arrayList);
             for (final View view2 : arrayList) {
@@ -802,7 +803,7 @@ public class MainHook extends XposedModule {
         }
     }
 
-    private String resName(View view) {
+    private static String resName(View view) {
         try {
             int id = view.getId();
             if (id == -1 || id == -1) {
@@ -824,6 +825,8 @@ public class MainHook extends XposedModule {
                 if (iMin <= 0) {
                     return;
                 }
+                int extraPx = Math.round(Constants.PIN_KEY_GLASS_EXTRA_RADIUS_DP * view.getResources().getDisplayMetrics().density);
+                int diameter = iMin + extraPx * 2;
                 for (int childCount = viewGroup.getChildCount() - 1; childCount >= 0; childCount--) {
                     if (Constants.PIN_MATERIAL_TAG.equals(viewGroup.getChildAt(childCount).getTag())) {
                         viewGroup.removeViewAt(childCount);
@@ -834,6 +837,7 @@ public class MainHook extends XposedModule {
                 imageView.setClickable(false);
                 imageView.setFocusable(false);
                 imageView.setImportantForAccessibility(2);
+                imageView.setDuplicateParentStateEnabled(true);
                 GradientDrawable gradientDrawable = new GradientDrawable();
                 gradientDrawable.setColor(Color.argb(1, 255, 255, 255));
                 imageView.setImageDrawable(gradientDrawable);
@@ -848,7 +852,9 @@ public class MainHook extends XposedModule {
                         outline.setOval(0, 0, view2.getWidth(), view2.getHeight());
                     }
                 });
-                viewGroup.addView(imageView, 0, new ViewGroup.LayoutParams(iMin, iMin));
+                viewGroup.addView(imageView, 0, new ViewGroup.LayoutParams(diameter, diameter));
+                viewGroup.setClipChildren(false);
+                viewGroup.setClipToPadding(false);
                 view.setBackground(null);
                 placePinMaterial(view, imageView);
                 view.addOnLayoutChangeListener(new View.OnLayoutChangeListener() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda1
@@ -864,7 +870,7 @@ public class MainHook extends XposedModule {
                     }
                 });
                 configurePinLabel(viewGroup);
-                applyPinBackdropMaterial(imageView, 14, 80, -1);
+                applyPinBackdropMaterial(imageView, Constants.PIN_BACKDROP_OPACITY, 80, -1);
                 applyPinGlassMaterial(imageView, classLoader, 36, 0.14f);
             }
         } catch (Throwable th) {
@@ -887,13 +893,15 @@ public class MainHook extends XposedModule {
         if (iMin <= 0) {
             return;
         }
+        int extraPx = Math.round(Constants.PIN_KEY_GLASS_EXTRA_RADIUS_DP * view.getResources().getDisplayMetrics().density);
+        int diameter = iMin + extraPx * 2;
         ViewGroup.LayoutParams layoutParams = view2.getLayoutParams();
-        layoutParams.width = iMin;
-        layoutParams.height = iMin;
+        layoutParams.width = diameter;
+        layoutParams.height = diameter;
         view2.setLayoutParams(layoutParams);
-        int width = (view.getWidth() - iMin) / 2;
-        int height = (view.getHeight() - iMin) / 2;
-        view2.layout(width, height, width + iMin, iMin + height);
+        int width = (view.getWidth() - diameter) / 2;
+        int height = (view.getHeight() - diameter) / 2;
+        view2.layout(width, height, width + diameter, diameter + height);
         view2.invalidateOutline();
     }
 
@@ -939,6 +947,75 @@ public class MainHook extends XposedModule {
             cls.getMethod("setMiGlassCompat", View.class, float[].class).invoke(null, view, fArr);
         } catch (Throwable th) {
             LogUtil.logAlways("[密码玻璃] 柔光材质失败: " + th);
+        }
+    }
+
+    /* 锁屏数字柔光玻璃（移植自 HyperModifier）：放大后的圆盘需要竖向留白，
+       因此在固定高度的 PIN 键盘容器里为 row1~row3 增加底部间距并同步抬高 pin_container 高度。 */
+    private static final Map<View, Integer> sPinRowOrigBottoms = Collections.synchronizedMap(new WeakHashMap<>());
+    private static final Map<View, Integer> sPinContainerOrigHeights = Collections.synchronizedMap(new WeakHashMap<>());
+
+    private void applyPinGlassLayout(View root) {
+        try {
+            int extraGap = Math.round(Constants.PIN_KEY_GLASS_VERTICAL_GAP_DP * root.getResources().getDisplayMetrics().density);
+            int expandedRows = 0;
+            for (View view : descendantsNamed(root, "row1", "row2", "row3")) {
+                ViewGroup.LayoutParams layoutParams = view.getLayoutParams();
+                if (!(layoutParams instanceof ViewGroup.MarginLayoutParams)) {
+                    continue;
+                }
+                ViewGroup.MarginLayoutParams marginLayoutParams = (ViewGroup.MarginLayoutParams) layoutParams;
+                Integer num = sPinRowOrigBottoms.get(view);
+                if (num == null) {
+                    num = marginLayoutParams.bottomMargin;
+                    sPinRowOrigBottoms.put(view, num);
+                }
+                marginLayoutParams.bottomMargin = num + extraGap;
+                view.setLayoutParams(marginLayoutParams);
+                expandedRows++;
+            }
+            if (expandedRows == 0) {
+                return;
+            }
+            for (View view2 : descendantsNamed(root, "pin_container")) {
+                ViewGroup.LayoutParams layoutParams2 = view2.getLayoutParams();
+                if (layoutParams2 == null || layoutParams2.height <= 0) {
+                    continue;
+                }
+                Integer num2 = sPinContainerOrigHeights.get(view2);
+                if (num2 == null) {
+                    num2 = layoutParams2.height;
+                    sPinContainerOrigHeights.put(view2, num2);
+                }
+                layoutParams2.height = num2 + extraGap * expandedRows;
+                view2.setLayoutParams(layoutParams2);
+            }
+        } catch (Throwable th) {
+            LogUtil.logAlways("[密码玻璃] 布局扩展失败: " + th);
+        }
+    }
+
+    private static List<View> descendantsNamed(View view, String... strArr) {
+        ArrayList<View> arrayList = new ArrayList<>();
+        collectDescendantsNamed(view, arrayList, strArr);
+        return arrayList;
+    }
+
+    private static void collectDescendantsNamed(View view, List<View> list, String... strArr) {
+        String resName = resName(view);
+        if (resName != null) {
+            for (String str : strArr) {
+                if (str.equals(resName)) {
+                    list.add(view);
+                    break;
+                }
+            }
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup viewGroup = (ViewGroup) view;
+            for (int i = 0; i < viewGroup.getChildCount(); i++) {
+                collectDescendantsNamed(viewGroup.getChildAt(i), list, strArr);
+            }
         }
     }
 
