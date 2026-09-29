@@ -111,7 +111,7 @@ public final class Constants {
     public static final String STATUS_AUTHORITY = "com.abel.hyperosglass.status";
     public static final String STATUS_URI = "content://com.abel.hyperosglass.status";
     public static final String TARGET_PKG = "com.android.systemui";
-    public static final String VERSION = "3.37";
+    public static final String VERSION = "3.38";
     public static final String[] BLE_UNLOCK_TEXT_BT = {"蓝牙", "bluetooth"};
     public static final String[] BLE_UNLOCK_TEXT_UNLOCK = {"解锁", "unlock"};
     public static final String[] PIN_KEY_IDS = {"key0", "key1", "key2", "key3", "key4", "key5", "key6", "key7", "key8", "key9"};
