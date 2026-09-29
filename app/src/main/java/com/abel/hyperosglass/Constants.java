@@ -97,7 +97,7 @@ public final class Constants {
     public static final int PIN_MAX_BLUR_RADIUS = 100;
     public static final int PIN_MAX_LARGE_BLUR_RADIUS = 500;
     public static final float PIN_MAX_LUMINANCE = 0.4f;
-    // 锁屏数字柔光玻璃（移植自 HyperModifier）：圆盘超出按键的额外半径(dp) 与按键行竖向间隔(dp)
+    // 锁屏数字柔光玻璃（移植自 HyperModifier）：圆盘超出按键边的 dp 与圆盘布局留白 dp
     public static final int PIN_KEY_GLASS_EXTRA_RADIUS_DP = 6;
     public static final int PIN_KEY_GLASS_VERTICAL_GAP_DP = 16;
     public static final String PIN_VIEW_CLASS = "com.android.keyguard.KeyguardPINView";
@@ -111,7 +111,11 @@ public final class Constants {
     public static final String STATUS_AUTHORITY = "com.abel.hyperosglass.status";
     public static final String STATUS_URI = "content://com.abel.hyperosglass.status";
     public static final String TARGET_PKG = "com.android.systemui";
-    public static final String VERSION = "3.38";
+    // 控制中心/通知栏的插件进程。三方主题玻璃真正的判定点（miui.systemui.util.ThemeUtils /
+    // MiBlurCompat / MiuiDefaultThemeControllerImpl）在插件 APK 里各有一份、跑在这个进程，
+    // 只在 SystemUI 进程里强制"默认主题"会造成两侧状态不一致（磁贴变方），必须一并注入。
+    public static final String TARGET_PLUGIN_PKG = "miui.systemui.plugin";
+    public static final String VERSION = "3.39";
     public static final String[] BLE_UNLOCK_TEXT_BT = {"蓝牙", "bluetooth"};
     public static final String[] BLE_UNLOCK_TEXT_UNLOCK = {"解锁", "unlock"};
     public static final String[] PIN_KEY_IDS = {"key0", "key1", "key2", "key3", "key4", "key5", "key6", "key7", "key8", "key9"};
