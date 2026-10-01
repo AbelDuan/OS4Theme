@@ -28,6 +28,7 @@ import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -40,6 +41,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /* JADX INFO: loaded from: classes.dex */
 public class MainHook extends XposedModule {
+    /* ===== 通知优先级/重要性（v3.40，移植自 HyperCeiler）===== */
+    private volatile boolean sNotifImportance = true;
+    private static final String[] NOTIF_VISIBLE_PREF_KEYS = {"importance", "badge", "allow_keyguard"};
+    private static Method sEntryRepresentative;
+    private static Method sEntryRanking;
+    private static Method sRankingImportance;
     private volatile SharedPreferences sPrefs;
     private static final Set<String> sinkHooked = new HashSet();
     private static final Set<Class<?>> qsEditHooked = Collections.newSetFromMap(new WeakHashMap());
@@ -120,8 +127,12 @@ public class MainHook extends XposedModule {
                 installAodBatteryHooks(defaultClassLoader);
                 installPinGlassHook(defaultClassLoader);
                 installQsEditHideHook(defaultClassLoader);
+                installNotificationImportanceFilterHooks(defaultClassLoader);
                 installNotifEnhanceHooks(defaultClassLoader);
                 installThirdPartyThemeGlassHooks(defaultClassLoader);
+            } else if (Constants.SETTINGS_PKG.equals(packageName)) {
+                // 设置：放开被 MIUI 隐藏的「重要性」，并让改动写回通知通道
+                installNotificationImportanceSettingsHooks(defaultClassLoader);
             } else if (Constants.TARGET_PLUGIN_PKG.equals(packageName)) {
                 // 插件进程：只补三方主题玻璃的判定点，其余 hook 都不属于这个进程
                 installThirdPartyThemeGlassHooks(defaultClassLoader);
@@ -1112,8 +1123,10 @@ public class MainHook extends XposedModule {
             boolean z14 = bundle.getBoolean(Constants.PREFS_CANCEL_VIBRATE_SCREEN_ON, true);
             boolean z15 = bundle.getBoolean(Constants.PREFS_ALLOW_MANAGE_ALL, true);
             boolean z16 = bundle.getBoolean(Constants.PREFS_ENABLE_LOG, false);
+            boolean z17 = bundle.getBoolean(Constants.PREFS_NOTIF_IMPORTANCE, true);
             this.sSinkEnabled = z;
             this.sGlassEnabled = z2;
+            this.sNotifImportance = z17;
             this.sHideLockFod = z3;
             sHideLockFodFlag.set(z3);
             this.sHideDismissBtn = z4;
@@ -1420,6 +1433,262 @@ public class MainHook extends XposedModule {
             }
         }
         return null;
+    }
+
+    /**
+     * 通知优先级 / 重要性（一）：设置侧。
+     * 移植自 HyperCeiler 的 MoreNotificationSettings：MIUI 把通知设置里的「重要性 / 角标 / 锁屏显示」
+     * 藏了起来，这里让它们重新可见，并接管通道设置页的重要性下拉：把用户选的值写回
+     * NotificationChannel（setImportance + lockFields(4) + NotificationBackend.updateChannel）。
+     */
+    private void installNotificationImportanceSettingsHooks(ClassLoader classLoader) {
+        if (classLoader == null) {
+            return;
+        }
+        try {
+            Class<?> base = Class.forName(Constants.NOTIF_SETTINGS_CLASS, false, classLoader);
+            for (Method method : base.getDeclaredMethods()) {
+                Class<?>[] types = method.getParameterTypes();
+                if (!"setPrefVisible".equals(method.getName()) || types.length != 2
+                        || !types[0].getName().endsWith("Preference") || types[1] != Boolean.TYPE) {
+                    continue;
+                }
+                method.setAccessible(true);
+                hook(method).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("notif-pref-visible")
+                        .intercept(new XposedInterface.Hooker() {
+                            public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                                if (!sNotifImportance) {
+                                    return chain.proceed();
+                                }
+                                try {
+                                    Object pref = chain.getArg(0);
+                                    if (pref != null) {
+                                        Object key = pref.getClass().getMethod("getKey").invoke(pref);
+                                        for (String want : NOTIF_VISIBLE_PREF_KEYS) {
+                                            if (want.equals(key)) {
+                                                Object[] args = chain.getArgs().toArray();
+                                                args[1] = Boolean.TRUE;
+                                                return chain.proceed(args);
+                                            }
+                                        }
+                                    }
+                                } catch (Throwable unused) {
+                                }
+                                return chain.proceed();
+                            }
+                        });
+                LogUtil.logAlways("[通知重要性] 已挂钩 setPrefVisible（放开被隐藏的设置项）");
+                break;
+            }
+        } catch (Throwable th) {
+            LogUtil.log("[通知重要性] 设置项可见性挂钩失败: " + th);
+        }
+        try {
+            Class<?> channelSettings = Class.forName(Constants.CHANNEL_NOTIF_SETTINGS_CLASS, false, classLoader);
+            Method setup = channelSettings.getDeclaredMethod("setupChannelDefaultPrefs");
+            setup.setAccessible(true);
+            hook(setup).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("notif-channel-defaults")
+                    .intercept(new XposedInterface.Hooker() {
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            Object result = chain.proceed();
+                            if (sNotifImportance) {
+                                try {
+                                    attachImportanceListener(chain.getThisObject());
+                                } catch (Throwable unused) {
+                                }
+                            }
+                            return result;
+                        }
+                    });
+            LogUtil.logAlways("[通知重要性] 已挂钩 ChannelNotificationSettings.setupChannelDefaultPrefs");
+        } catch (Throwable th) {
+            LogUtil.log("[通知重要性] 通道设置页挂钩失败: " + th);
+        }
+    }
+
+    private void attachImportanceListener(final Object settings) throws Exception {
+        Object pref = invoke(settings, "findPreference", new Class[]{CharSequence.class}, new Object[]{"importance"});
+        if (pref == null) {
+            return;
+        }
+        setField(settings, "mImportance", pref);
+        Object backup = getField(settings, "mBackupImportance");
+        if (backup instanceof Integer && ((Integer) backup).intValue() > 0) {
+            Object index = invoke(pref, "findSpinnerIndexOfValue", new Class[]{String.class},
+                    new Object[]{String.valueOf(((Integer) backup).intValue())});
+            if (index instanceof Integer && ((Integer) index).intValue() > -1) {
+                invoke(pref, "setValueIndex", new Class[]{int.class}, new Object[]{index});
+            }
+        }
+        Class<?> listenerType = Class.forName("androidx.preference.Preference$OnPreferenceChangeListener",
+                false, settings.getClass().getClassLoader());
+        Object listener = Proxy.newProxyInstance(settings.getClass().getClassLoader(), new Class[]{listenerType},
+                new java.lang.reflect.InvocationHandler() {
+                    public Object invoke(Object proxy, Method method, Object[] args) {
+                        String name = method.getName();
+                        if ("onPreferenceChange".equals(name)) {
+                            try {
+                                applyImportanceChange(settings, args);
+                            } catch (Throwable unused) {
+                            }
+                            return Boolean.TRUE;
+                        }
+                        if ("equals".equals(name)) {
+                            return proxy == args[0];
+                        }
+                        if ("hashCode".equals(name)) {
+                            return Integer.valueOf(System.identityHashCode(proxy));
+                        }
+                        return null;
+                    }
+                });
+        invoke(pref, "setOnPreferenceChangeListener", new Class[]{listenerType}, new Object[]{listener});
+    }
+
+    private void applyImportanceChange(Object settings, Object[] args) throws Exception {
+        if (args == null || args.length < 2 || !(args[1] instanceof String)) {
+            return;
+        }
+        int importance = Integer.parseInt((String) args[1]);
+        setField(settings, "mBackupImportance", Integer.valueOf(importance));
+        Object channel = getField(settings, "mChannel");
+        if (channel == null) {
+            return;
+        }
+        // NotificationChannel.setImportance + lockFields(USER_LOCKED_IMPORTANCE=4)
+        channel.getClass().getMethod("setImportance", int.class).invoke(channel, Integer.valueOf(importance));
+        try {
+            Method lock = channel.getClass().getDeclaredMethod("lockFields", int.class);
+            lock.setAccessible(true);
+            lock.invoke(channel, Integer.valueOf(4));
+        } catch (Throwable unused) {
+        }
+        Object backend = getField(settings, "mBackend");
+        Object pkg = getField(settings, "mPkg");
+        Object uid = getField(settings, "mUid");
+        if (backend != null && pkg instanceof String) {
+            Method update = findMethod(backend.getClass(), "updateChannel", 3);
+            if (update != null) {
+                update.invoke(backend, pkg, Integer.valueOf(uid instanceof Integer ? ((Integer) uid).intValue() : 0), channel);
+            }
+        }
+        invoke(settings, "updateDependents", new Class[]{boolean.class}, new Object[]{Boolean.FALSE});
+        LogUtil.logAlways("[通知重要性] 已写回通道重要性: " + importance);
+    }
+
+    /**
+     * 通知优先级 / 重要性（二）：系统界面侧。
+     * 移植自 HyperCeiler 的 NotificationImportanceHyperOSFix：HyperOS 会把「已关闭 / 最低」的通知
+     * 照样渲染出来，这里按 Ranking.getImportance() 过滤，importance <= 1 的不进渲染列表。
+     */
+    private void installNotificationImportanceFilterHooks(ClassLoader classLoader) {
+        if (classLoader == null) {
+            return;
+        }
+        try {
+            Class<?> entryClass = Class.forName(Constants.NOTIF_ENTRY_CLASS, false, classLoader);
+            sEntryRepresentative = entryClass.getMethod("getRepresentativeEntry");
+            sEntryRanking = entryClass.getMethod("getRanking");
+            sRankingImportance = sEntryRanking.getReturnType().getMethod("getImportance");
+        } catch (Throwable th) {
+            LogUtil.log("[通知重要性] Ranking 反射准备失败: " + th);
+        }
+        try {
+            Class<?> stack = Class.forName(Constants.STACK_COORDINATOR_INNER_CLASS, false, classLoader);
+            for (Method method : stack.getDeclaredMethods()) {
+                Class<?>[] types = method.getParameterTypes();
+                if (!"onAfterRenderList".equals(method.getName()) || types.length != 1
+                        || !List.class.isAssignableFrom(types[0])) {
+                    continue;
+                }
+                method.setAccessible(true);
+                hook(method).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("notif-importance-filter")
+                        .intercept(new XposedInterface.Hooker() {
+                            public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                                if (!sNotifImportance || sRankingImportance == null) {
+                                    return chain.proceed();
+                                }
+                                Object arg = chain.getArg(0);
+                                if (!(arg instanceof List)) {
+                                    return chain.proceed();
+                                }
+                                List<?> source = (List<?>) arg;
+                                ArrayList<Object> kept = new ArrayList<Object>();
+                                for (Object entry : source) {
+                                    if (entryImportance(entry) > 1) {
+                                        kept.add(entry);
+                                    }
+                                }
+                                if (kept.size() == source.size()) {
+                                    return chain.proceed();
+                                }
+                                Object[] args = chain.getArgs().toArray();
+                                args[0] = kept;
+                                return chain.proceed(args);
+                            }
+                        });
+                LogUtil.logAlways("[通知重要性] 已挂钩 onAfterRenderList（按重要性过滤通知）");
+                break;
+            }
+        } catch (Throwable th) {
+            LogUtil.log("[通知重要性] 渲染列表过滤挂钩失败: " + th);
+        }
+    }
+
+    private static int entryImportance(Object entry) {
+        try {
+            Object representative = entry == null ? null : sEntryRepresentative.invoke(entry);
+            Object target = representative == null ? entry : representative;
+            Object ranking = sEntryRanking.invoke(target);
+            if (ranking == null) {
+                return 2;
+            }
+            Object importance = sRankingImportance.invoke(ranking);
+            return importance instanceof Integer ? ((Integer) importance).intValue() : 2;
+        } catch (Throwable unused) {
+            return 2; // 取不到就保留，宁可不删
+        }
+    }
+
+    private static Object invoke(Object target, String name, Class<?>[] types, Object[] args) {
+        try {
+            Method method = target.getClass().getMethod(name, types);
+            method.setAccessible(true);
+            return method.invoke(target, args);
+        } catch (Throwable unused) {
+            return null;
+        }
+    }
+
+    private static Method findMethod(Class<?> type, String name, int parameters) {
+        for (Class<?> current = type; current != null; current = current.getSuperclass()) {
+            for (Method method : current.getDeclaredMethods()) {
+                if (name.equals(method.getName()) && method.getParameterCount() == parameters) {
+                    method.setAccessible(true);
+                    return method;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static Object getField(Object target, String name) {
+        try {
+            Field field = target.getClass().getDeclaredField(name);
+            field.setAccessible(true);
+            return field.get(target);
+        } catch (Throwable unused) {
+            return null;
+        }
+    }
+
+    private static void setField(Object target, String name, Object value) {
+        try {
+            Field field = target.getClass().getDeclaredField(name);
+            field.setAccessible(true);
+            field.set(target, value);
+        } catch (Throwable unused) {
+        }
     }
 
     private void installExpandButtonColor(ClassLoader classLoader) {

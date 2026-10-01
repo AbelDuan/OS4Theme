@@ -290,6 +290,10 @@ public class SettingsActivity extends Activity {
         addSectionTitle(linearLayoutNewCard5, "功能隐藏", null);
         addSwitches(linearLayoutNewCard5, new Sw("锁屏指纹图标", Constants.PREFS_HIDE_LOCK_FOD, true), new Sw("通知清除按钮", Constants.PREFS_HIDE_DISMISS_BTN, true), new Sw("控制中心「编辑」", Constants.PREFS_QS_EDIT_HIDE, true), new Sw("蓝牙设备解锁提示", Constants.PREFS_HIDE_BT_UNLOCK, true));
         linearLayout.addView(linearLayoutNewCard5, cardLp());
+        LinearLayout linearLayoutNewCardNotif = newCard();
+        addSectionTitle(linearLayoutNewCardNotif, "通知优先级 / 重要性", "放开系统设置里被隐藏的重要性选项，并让改动生效");
+        addSwitch(linearLayoutNewCardNotif, "重要性可调（含低重要性过滤）", Constants.PREFS_NOTIF_IMPORTANCE, true);
+        linearLayout.addView(linearLayoutNewCardNotif, cardLp());
         LinearLayout linearLayoutNewCard6 = newCard();
         addSectionTitle(linearLayoutNewCard6, "应用工具", "日志记录：开启后需重启系统界面才开始记录");
         addSwitch(linearLayoutNewCard6, "日志记录", Constants.PREFS_ENABLE_LOG, false);

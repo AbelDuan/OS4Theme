@@ -103,6 +103,10 @@ public final class Constants {
     public static final String PIN_VIEW_CLASS = "com.android.keyguard.KeyguardPINView";
     public static final String PLUGIN_CREATE_CLASSLOADER_METHOD = "createClassLoader";
     public static final String PLUGIN_FACTORY_CLASS = "com.android.systemui.shared.plugins.PluginInstance$PluginFactory";
+    /** 通知优先级/重要性（v3.40，移植自 HyperCeiler 的 MoreNotificationSettings / NotificationImportanceHyperOSFix） */
+    public static final String NOTIF_SETTINGS_CLASS = "com.android.settings.notification.BaseNotificationSettings";
+    public static final String CHANNEL_NOTIF_SETTINGS_CLASS = "com.android.settings.notification.ChannelNotificationSettings";
+    public static final String STACK_COORDINATOR_INNER_CLASS = "com.android.systemui.statusbar.notification.collection.coordinator.StackCoordinator$attach$1";
     public static final String PREFS = "hyperosglass";
     public static final String PREFS_FOD_MODE_LEGACY = "fod_mode";
     public static final String QS_EDIT_CONTROLLER_CLASS = "miui.systemui.controlcenter.panel.main.qs.EditButtonController";
@@ -111,11 +115,12 @@ public final class Constants {
     public static final String STATUS_AUTHORITY = "com.abel.hyperosglass.status";
     public static final String STATUS_URI = "content://com.abel.hyperosglass.status";
     public static final String TARGET_PKG = "com.android.systemui";
+    public static final String SETTINGS_PKG = "com.android.settings";
     // 控制中心/通知栏的插件进程。三方主题玻璃真正的判定点（miui.systemui.util.ThemeUtils /
     // MiBlurCompat / MiuiDefaultThemeControllerImpl）在插件 APK 里各有一份、跑在这个进程，
     // 只在 SystemUI 进程里强制"默认主题"会造成两侧状态不一致（磁贴变方），必须一并注入。
     public static final String TARGET_PLUGIN_PKG = "miui.systemui.plugin";
-    public static final String VERSION = "3.39";
+    public static final String VERSION = "3.40";
     public static final String[] BLE_UNLOCK_TEXT_BT = {"蓝牙", "bluetooth"};
     public static final String[] BLE_UNLOCK_TEXT_UNLOCK = {"解锁", "unlock"};
     public static final String[] PIN_KEY_IDS = {"key0", "key1", "key2", "key3", "key4", "key5", "key6", "key7", "key8", "key9"};
@@ -137,6 +142,7 @@ public final class Constants {
     public static final String PREFS_HIDE_DISMISS_BTN = "hide_dismiss_btn";
     public static final String PREFS_QS_EDIT_HIDE = "qs_edit_hide";
     public static final String PREFS_ENABLE_LOG = "enable_log";
-    public static final String[] ALL_PREF_KEYS = {PREFS_GLASS_ENABLED, PREFS_FOCUS_GLASS, PREFS_AOD_BATTERY_SYNC, PREFS_PIN_GLASS, PREFS_NO_FOLD_HISTORY, PREFS_SINK_ENABLED, PREFS_NO_NOTIF_LIMIT, PREFS_KEEP_NOTIF, PREFS_HIDE_BT_UNLOCK, PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_ALLOW_MANAGE_ALL, PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE, PREFS_ENABLE_LOG};
-    public static final boolean[] ALL_PREF_DEFAULTS = {true, true, true, true, true, false, true, true, true, true, true, true, false, true, true, false};
+    public static final String PREFS_NOTIF_IMPORTANCE = "notif_importance";
+    public static final String[] ALL_PREF_KEYS = {PREFS_GLASS_ENABLED, PREFS_FOCUS_GLASS, PREFS_AOD_BATTERY_SYNC, PREFS_PIN_GLASS, PREFS_NO_FOLD_HISTORY, PREFS_SINK_ENABLED, PREFS_NO_NOTIF_LIMIT, PREFS_KEEP_NOTIF, PREFS_HIDE_BT_UNLOCK, PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_ALLOW_MANAGE_ALL, PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE, PREFS_ENABLE_LOG, PREFS_NOTIF_IMPORTANCE};
+    public static final boolean[] ALL_PREF_DEFAULTS = {true, true, true, true, true, false, true, true, true, true, true, true, false, true, true, false, true};
 }

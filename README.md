@@ -27,6 +27,7 @@
 5. **通知清除按钮隐藏** — 隐藏通知面板的「清除通知」按钮（图标置不可见 + 容器移出屏外，不拦截触摸）。
 6. **息屏电池状态同步**（v3.4）— AOD / 息屏场景下，状态栏电池完全同步系统状态栏：图标与百分比均按系统设置显示，模块零干预。
 7. **锁屏密码柔光玻璃**（v3.5）— 锁屏数字键盘圆形柔光玻璃：hook `KeyguardPINView.onFinishInflate`，调用系统 `MiGlassCompat` 接口（`setMiGlassBlurRadius` / `setMiViewMaterialTypeCompat(type=1)` / `setMiGlassCompat`）为 `key0..key9` 插入柔光材质层；仅用系统开放接口，非私有实现。
+10. **通知优先级 / 重要性**（v3.40）— 移植自 HyperCeiler：放开系统设置里被 MIUI 隐藏的「重要性」选项，并把改动写回通知通道（`NotificationChannel.setImportance` + `lockFields` + `NotificationBackend.updateChannel`）；同时在系统界面侧按 `Ranking.getImportance() <= 1` 过滤掉「已关闭 / 最低」的通知，让设置真正生效。作用域因此新增 `com.android.settings`。
 8. **手势导航白条**（v3.6）— 手势导航提示线（底部小白条）不可见，但底栏抬高与手势区照常保留：hook `NavigationHandle.onDraw` 与 `QuickswitchOrientedNavHandle.onDraw`（`com.android.systemui.navigationbar.gestural`），开启时直接跳过绘制 → 小白条不画，视图仍占位。
 9. **控制中心编辑**（v3.7 / 修复于 v3.8）— 下拉控制中心底栏的「编辑」按钮视觉隐藏，但点击区域与编辑入口保留：hook `miui.systemui.controlcenter.panel.main.qs.EditButtonController.onBindViewHolder`（位于 `MIUISystemUIPlugin` 插件 APK 的独立 ClassLoader，经 `PluginFactory.createClassLoader` 拿到插件 loader 后补挂）。`onBindViewHolder` 内已把编辑点击设到 `binding.touchContainer`（LinearLayout），故执行原绑定后对该 View `setAlpha(0f)`——alpha 只影响绘制、不改 `VISIBILITY` 标志位，View 仍是 `VISIBLE`、仍接收触摸事件，因此「完全透明但点击命中保留」（v3.7 初版误用 `INVISIBLE`，框架 `canViewReceivePointerEvents` 要求 `VISIBILITY==VISIBLE` 才派发触摸，导致按钮隐了但点不动，v3.8 修正），其余按钮不受影响。
 

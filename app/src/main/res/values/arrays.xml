@@ -2,5 +2,6 @@
 <resources>
     <array name="xposed_scope">
         <item>com.android.systemui</item>
+        <item>com.android.settings</item>
     </array>
 </resources>

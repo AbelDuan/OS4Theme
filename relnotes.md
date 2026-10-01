@@ -1,3 +1,14 @@
+## v3.40 移植 HyperCeiler「通知优先级 / 重要性」
+
+- 设置侧（需作用域 `com.android.settings`）：hook `BaseNotificationSettings.setPrefVisible`，
+  让被 MIUI 藏起的 `importance` / `badge` / `allow_keyguard` 重新可见；hook
+  `ChannelNotificationSettings.setupChannelDefaultPrefs`，把「重要性」选择写回通道
+  （`setImportance` + `lockFields(4)` + `NotificationBackend.updateChannel`），并还原上次选择
+- 系统界面侧：hook `StackCoordinator$attach$1.onAfterRenderList`，把 `Ranking.getImportance() <= 1`
+  （已关闭 / 最低）的通知从渲染列表剔除，让「重要性」设置真正生效
+- 设置页新增卡片「通知优先级 / 重要性」，开关 `notif_importance` 默认开
+- 版本 3.40 / versionCode 111；细节与「未完成实机验证」的原因见 NOTES-v3.40-notification-importance.md
+
 ## v3.4 息屏电池状态同步
 
 基于 v3.3.11 集成「锁屏状态栏调整」任务的 AOD 电池能力：
