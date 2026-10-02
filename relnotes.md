@@ -1,3 +1,14 @@
+## v3.41 修 v3.40 的重要性写回无效（改成「低」会弹回）
+
+- 根因：AOSP 的 `mChannel` / `mBackend` / `mPkg` / `mUid` / `mBackupImportance` 声明在父类
+  `NotificationSettingsBase`（本机为 `com.android.settings.notification.*` 体系），
+  v3.40 的 `getField/setField` 只查**本类 declared 字段** → 全部取到 null →
+  listener 里「mChannel 为空，写回中止」→ 界面重新读回真实值，表现为「改成低又弹回紧急」
+- 修法：字段查找改为**递归父类**（`findField`），写回链路恢复：
+  `NotificationChannel.setImportance` + `lockFields(4)` + `NotificationBackend.updateChannel` + `updateDependents`
+- 实机验证（OS4.0.21）：`[通知重要性] 已写回通道重要性: N`，`channel.getImportance()` 与选择一致，不再回弹
+- 版本 3.41 / versionCode 112
+
 ## v3.40 移植 HyperCeiler「通知优先级 / 重要性」
 
 - 设置侧（需作用域 `com.android.settings`）：hook `BaseNotificationSettings.setPrefVisible`，

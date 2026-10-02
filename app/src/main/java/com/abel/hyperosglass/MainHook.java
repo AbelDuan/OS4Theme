@@ -1672,11 +1672,23 @@ public class MainHook extends XposedModule {
         return null;
     }
 
+    /** 字段可能在父类里（AOSP 的 mChannel/mBackend/mPkg/mUid 都在 NotificationSettingsBase 上），逐级向上找 */
+    private static Field findField(Object target, String name) {
+        for (Class<?> type = target.getClass(); type != null && type != Object.class; type = type.getSuperclass()) {
+            try {
+                Field field = type.getDeclaredField(name);
+                field.setAccessible(true);
+                return field;
+            } catch (Throwable unused) {
+            }
+        }
+        return null;
+    }
+
     private static Object getField(Object target, String name) {
         try {
-            Field field = target.getClass().getDeclaredField(name);
-            field.setAccessible(true);
-            return field.get(target);
+            Field field = findField(target, name);
+            return field == null ? null : field.get(target);
         } catch (Throwable unused) {
             return null;
         }
@@ -1684,9 +1696,10 @@ public class MainHook extends XposedModule {
 
     private static void setField(Object target, String name, Object value) {
         try {
-            Field field = target.getClass().getDeclaredField(name);
-            field.setAccessible(true);
-            field.set(target, value);
+            Field field = findField(target, name);
+            if (field != null) {
+                field.set(target, value);
+            }
         } catch (Throwable unused) {
         }
     }

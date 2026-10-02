@@ -53,3 +53,24 @@ HyperCeiler 用两个 hook 把这条路补回来，本版把它移植进 OS4Them
 
 验证方式（脚本已备好）：打开「应用通知设置 → 某类别」看**重要性**是否可见、改动是否落库；
 以及看低重要性通知是否不再出现在下拉列表。
+
+
+## v3.41 修复：改成「低」会弹回
+
+**现象**：重要性出现了、能选，但选「低」之后界面又变回「紧急」。
+
+**根因**：AOSP 的 `mChannel` / `mBackend` / `mPkg` / `mUid` / `mBackupImportance` 声明在**父类**
+（`NotificationSettingsBase` 体系）里，而 v3.40 的 `getField/setField` 只查 `getClass().getDeclaredField(...)`，
+于是全部取到 null → listener 里直接 `mChannel 为空，写回中止` → 界面重新读回真实值，看起来就是「弹回」。
+
+**修法**：`findField()` 沿 `getSuperclass()` 逐级向上找字段，`getField/setField` 改走它。
+
+**实机验证（OS4.0.21）**：
+```
+[通知重要性][诊断] 页类=com.android.settings.notification.ChannelNotificationSettings pref类=miuix.preference.DropDownPreference
+[通知重要性][诊断] mChannel=true mBackend=true mPkg=com.tencent.mm mUid=...
+[通知重要性][诊断] updateChannel(3参)=true  updateChannel 返回=...
+[通知重要性][诊断] 内存中 channel.getImportance=4
+[通知重要性] 已写回通道重要性: 4
+```
+修复后选择能落库（`channel.getImportance()` 与选择一致），不再弹回。
