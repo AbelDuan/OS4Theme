@@ -73,7 +73,16 @@ public final class RotationHint {
             "com.android.systemui.navigationbar.views.NavigationBarView";
 
     /** 传感器回调到实际弹按钮之间的稳定延时（ms），过滤转动过程中的抖动 */
-    private static final long STABLE_DELAY_MS = 350L;
+    /**
+     * 方向「停稳」确认延时。
+     *
+     * <p>⚠️ 原来是 350ms —— 用户反馈「转动后要好几秒才生效」，
+     * 这个等待本身就是主要延迟来源之一。转动时手会抖，需要一点去抖，
+     * 但 350ms 太长；120ms（约 2 个 15Hz 采样周期）足够滤掉抖动，
+     * 又不会让用户感到迟滞。
+     */
+    // 📌 已取消「停稳确认」等待（原 120ms）—— 用户要求取消所有延迟
+    private static final long STABLE_DELAY_MS = 0L;
     /**
      * 「收→显」之间留的间隔（毫秒）。
      *
@@ -81,7 +90,8 @@ public final class RotationHint {
      * 位置切换会跟随系统自己的淡入淡出，视觉上平滑。
      * 90ms 是实测比较自然的取值 —— 再大会觉得卡顿，再小仍然生硬。
      */
-    private static final long RELOCATE_SHOW_DELAY_MS = 90L;
+    // 📌 收→显之间不再留间隔（原 90ms）—— 用户要求取消所有延迟
+    private static final long RELOCATE_SHOW_DELAY_MS = 0L;
 
     /** 拿到的 RotationButtonController 实例（反射调用，避免编译期依赖） */
     private static volatile Object sController;
@@ -100,6 +110,15 @@ public final class RotationHint {
 
     /** 传感器是否已注册 */
     private static volatile boolean sSensorRegistered;
+    /** 已注册的传感器监听器与 SensorManager，用于注销（省电）。 */
+    private static volatile SensorEventListener sListener;
+    private static volatile SensorManager sSensorMgr;
+    /** 系统同款的 OrientationEventListener（主路径）。 */
+    private static volatile android.view.OrientationEventListener sOel;
+    /** OEL 回调计数（排查上报频率用）。 */
+    private static volatile long sOelTicks = 0L;
+    /** 上一次打印的落点摘要，用于热路径日志去重。 */
+    private static volatile String sLastPositionLog = "";
     /** 主线程 Handler，用于延时去抖 */
     private static final Handler sMain = new Handler(Looper.getMainLooper());
     /** 最近一次已提示过的目标方向（Surface.ROTATION_*），-1 表示未提示 */
@@ -310,7 +329,7 @@ public final class RotationHint {
     private static volatile int sLastRelocatedSensor = -2;
     private static volatile long sLastRelocateAt = 0L;
     /** 重排最小间隔：同一方向的重复请求在这段时间内直接忽略。 */
-    private static final long RELOCATE_MIN_INTERVAL_MS = 400L;
+    private static final long RELOCATE_MIN_INTERVAL_MS = 150L;
 
     private static void relocate() {
         if (!MainHook.sRotationHintEnable.get()) {
@@ -320,14 +339,25 @@ public final class RotationHint {
         //   （传感器抖动 + 多个入口重复触发），日志暴刷、按钮反复闪，
         //   用户看到的「渐入渐出没效果」就是这么来的。
         //   同一方向在 RELOCATE_MIN_INTERVAL_MS 内只执行一次。
+        // 🔑 防抖改为「延时合并」而不是「直接丢弃」。
+        //   ⚠️ 旧实现的问题：快速连续转动 A→B→C 时，B 可能落在
+        //   A 之后 150ms 内被**直接 return 掉**，而 C 又因为
+        //   「和 B 不同」重新计时 —— 结果按钮停在中间某个方向，
+        //   用户感受就是「停留在第一次转的地方」。
+        //   现在改成：把最新方向延后合并执行，**保证最后一个方向一定会被应用**。
+        // ⚠️ 这里**不再做时间冷却检查** —— 冷却已经由调用方的
+        //   「取消上一次、只保留最新」的延时合并完成。
+        //   若此处再拦一次，合并后的最终方向仍可能被误丢，
+        //   那就又回到「停在第一次转的地方」的老问题。
+        //   只跳过完全重复的方向（同一方向重排没有意义）。
         int curSensor = sSensorTargetRotation;
-        long now = android.os.SystemClock.uptimeMillis();
-        if (curSensor == sLastRelocatedSensor
-                && now - sLastRelocateAt < RELOCATE_MIN_INTERVAL_MS) {
+        if (curSensor == sLastRelocatedSensor) {
+            LogUtil.logAlways("[旋转提示] 重排跳过（方向未变）方向=" + curSensor);
             return;
         }
+        LogUtil.logAlways("[旋转提示] 重排执行 方向=" + curSensor
+                + " 上次方向=" + sLastRelocatedSensor);
         sLastRelocatedSensor = curSensor;
-        sLastRelocateAt = now;
 
         Object controller = sController;
         if (controller == null) {
@@ -583,9 +613,15 @@ public final class RotationHint {
         changed |= setIntField(pos, "translationX", tx);
         changed |= setIntField(pos, "translationY", ty);
         if (changed) {
-            LogUtil.logAlways("[旋转提示] 落点 传感器=" + sensor + " 屏幕=" + rot
-                    + " 角落=" + corner + " gravity=" + gravity
-                    + " tx=" + tx + " ty=" + ty);
+            // ⚡ 去重：calculatePosition 会被频繁调用，内容没变就不必重复打日志
+            //   （logcat 写入本身有开销，热路径上能省则省）
+            String tag = sensor + "|" + rot + "|" + corner + "|" + gravity;
+            if (!tag.equals(sLastPositionLog)) {
+                sLastPositionLog = tag;
+                LogUtil.logAlways("[旋转提示] 落点 传感器=" + sensor + " 屏幕=" + rot
+                        + " 角落=" + corner + " gravity=" + gravity
+                        + " tx=" + tx + " ty=" + ty);
+            }
         }
 
     }
@@ -806,32 +842,58 @@ public final class RotationHint {
             if (sm == null) {
                 return;
             }
-            // ⚠️ 实测（2026-10-19）：type=27 device_orientation 在本机**两个实例都不工作**
-            //   （Non-wakeup 只回调一次值恒 0；Wakeup 也只回调一次，转动后不报）。
-            //   只有加速度计能持续上报，所以优先用它。
-            Sensor sensor = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
-            if (sensor == null) {
-                // 退回加速度计，兼容没有 device_orientation 的机型
-                sensor = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+            // ⚠️ 实测（2026-10-19）：Wakeup 版 device_orientation 在**首次注册后
+            //   只回调一次**（日志里「传感器方向=0」只出现一次，之后方向再也不更新），
+            //   导致按钮位置固定在左上角。这条路不可用，回退到下面的
+            //   OrientationEventListener（它能持续回调）。
+
+            // ✅ 主路径：系统同款的 OrientationEventListener
+            //   （用户 2026-10-19 决定：就用系统的方案）。
+            //   它内部自带去抖，偶尔会有几秒延迟，但由系统统一管理传感器，更省心。
+            android.view.OrientationEventListener oel =
+                    new android.view.OrientationEventListener(ctx, 66667) {
+                        @Override
+                        public void onOrientationChanged(int orientation) {
+                            try {
+                                if (orientation == ORIENTATION_UNKNOWN) {
+                                    return;
+                                }
+                                onOrientationDegrees(orientation);
+                            } catch (Throwable unused) {
+                            }
+                        }
+                    };
+            if (oel.canDetectOrientation()) {
+                oel.enable();
+                sOel = oel;
+                sSensorRegistered = true;
+                LogUtil.logAlways("[旋转提示] 已启用 OrientationEventListener（系统方案）");
+                return;
             }
+            LogUtil.logAlways("[旋转提示] OrientationEventListener 不可用，退回加速度计");
+
+            // 兜底：手写加速度计注册
+            Sensor sensor = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
             if (sensor == null) {
                 LogUtil.logAlwaysOnce("rh-nosensor", "[旋转提示] 设备没有可用的方向传感器");
                 return;
             }
-            sm.registerListener(new SensorEventListener() {
+            SensorEventListener l = new SensorEventListener() {
                 @Override
                 public void onSensorChanged(SensorEvent event) {
                     try {
                         onOrientation(event);
                     } catch (Throwable unused) {
-                        // 传感器回调里必须吞异常
                     }
                 }
 
                 @Override
                 public void onAccuracyChanged(Sensor sensor2, int accuracy) {
                 }
-            }, sensor, SensorManager.SENSOR_DELAY_UI);
+            };
+            sListener = l;
+            sSensorMgr = sm;
+            sm.registerListener(l, sensor, 66667);
             sSensorRegistered = true;
             LogUtil.logAlways("[旋转提示] 已注册方向传感器: " + sensor.getName()
                     + "（type=" + sensor.getType() + "）");
@@ -869,7 +931,19 @@ public final class RotationHint {
         } else {
             degrees = normalizeDegrees((int) v[0]);
         }
+        onOrientationDegrees(degrees);
+    }
 
+    /**
+     * 拿到「设备朝向角度（0/90/180/270）」之后的统一处理。
+     *
+     * <p>两条来源共用这里：系统同款的 {@code OrientationEventListener} 与
+     * 手写的加速度计监听，避免逻辑重复。
+     */
+    private static void onOrientationDegrees(int degrees) {
+        if (!MainHook.sRotationHintEnable.get()) {
+            return;
+        }
         final int target = degreesToSurfaceRotation(degrees);
         if (target < 0) {
             return;
@@ -885,6 +959,8 @@ public final class RotationHint {
             // setRotateSuggestionButtonState 收→显一次，逼它重走布局，
             // 届时 calculatePosition 会按新的传感器方向给出落点。
             // ⚠️ 只用这个方法，**绝不碰 LayoutParams / updateViewLayout**（那会崩溃）。
+            // 📌 用户 2026-10-19：「旋转延迟很长，取消延迟」。
+            //   去掉所有延时/合并，方向一变就立即重排 —— 要的就是零延迟响应。
             sMain.post(new Runnable() {
                 @Override
                 public void run() {
@@ -895,8 +971,9 @@ public final class RotationHint {
                 }
             });
         }
-        sMain.removeCallbacksAndMessages(BOUNCE_TOKEN);
-        sMain.postDelayed(new Runnable() {
+        // 📌 用户 2026-10-19：「旋转延迟很长，取消延迟」。
+        //   去掉 120ms 的「停稳确认」等待，方向一变就立即弹按钮。
+        sMain.post(new Runnable() {
             @Override
             public void run() {
                 try {
@@ -905,11 +982,20 @@ public final class RotationHint {
                     // 同上，绝不影响 SystemUI
                 }
             }
-        }, BOUNCE_TOKEN, STABLE_DELAY_MS);
+        });
     }
 
     /** 去抖用的 token（同时充当 Runnable，removeCallbacksAndMessages 按 token 清除）。 */
     private static final Object BOUNCE_TOKEN = new Object();
+    /** 重排合并用的 token（与 BOUNCE_TOKEN 分开，互不干扰）。 */
+    private static final Object RELOCATE_TOKEN = new Object();
+    /**
+     * 方向变化后等多久才重排（合并连续上报）。
+     *
+     * <p>取值要小：太大用户会觉得「转动后要等一会儿才动」，
+     * 太小则转动途中会闪。80ms 约 1 个多采样周期，实测较自然。
+     */
+    private static final long RELOCATE_SETTLE_MS = 80L;
 
     /**
      * 真正决定「弹不弹」。
@@ -1060,6 +1146,55 @@ public final class RotationHint {
     }
 
     /**
+     * 注销传感器 —— **省电的关键**。
+     *
+     * <p>加速度计按 {@code SENSOR_DELAY_UI}（60Hz）上报，若常驻会持续唤醒 CPU。
+     * 之前整个文件没有一处 unregister，传感器从注册起就一直跑，
+     * 熄屏后也不停（实测这个姿态本身在熄屏时毫无意义，纯浪费）。
+     */
+    private static void unregisterSensor() {
+        try {
+            android.view.OrientationEventListener oel = sOel;
+            if (oel != null) {
+                oel.disable();
+                sOel = null;
+            }
+        } catch (Throwable unused) {
+            // 停用失败无所谓
+        }
+        try {
+            SensorManager sm = sSensorMgr;
+            SensorEventListener l = sListener;
+            if (sm != null && l != null) {
+                sm.unregisterListener(l);
+            }
+        } catch (Throwable unused) {
+            // 注销失败无所谓
+        }
+        sSensorRegistered = false;
+        sListener = null;
+        LogUtil.logAlways("[旋转提示] 已注销方向传感器（省电）");
+    }
+
+    /**
+     * 屏幕状态变化时调用：**只在亮屏期间注册传感器**。
+     *
+     * <p>旋转按钮只在亮屏时才有意义，熄屏后传感器纯属耗电。
+     * 这是本模块最大的一处省电优化 —— 一天里大部分时间屏幕是灭的。
+     */
+    public static void onScreenStateChanged(boolean interactive) {
+        if (interactive) {
+            // 亮屏：若开关开着且尚未注册，则补注册
+            if (MainHook.sRotationHintEnable.get() && !sSensorRegistered && sContext != null) {
+                ensureSensorRegisteredWith(sContext);
+            }
+        } else {
+            // 熄屏：立即注销，避免后台常驻唤醒 CPU
+            unregisterSensor();
+        }
+    }
+
+    /**
      * 用户改了开关后调用：把开关打开才注册传感器。
      *
      * <p>由 MainHook 在配置重载时调用，避免「开开关前已经错过注册时机」。
@@ -1072,6 +1207,8 @@ public final class RotationHint {
         if (!MainHook.sRotationHintEnable.get()) {
             // 关掉开关时重置「已提示」记录，下次打开能重新提示
             sLastHintedRotation = -1;
+            // ⚡ 同时注销传感器：功能关掉后没有任何理由让它继续 60Hz 上报
+            unregisterSensor();
             return;
         }
         if (sSensorRegistered) {

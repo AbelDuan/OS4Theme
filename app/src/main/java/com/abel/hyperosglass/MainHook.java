@@ -196,6 +196,33 @@ public class MainHook extends XposedModule {
                 }, new IntentFilter(Constants.ACTION_RELOAD_PREFS), 2);
                 sReloadReceiverRegistered = true;
                 LogUtil.logAlways("[重载] 已注册实时重载广播接收器");
+
+                // ⚡ 屏幕开关联动：熄屏时注销方向传感器（省电）。
+                //   旋转按钮只在亮屏时有意义，而加速度计按 60Hz 上报会持续
+                //   唤醒 CPU —— 一天里大半时间屏幕是灭的，这处优化收益最大。
+                try {
+                    ((Context) objCurrentApplication).registerReceiver(
+                            new BroadcastReceiver() {
+                                @Override
+                                public void onReceive(Context context, Intent intent) {
+                                    try {
+                                        String a = intent.getAction();
+                                        if (Intent.ACTION_SCREEN_ON.equals(a)) {
+                                            RotationHint.onScreenStateChanged(true);
+                                        } else if (Intent.ACTION_SCREEN_OFF.equals(a)) {
+                                            RotationHint.onScreenStateChanged(false);
+                                        }
+                                    } catch (Throwable unused) {
+                                    }
+                                }
+                            },
+                            new IntentFilter(Intent.ACTION_SCREEN_ON) {{
+                                addAction(Intent.ACTION_SCREEN_OFF);
+                            }});
+                    LogUtil.logAlways("[旋转提示] 已注册屏幕开关监听（熄屏注销传感器）");
+                } catch (Throwable t2) {
+                    LogUtil.logAlways("[旋转提示] 屏幕监听注册失败: " + t2);
+                }
             }
         } catch (Throwable th) {
             LogUtil.logAlways("[重载] 注册失败: " + th);

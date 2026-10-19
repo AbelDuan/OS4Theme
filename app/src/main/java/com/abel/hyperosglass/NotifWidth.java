@@ -70,6 +70,12 @@ public final class NotifWidth {
                 + "，ratio=" + MainHook.sNotifWidthRatio.get() + "%");
         hookOne(module, "getDimensionPixelSize");
         hookOne(module, "getDimensionPixelOffset");
+        // ⚠️ 必须同时挂 getDimension（返回 float 的那个）。
+        //   它是上面两个方法的底层实现，而系统在**不同时机走不同路径**：
+        //   锁屏首次构建时可能直接调 getDimension → 未被 hook → 拿到系统默认宽度；
+        //   解锁后重建才走 getDimensionPixelSize → 命中我们的值。
+        //   这就是用户反馈「锁屏通知宽度时好时坏」的根因。
+        hookOneFloat(module, "getDimension");
         installHunSizeProbe(module, classLoader);
         LogUtil.logAlways("[通知宽度] 安装完成（钩子已挂，开关状态运行期判定）");
     }
@@ -167,6 +173,50 @@ public final class NotifWidth {
                             } catch (Throwable unused) {
                                 // 任何意外都回退原值：这里挂的是 Resources 的公共方法，
                                 // 一旦抛异常会波及整个 SystemUI 的资源读取。
+                                return original;
+                            }
+                        }
+                    });
+            LogUtil.logAlways("[通知宽度] 已挂钩 android.content.res.Resources." + methodName);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[通知宽度] 挂钩 " + methodName + " 失败: " + th);
+        }
+    }
+
+    /**
+     * 与 {@link #hookOne} 相同，但用于返回 {@code float} 的 {@code Resources.getDimension}。
+     *
+     * <p>为什么要单独一份：{@code getDimension} 返回 float，
+     * 若沿用 int 版会让 {@code adjust} 拿不到值。这里把 float 原值转成
+     * int 走同一套计算，再转回 float 返回，保证两条路径结果一致。
+     */
+    private static void hookOneFloat(final io.github.libxposed.api.XposedModule module, String methodName) {
+        try {
+            Method method = Resources.class.getDeclaredMethod(methodName, Integer.TYPE);
+            method.setAccessible(true);
+            module.hook(method)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("notif-width-" + methodName)
+                    .intercept(new XposedInterface.Hooker() {
+                        @Override
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            Object original = chain.proceed();
+                            if (!MainHook.sNotifWidthEnable.get()) {
+                                return original;
+                            }
+                            try {
+                                if (!(original instanceof Number)) {
+                                    return original;
+                                }
+                                float origF = ((Number) original).floatValue();
+                                Object self = chain.getThisObject();
+                                if (!(self instanceof Resources)) {
+                                    return original;
+                                }
+                                int adjusted = adjust((Resources) self, chain.getArg(0),
+                                        Math.round(origF));
+                                return (float) adjusted;
+                            } catch (Throwable unused) {
                                 return original;
                             }
                         }
@@ -278,13 +328,19 @@ public final class NotifWidth {
 
     /** 目标资源白名单。 */
     private static boolean isTargetName(String name) {
+        // ⚠️ 必须用**前缀匹配**，不能精确匹配！
+        //   实测系统对折叠屏内外屏 / 横竖屏 / 锁屏会用**带后缀的资源名**，
+        //   例如：notification_panel_width_outer_port（外屏竖屏）。
+        //   白名单里只有 notification_panel_width，精确匹配就漏掉了它 ——
+        //   这正是「悬浮通知和锁屏通知宽度时好时坏、有时变回默认」的根因：
+        //   内屏走基础名（命中），外屏/锁屏走后缀名（未命中）。
         for (String s : Constants.NOTIF_WIDTH_RES_NAMES) {
-            if (s.equals(name)) {
+            if (name.equals(s) || name.startsWith(s + "_")) {
                 return true;
             }
         }
         for (String s : Constants.HUN_WIDTH_RES_NAMES) {
-            if (s.equals(name)) {
+            if (name.equals(s) || name.startsWith(s + "_")) {
                 return true;
             }
         }
