@@ -593,7 +593,6 @@ public final class RotationHint {
                     try {
                         setM.invoke(sController, Boolean.TRUE, Boolean.FALSE);
                         LogUtil.logAlways("[旋转提示] 已按方向重排（收→显）");
-                        syncMirrorButton();
                     } catch (Throwable unused) {
                         // 失败就保持收起状态，下一次方向变化会再试
                     }
