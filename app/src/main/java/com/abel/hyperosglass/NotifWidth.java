@@ -328,8 +328,12 @@ public final class NotifWidth {
      *   <li>固定 dp 在不同屏/DPI 下不精确（实测 60dp=129px，比状态栏 140px 少）。</li>
      * </ol>
      * 现在改成：读系统真实的 {@code status_bar_height}，把让位量**补齐到该值**。
-     * 这样每个方向、每种屏、每种 DPI 都自动精确，且都等于状态栏高度 ——
-     * 视觉上与「系统默认间距」语义一致（卡片顶边正好贴状态栏下沿）。
+     * 但**只在横屏时补** —— 这是用户 2026-10-19 实测反馈后的关键修正：
+     * <pre>
+     *   竖屏 1168x1712：系统原本就让位得当，强行补到 140px 反而把卡片推得太远 ❌
+     *   横屏 1712x1168：系统只让位 16px，必须补，否则盖住状态栏 ✅
+     * </pre>
+     * 所以竖屏一律原样返回系统值，只有横屏才补差额。
      *
      * <p>只补差额（{@code barHeight - original}），不直接覆盖成 barHeight，
      * 是为了不丢掉系统原本那部分让位语义。
@@ -356,6 +360,12 @@ public final class NotifWidth {
             density = 2.0f;
         }
 
+        // ⚠️ 只在横屏补。竖屏系统的让位本来就合适（实测 211px，卡片位置正常），
+        //    强行补到 140px 会反而把卡片推得太远 —— 用户明确反馈过这一点。
+        if (w <= h) {
+            return original;
+        }
+
         // 读真实状态栏高度（系统资源，随横竖屏/DPI 自动变化）
         int barHeight = 0;
         try {
@@ -377,7 +387,7 @@ public final class NotifWidth {
             return original;
         }
         LogUtil.logAlwaysOnce("hun-pad-" + barHeight + "-" + w + "x" + h,
-                "[悬浮通知] 顶部让位 状态栏高=" + barHeight + " 原=" + original
+                "[悬浮通知] 横屏顶部让位 状态栏高=" + barHeight + " 原=" + original
                         + " 追加=" + extra + " 共=" + (original + extra)
                         + "（屏 " + w + "x" + h + "）");
         return original + extra;

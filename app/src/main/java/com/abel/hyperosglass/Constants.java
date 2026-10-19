@@ -227,19 +227,26 @@ public final class Constants {
      * 从源头改这个资源才是正解 —— 它和 {@code notification_panel_width} 等值，
      * 因此和通知卡片天然保持同一宽度。
      *
-     * <h2>⚠️ 为什么不包含 lockscreen / outer_port 那两个</h2>
-     * 这两个名字虽然存在（在 resources.arsc 里），但经实测**不能动**：
-     * <ul>
-     *   <li>{@code notification_panel_width_lockscreen} —— 一旦被改，
-     *       **锁屏状态栏的宽度会跟着变成通知栏的宽度**，与非锁屏状态不一致。
-     *       用户 2026-10-19 明确反馈这是 bug：锁屏状态栏应保持原样。</li>
-     *   <li>{@code notification_panel_width_outer_port} —— 它对应外屏的
-     *       {@code 857}（不是 977），语义与主面板不同，一起改会连带外屏异常。</li>
-     * </ul>
-     * 因此白名单只保留真正需要跟随的入口，其余一律放行原值。
+     * <h2>{@code notification_panel_width_lockscreen}</h2>
+     * 它控制的是**锁屏的通知列表**宽度，不是状态栏。
+     *
+     * <p>中间曾经把它移出白名单：当时锁屏状态栏内容被挤到中间，
+     * 误以为它是元凶。实际元凶是早期 {@code NotifTopAlign} 改了
+     * {@code mKeyguardLeftSide / mKeyguardRightSide} 的 margin —— 那个类已整个删除。
+     * 删掉之后锁屏状态栏恢复正常（实测 {@code 左块 80,0-210,140}、
+     * {@code 右块 210,0-2198,140}、状态栏满宽 2364），
+     * 而这个资源如果不放开，锁屏通知就会停在 977、与下拉的 1560 差 583px
+     * （用户 2026-10-19 反馈「锁屏 vs 下拉不一致」）。
+     *
+     * <p>所以现在**放回来**，让锁屏通知也跟随同一比例。
+     *
+     * <h2>⚠️ 仍然不含 {@code notification_panel_width_outer_port}</h2>
+     * 它对应外屏的 {@code 857}（不是 977），语义与主面板不同，
+     * 一起改会连带外屏异常，因此保持原值。
      */
     public static final String[] NOTIF_WIDTH_RES_NAMES = {
             "notification_panel_width",
+            "notification_panel_width_lockscreen",
             "qs_panel_width"
     };
     /** 悬浮通知（HUN）的宽度资源名 */

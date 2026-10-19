@@ -94,7 +94,8 @@ public class MainHook extends XposedModule {
     public static final AtomicBoolean sRotationHintEnable = new AtomicBoolean(false);
     /**
      * 当前通知卡片实际宽度（px），由 {@link NotifWidth} 每次算出新值时写入，
-     * 供 {@link NotifTopAlign} 把顶部区域对齐到卡片边缘。0 表示还没算过。
+     * 仅作调试参考（记录当前卡片宽度）。顶部时间卡片跟随卡片宽度是
+     * 直接通过资源 {@code qs_panel_width} 实现的（见 NotifWidth），不依赖这个值。
      */
     public static final java.util.concurrent.atomic.AtomicInteger sNotifWidthCardPx =
             new java.util.concurrent.atomic.AtomicInteger(0);
@@ -253,12 +254,13 @@ public class MainHook extends XposedModule {
         } catch (Throwable th) {
             LogUtil.logAlways("[通知宽度] 挂载失败: " + th);
         }
-        // 顶部（时钟/日期/运营商）跟随卡片宽度：卡片变宽后顶部那行要一起撑开
-        try {
-            NotifTopAlign.install(this, classLoader);
-        } catch (Throwable th) {
-            LogUtil.logAlways("[顶部对齐] 挂载失败: " + th);
-        }
+        // ⚠️ 这里**不再**挂 NotifTopAlign。
+        // 早期版本为了「让锁屏状态栏左右块对齐卡片」去改 MiuiKeyguardStatusBarView
+        // 里 mKeyguardLeftSide / mKeyguardRightSide 的 margin，结果把**锁屏状态栏
+        // 自己的内容挤到了中间**（用户 2026-10-19 反馈「内容变窄了」）。
+        // 顶部时间卡片跟随卡片宽度是靠资源 qs_panel_width 实现的（见 NotifWidth），
+        // 完全不需要动锁屏状态栏 —— 所以那个类整个删掉了。
+
         // 锁定方向时的旋转提示：复用系统原生的 FloatingRotationButton
         try {
             RotationHint.install(this, classLoader);

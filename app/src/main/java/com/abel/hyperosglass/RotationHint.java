@@ -118,6 +118,11 @@ public final class RotationHint {
             hooked += hookNavBarMethod(module, cls, "onConfigurationChanged");
             LogUtil.logAlways("[旋转提示] 已挂钩 " + NAV_BAR_CLASS + " 的 " + hooked + " 个生命周期方法");
 
+            // 第二个旋转按钮：系统自带的那个只出现在一个下角，
+            // 用户要求「传感器方向对应的屏幕左右下角都显示」，
+            // 所以额外挂 FloatingRotationButton 的布局方法，镜像再加一个。
+            installMirrorButtonHook(module, cl);
+
             // ⚠️ 还差最后一块：上面三个回调都要等「导航栏下次动」才触发，
             //    而 SystemUI 启动后导航栏可能长时间不重建 —— 那样传感器永远注册不上。
             //    所以这里**主动去现有视图树里捞一次**（延迟几秒，等 SystemUI 建完视图）。
@@ -133,6 +138,276 @@ public final class RotationHint {
             }, 4000L);
         } catch (Throwable th) {
             LogUtil.logAlways("[旋转提示] 挂钩失败: " + th);
+        }
+    }
+
+    /**
+     * 让旋转按钮**同时出现在两个下角**。
+     *
+     * <h2>为什么要这么做</h2>
+     * 系统自带的 {@code FloatingRotationButton} 只算**一个**位置
+     * （见 {@code FloatingRotationButtonPositionCalculator.calculatePosition}：
+     * {@code floatingRotationButtonPositionLeft} 是布尔开关，只会二选一）。
+     * 单手握着时那个位置常常够不到 —— 用户 2026-10-19 要求两个下角都给一个。
+     *
+     * <h2>做法</h2>
+     * 不改系统那个按钮，而是**额外用 WindowManager 再放一个同类按钮**：
+     * <ul>
+     *   <li>hook {@code adjustViewPositionAndCreateLayoutParams()}，在系统算完之后拿到它的
+     *       {@code LayoutParams} 和 {@code Position}；</li>
+     *   <li>用相同的 gravity（BOTTOM|LEFT / BOTTOM|RIGHT）与尺寸，但把左右镜像过去，
+     *       经 {@code addView} 挂到 WindowManager；</li>
+     *   <li>点一下同样是「旋转屏幕」，并且两个一起消失。</li>
+     * </ul>
+     *
+     * <p>整体 try/catch：加不上就只保留系统那一个，不影响旋转功能本身。
+     */
+    private static void installMirrorButtonHook(final io.github.libxposed.api.XposedModule module,
+                                                ClassLoader cl) {
+        try {
+            Class<?> cls = Class.forName(
+                    "com.android.systemui.shared.rotation.FloatingRotationButton", false, cl);
+            Method m = null;
+            for (Method cand : cls.getDeclaredMethods()) {
+                if ("adjustViewPositionAndCreateLayoutParams".equals(cand.getName())
+                        && cand.getParameterTypes().length == 0) {
+                    m = cand;
+                    break;
+                }
+            }
+            if (m == null) {
+                LogUtil.logAlways("[旋转提示] 未找到 adjustViewPositionAndCreateLayoutParams，跳过镜像按钮");
+                return;
+            }
+            m.setAccessible(true);
+            module.hook(m)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("rotation-hint-mirror")
+                    .intercept(new XposedInterface.Hooker() {
+                        @Override
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            Object r = chain.proceed();
+                            try {
+                                syncMirrorButton(chain.getThisObject(), r);
+                            } catch (Throwable unused) {
+                                // 镜像按钮失败不影响系统那个
+                            }
+                            return r;
+                        }
+                    });
+            LogUtil.logAlways("[旋转提示] 已挂钩 FloatingRotationButton.adjustViewPositionAndCreateLayoutParams");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[旋转提示] 镜像按钮挂钩失败: " + th);
+        }
+    }
+
+    /** 镜像按钮的 WindowManager 与视图（全局只有一个）。 */
+    private static volatile android.view.WindowManager sMirrorWm;
+    private static volatile android.view.View sMirrorView;
+    private static volatile android.view.WindowManager.LayoutParams sMirrorLp;
+
+    /**
+     * 依据系统按钮的布局参数，挂一个**左右镜像**的第二按钮。
+     *
+     * <p>系统每次调整位置都会走这里，所以这里也同步刷新镜像按钮的位置，
+     * 保证两个按钮始终在同一水平线、分居左右下角。
+     */
+    private static void syncMirrorButton(Object button, Object lpObj) {
+        if (!MainHook.sRotationHintEnable.get()) {
+            return;
+        }
+        if (!(lpObj instanceof android.view.WindowManager.LayoutParams)) {
+            return;
+        }
+        android.view.WindowManager.LayoutParams srcLp =
+                (android.view.WindowManager.LayoutParams) lpObj;
+        if (!(button instanceof android.view.View)) {
+            return;
+        }
+        android.view.View src = (android.view.View) button;
+
+        // 系统按钮当前是否在显示：只有显示时才需要镜像
+        Boolean showing = readBoolField(button, "mIsShowing");
+        if (showing == null || !showing.booleanValue()) {
+            removeMirror();
+            return;
+        }
+
+        try {
+            android.content.Context ctx = src.getContext();
+            if (ctx == null) {
+                return;
+            }
+            if (sMirrorView == null) {
+                // 直接用系统的那个按钮视图『借』一份外观：新建一个同样的 View 类实例，
+                // 图标资源也从它身上反射取，保证样式完全一致。
+                android.view.View mirror = createMirrorView(src);
+                if (mirror == null) {
+                    return;
+                }
+                sMirrorView = mirror;
+            }
+            android.view.WindowManager wm =
+                    (android.view.WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
+            if (wm == null) {
+                return;
+            }
+            sMirrorWm = wm;
+
+            android.view.WindowManager.LayoutParams lp = new android.view.WindowManager.LayoutParams(
+                    srcLp.width, srcLp.height, srcLp.type, srcLp.flags, srcLp.format);
+            lp.gravity = mirrorGravity(srcLp.gravity);
+            // 位置量取绝对值：系统对 LEFT/BOTTOM 会用负值表示内缩，
+            // 镜像到另一侧后方向要反过来。
+            lp.x = -srcLp.x;
+            lp.y = srcLp.y;
+            lp.setTitle("FloatingRotationButtonMirror");
+            try {
+                lp.setFitInsetsTypes(0);
+            } catch (Throwable ignored) {
+            }
+            sMirrorLp = lp;
+
+            try {
+                if (sMirrorView.getParent() != null) {
+                    wm.removeViewImmediate(sMirrorView);
+                }
+            } catch (Throwable ignored) {
+            }
+            wm.addView(sMirrorView, lp);
+            LogUtil.logAlwaysOnce("rh-mirror-add",
+                    "[旋转提示] 已添加镜像旋转按钮 gravity=" + lp.gravity);
+        } catch (Throwable th) {
+            LogUtil.logAlwaysOnce("rh-mirror-fail", "[旋转提示] 添加镜像按钮失败: " + th);
+        }
+    }
+
+    /**
+     * 由系统按钮复制出一个同样外观的 View。
+     *
+     * <p>用 {@code new FloatingRotationButtonView(context)} 构造，再加一个简单箭头图标 ——
+     * 系统那个类的图标资源是私有的，直接反射设置容易踩版本差异；
+     * 这里用 {@code android.R.drawable.ic_menu_rotate} 兜底，保证一定有可见图形。
+     */
+    private static android.view.View createMirrorView(final android.view.View src) {
+        try {
+            Context ctx = src.getContext();
+            if (ctx == null) {
+                return null;
+            }
+            // 复用系统按钮类，保证点击行为一致
+            android.view.View v = (android.view.View) src.getClass()
+                    .getConstructor(Context.class)
+                    .newInstance(ctx);
+            // 背景/图标：优先从系统按钮上取同一个 drawable
+            try {
+                android.graphics.drawable.Drawable bg = src.getBackground();
+                if (bg != null) {
+                    v.setBackground(bg.getConstantState() != null
+                            ? bg.getConstantState().newDrawable() : bg);
+                }
+            } catch (Throwable ignored) {
+            }
+            try {
+                if (v instanceof android.widget.ImageView) {
+                    android.graphics.drawable.Drawable icon = null;
+                    if (src instanceof android.widget.ImageView) {
+                        android.graphics.drawable.Drawable srcIcon =
+                                ((android.widget.ImageView) src).getDrawable();
+                        if (srcIcon != null && srcIcon.getConstantState() != null) {
+                            icon = srcIcon.getConstantState().newDrawable();
+                        }
+                    }
+                    if (icon == null) {
+                        icon = ctx.getDrawable(android.R.drawable.ic_menu_rotate);
+                    }
+                    ((android.widget.ImageView) v).setImageDrawable(icon);
+                }
+            } catch (Throwable ignored) {
+            }
+            // 点击 = 旋转屏幕（与系统按钮一致）
+            v.setOnClickListener(new android.view.View.OnClickListener() {
+                @Override
+                public void onClick(android.view.View view) {
+                    try {
+                        rotationPolicyToggle();
+                    } catch (Throwable unused) {
+                        // 点不动就只当装饰，不崩
+                    }
+                }
+            });
+            return v;
+        } catch (Throwable th) {
+            LogUtil.logAlwaysOnce("rh-mirror-create-fail", "[旋转提示] 创建镜像按钮失败: " + th);
+            return null;
+        }
+    }
+
+    /** 点镜像按钮时：按系统当前方向的反方向旋转一次。 */
+    private static void rotationPolicyToggle() {
+        Context ctx = sContext;
+        if (ctx == null) {
+            return;
+        }
+        android.view.WindowManager wm =
+                (android.view.WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
+        if (wm == null) {
+            return;
+        }
+        android.view.Display d = wm.getDefaultDisplay();
+        if (d == null) {
+            return;
+        }
+        int cur = d.getRotation();
+        int next = (cur + 1) % 4;
+        // 通过 Settings 走系统旋转策略：临时锁定到目标方向，用户再点一次自动旋转回来
+        try {
+            Settings.System.putInt(ctx.getContentResolver(),
+                    Settings.System.ACCELEROMETER_ROTATION, 0);
+            Settings.System.putInt(ctx.getContentResolver(),
+                    Settings.System.USER_ROTATION, next);
+            // 旋转完成后把建议按钮收起来
+            removeMirror();
+        } catch (Throwable unused) {
+            // 改不了设置就不处理
+        }
+    }
+
+    /** 把 gravity 左右镜像（BOTTOM|LEFT ↔ BOTTOM|RIGHT，TOP|LEFT ↔ TOP|RIGHT）。 */
+    private static int mirrorGravity(int gravity) {
+        boolean left = (gravity & android.view.Gravity.LEFT) == android.view.Gravity.LEFT;
+        boolean right = (gravity & android.view.Gravity.RIGHT) == android.view.Gravity.RIGHT;
+        int g = gravity & ~(android.view.Gravity.LEFT | android.view.Gravity.RIGHT);
+        if (left) {
+            g |= android.view.Gravity.RIGHT;
+        } else if (right) {
+            g |= android.view.Gravity.LEFT;
+        }
+        return g;
+    }
+
+    /** 读一个 boolean 私有字段。 */
+    private static Boolean readBoolField(Object obj, String name) {
+        try {
+            Field f = obj.getClass().getDeclaredField(name);
+            f.setAccessible(true);
+            Object v = f.get(obj);
+            return v instanceof Boolean ? (Boolean) v : null;
+        } catch (Throwable unused) {
+            return null;
+        }
+    }
+
+    /** 从窗口移除镜像按钮。 */
+    private static void removeMirror() {
+        try {
+            android.view.View v = sMirrorView;
+            android.view.WindowManager wm = sMirrorWm;
+            if (v != null && wm != null && v.getParent() != null) {
+                wm.removeViewImmediate(v);
+            }
+        } catch (Throwable unused) {
+            // 已经移除了就忽略
         }
     }
 
