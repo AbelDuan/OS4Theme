@@ -114,3 +114,56 @@ hook NavigationBarView 的三个生命周期（onFinishInflate / onAttachedToWin
 | 不能只挂 `onFinishInflate` | 导航栏在 SystemUI 启动早期就建好，模块注入时那次调用已过去 → 必须多挂 |
 | 去抖 | 传感器 350ms 防抖，只按停稳后的方向判断 |
 | 方向换算 | 设备角度 0/90/180/270 → Surface.ROTATION_0/270/180/90（注意是反的） |
+| **不要自己判断显示时机** | 交给系统，我们只改落点 |
+
+### 弯路：换位置试了三版才走对
+
+| 版本 | 做法 | 结果 |
+|---|---|---|
+| v3.46.x | hook `adjustViewPositionAndCreateLayoutParams()` 再镜像加一个 | ❌ 系统弹按钮时**根本不经过该方法**（日志证实：有「已弹出」无镜像日志） |
+| v3.47.x | 完全自建 ImageView 按钮（两个下角各一个） | ❌ 常驻不收、点完不消失、**没有方向预示图标** |
+| **v3.48.0** | **hook `calculatePosition` 只改落点** | ✅ |
+
+**v3.47 为什么错**：用户一句话点破 ——
+
+> 自带的图标里面的内容会**根据实际的传感器方向旋转，去预示点完之后会到什么方向**。
+
+系统用 4 套 `AnimatedVectorDrawable`
+（`ic_sysbar_rotate_button_{cw,ccw}_start_{0,90}`，资源表已确认存在）
+把「将要转到哪」画在图形上。这是**交互语义**，不是装饰，复刻不了也不该复刻。
+
+### 最终实现（v3.48.0）
+
+位置流程（REA 反编译确认）：
+
+```
+calculatePosition(rotation, taskbarVisible, taskbarStashed) → Position
+    → updateTranslation(pos, animate)
+        → mKeyButtonView.setTranslationX/Y(pos.translationX/Y)
+```
+
+`Position` 只有三个字段：`gravity` / `translationX` / `translationY`。
+所以在一处 hook 即可：
+
+```java
+Position calculatePosition(int rotation, boolean taskbarVisible, boolean taskbarStashed) {
+    Position p = chain.proceed();          // 系统算好的，语义都在里面
+    p.gravity      = BOTTOM | RIGHT;       // 只改这三行
+    p.translationX = -margin;
+    p.translationY = -margin;
+    return p;
+}
+```
+
+**系统原生完整保留**：
+
+| 能力 | 由谁提供 |
+|---|---|
+| 图标随传感器方向旋转、预示目标方向 | 系统 `updateIcon()` |
+| 箭头旋转动效 | 系统的 `AnimatedVectorDrawable` |
+| 何时显示（方向不一致时） | 系统 `setRotateSuggestionButtonState()` |
+| 何时消失（方向一致 / 超时） | 系统自己 |
+| 点击旋转 | 系统 `RotationPolicyWrapper` |
+
+**为什么这样就「跟随屏幕方向」**：`gravity` 是相对**当前屏幕坐标系**的，
+屏幕怎么转，`BOTTOM|RIGHT` 始终是用户视觉上的右下角。
