@@ -13,6 +13,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.text.method.ScrollingMovementMethod;
 import android.util.Log;
+import android.util.DisplayMetrics;
 import android.util.TypedValue;
 import android.view.Menu;
 import android.view.MenuItem;
@@ -23,6 +24,7 @@ import android.widget.FrameLayout;
 import android.widget.ImageButton;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.SeekBar;
 import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -56,6 +58,13 @@ public class SettingsActivity extends Activity {
     @Override // android.app.Activity
     protected void onCreate(Bundle bundle) {
         super.onCreate(bundle);
+        // ★ v3.41.2 修复「第一次打开闪退」：必须**第一时间**告诉 StatusProvider
+        //   「Activity 已经起来了」，否则它在冷启动 5 秒后会把整个进程杀掉。
+        //   放在 super.onCreate 之后、其余初始化之前 —— 这里是进程已经安全的第一个时机。
+        try {
+            StatusProvider.noteActivityStarted();
+        } catch (Throwable unused) {
+        }
         try {
             getWindow().setNavigationBarColor(Color.parseColor("#F5F6F8"));
             getWindow().getDecorView().setSystemUiVisibility(getWindow().getDecorView().getSystemUiVisibility() | 16);
@@ -244,6 +253,33 @@ public class SettingsActivity extends Activity {
         }
     }
 
+    /**
+     * 写一个 int 配置到 DE + CE 两处存储（v3.41.2，通知宽度比例用）。
+     *
+     * <p>为什么需要单独一个方法：既有 {@link #writeBoth} 只处理 boolean，
+     * 而宽度比例是连续值。DE/CE 双写是既有的同步纪律（见 README「设置同步」一节），
+     * 这里照做，保证 SystemUI 侧无论走哪条通路都能读到。
+     */
+    public void writeBothInt(String str, int i) {
+        try {
+            sp().edit().putInt(str, i).commit();
+            ceSp().edit().putInt(str, i).commit();
+        } catch (Throwable unused) {
+        }
+    }
+
+    /** 读 int 配置（DE 优先，缺失则回落到 CE，再缺用默认值）。 */
+    private int readIntPref(String str, int def) {
+        try {
+            if (sp().contains(str)) {
+                return sp().getInt(str, def);
+            }
+            return ceSp().getInt(str, def);
+        } catch (Throwable unused) {
+            return def;
+        }
+    }
+
     private void buildUi() {
         ScrollView scrollView = new ScrollView(this);
         scrollView.setBackgroundColor(Color.parseColor("#F5F6F8"));
@@ -294,9 +330,37 @@ public class SettingsActivity extends Activity {
         addSectionTitle(linearLayoutNewCardNotif, "通知优先级 / 重要性", "放开系统设置里被隐藏的重要性选项，并让改动生效");
         addSwitch(linearLayoutNewCardNotif, "重要性可调（含低重要性过滤）", Constants.PREFS_NOTIF_IMPORTANCE, true);
         linearLayout.addView(linearLayoutNewCardNotif, cardLp());
+
+        // ── 通知宽度（v3.41.2）──
+        // 背景：通知面板宽度写死 452dp（与屏宽无关）。DPI 调低后内屏横屏只占 41%，
+        // 两侧大片空白。这里改成按屏宽比例算，自动适配 内屏/外屏 × 横屏/竖屏。
+        LinearLayout linearLayoutNewCardWidth = newCard();
+        addSectionTitle(linearLayoutNewCardWidth, "通知宽度",
+                "系统把通知面板宽度写死为 452dp，与屏幕宽度无关；\n"
+                        + "调低 DPI 后内屏横屏只占 41%，两侧大片空白。\n"
+                        + "开启后按屏宽比例计算，四种屏幕场景自动适配。\n"
+                        + "横屏与竖屏的比例**各自独立**，互不影响。");
+        addSwitch(linearLayoutNewCardWidth, "调整通知面板 / 悬浮通知宽度",
+                Constants.PREFS_NOTIF_WIDTH_ENABLE, Constants.DEFAULT_NOTIF_WIDTH_ENABLE);
+        addNotifWidthSlider(linearLayoutNewCardWidth, false);
+        addNotifWidthSlider(linearLayoutNewCardWidth, true);
+        linearLayout.addView(linearLayoutNewCardWidth, cardLp());
+
+        LinearLayout linearLayoutRotationHint = newCard();
+        addSectionTitle(linearLayoutRotationHint, "旋转提示",
+                "锁定屏幕方向时，如果手机被转动到了与当前画面不一致的方向，\n"
+                        + "弹出系统原生的手动旋转按钮（安卓自带的那一个）。\n"
+                        + "仅在「自动旋转」关闭时生效 —— 开着时系统会自己转。");
+        addSwitch(linearLayoutRotationHint, "方向不一致时提示旋转",
+                Constants.PREFS_ROTATION_HINT, Constants.DEFAULT_ROTATION_HINT);
+        linearLayout.addView(linearLayoutRotationHint, cardLp());
+
+        LinearLayout linearLayoutNewCard7 = newCard();
+        addSectionTitle(linearLayoutNewCard7, "应用工具", "日志记录：开启后需重启系统界面才开始记录");
+        addSwitch(linearLayoutNewCard7, "日志记录", Constants.PREFS_ENABLE_LOG, false);
+        linearLayout.addView(linearLayoutNewCard7, cardLp());
+
         LinearLayout linearLayoutNewCard6 = newCard();
-        addSectionTitle(linearLayoutNewCard6, "应用工具", "日志记录：开启后需重启系统界面才开始记录");
-        addSwitch(linearLayoutNewCard6, "日志记录", Constants.PREFS_ENABLE_LOG, false);
         LinearLayout linearLayout2 = new LinearLayout(this);
         linearLayout2.setOrientation(0);
         Button buttonMakeButton = makeButton("清空日志");
@@ -339,8 +403,107 @@ public class SettingsActivity extends Activity {
         return layoutParamsMw;
     }
 
-    private void addSectionTitle(LinearLayout linearLayout, String str, String str2) {
-        TextView textView = new TextView(this);
+    /**
+     * 通知宽度比例滑杆（v3.41.2）。
+     *
+     * <p>用 SeekBar 的整数进度承载百分比（progress = 百分比 − 38，范围 38~98）。
+     * 标签实时显示「本屏会变成多少 px、占屏宽多少」—— 光看百分比用户不知道效果。
+     *
+     * <p>下限取 38% 而不是更早的 70%：实测内屏横屏下 88% 仍然偏宽（两侧各留 142px
+     * 显得空旷），66% 才是舒服的值。留到 38% 是为了让用户在超宽屏/竖屏下也能调到
+     * 接近手机比例；再低会触发 452dp 下限，滑到底也没有更窄的效果。
+     */
+    private void addNotifWidthSlider(LinearLayout linearLayout) {
+        addNotifWidthSlider(linearLayout, false);
+    }
+
+    /**
+     * 加一个宽度比例滑杆。
+     *
+     * @param landscape false = 竖屏比例（{@link Constants#PREFS_NOTIF_WIDTH_RATIO}）；
+     *                  true  = 横屏比例（{@link Constants#PREFS_NOTIF_WIDTH_RATIO_LAND}）
+     */
+    private void addNotifWidthSlider(LinearLayout linearLayout, final boolean landscape) {
+        final int minPct = Constants.MIN_NOTIF_WIDTH_RATIO;
+        final int maxPct = Constants.MAX_NOTIF_WIDTH_RATIO;
+        final String prefKey = landscape
+                ? Constants.PREFS_NOTIF_WIDTH_RATIO_LAND
+                : Constants.PREFS_NOTIF_WIDTH_RATIO;
+        final int defVal = landscape
+                ? Constants.DEFAULT_NOTIF_WIDTH_RATIO_LAND
+                : Constants.DEFAULT_NOTIF_WIDTH_RATIO;
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(1);
+        row.setPadding(0, dp(6), 0, dp(6));
+
+        final TextView label = new TextView(this);
+        label.setTextSize(2, 13.0f);
+        label.setTextColor(Color.parseColor("#222222"));
+        label.setText(notifWidthLabel(landscape, readIntPref(prefKey, defVal)));
+
+        final SeekBar seekBar = new SeekBar(this);
+        seekBar.setMax(maxPct - minPct);
+        seekBar.setProgress(readIntPref(prefKey, defVal) - minPct);
+        seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar2, int i, boolean z) {
+                int pct = i + minPct;
+                label.setText(notifWidthLabel(landscape, pct));
+                if (z) {
+                    // 只在用户拖动时写盘，程序设初值不写（否则一进设置页就改配置）
+                    writeBothInt(prefKey, pct);
+                    sendReloadBroadcast();
+                }
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar2) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar2) {
+            }
+        });
+
+        row.addView(label, mw());
+        row.addView(seekBar, mw());
+        linearLayout.addView(row, mw());
+    }
+
+    /**
+     * 把比例换算成「实际宽度」的直观提示。
+     *
+     * <p>竖屏滑杆按**当前屏**算；横屏滑杆若当前就是横屏则按当前屏算，
+     * 否则按「把当前屏长边当宽」估算 —— 用户调横屏比例时多半正拿着竖屏，
+     * 这样至少能给出量级正确的参考值。
+     */
+    private String notifWidthLabel(boolean landscape, int pct) {
+        try {
+            DisplayMetrics displayMetrics = getResources().getDisplayMetrics();
+            int w = displayMetrics.widthPixels;
+            int h = displayMetrics.heightPixels;
+            int screenW = landscape ? Math.max(w, h) : Math.min(w, h);
+            float density = displayMetrics.density;
+            int minPx = (int) (Constants.NOTIF_WIDTH_MIN_DP * density);
+            int marginPx = (int) (Constants.NOTIF_WIDTH_MARGIN_DP * density);
+            int byRatio = (int) (screenW * (pct / 100.0f));
+            int maxPx = screenW - marginPx * 2;
+            int finalPx = Math.max(Math.min(byRatio, maxPx), minPx);
+            int shown = screenW > 0 ? (finalPx * 100 / screenW) : 0;
+            return (landscape ? "横屏" : "竖屏") + "屏宽占比 " + pct + "%  →  参考 "
+                    + finalPx + "px（占 " + shown + "%，参考屏宽 " + screenW + "px）";
+        } catch (Throwable unused) {
+            return (landscape ? "横屏" : "竖屏") + "屏宽占比 " + pct + "%";
+        }
+    }
+
+    /** 兼容旧调用：默认按竖屏算标签。 */
+    private String notifWidthLabel(int pct) {
+        return notifWidthLabel(false, pct);
+    }
+
+    private void addSectionTitle(LinearLayout linearLayout, String str, String str2) {        TextView textView = new TextView(this);
         textView.setText(str);
         textView.setTextSize(2, 13.0f);
         textView.setTypeface(Typeface.DEFAULT_BOLD);

@@ -120,7 +120,212 @@ public final class Constants {
     // MiBlurCompat / MiuiDefaultThemeControllerImpl）在插件 APK 里各有一份、跑在这个进程，
     // 只在 SystemUI 进程里强制"默认主题"会造成两侧状态不一致（磁贴变方），必须一并注入。
     public static final String TARGET_PLUGIN_PKG = "miui.systemui.plugin";
-    public static final String VERSION = "3.41.1";
+    public static final String VERSION = "3.41.2";
+
+    // ============================================================
+    // 通知宽度调节（v3.41.2 新增）
+    //
+    //【问题】通知面板宽度在 AOSP 里是**固定 dp**：`notification_panel_width` = 452dp，
+    //   与屏幕宽度无关。用户把 DPI 从 440 调到 345 后，452dp 只换算成约 975px，
+    //   而内屏横屏有 2364px ⇒ 两侧各空约 695px（下拉通知与悬浮通知都一样）。
+    //   实测依据（本机 2026-10-19）：SystemUI dump 里
+    //   `ConfigurationBasedDimensions(... width=977)`，977 ÷ (345/160) = 453dp，
+    //   与 AOSP 的 452dp 完全吻合。
+    //
+    //【解法】在取值出口把固定 dp 换成「按屏宽比例」，并加下限/上限，
+    //   自动适配四种场景（内屏/外屏 × 横屏/竖屏）。
+    //   上限 = 屏宽 − 2×留白，保证外屏竖屏（本来就占 83%）不会被顶到屏幕边缘。
+    //
+    // ⚠️ 宽度是**连续值**，不能塞进现有 boolean 开关体系
+    //   （ALL_PREF_KEYS/ALL_PREF_DEFAULTS 是 boolean[]，StatusProvider 全走 putBoolean）。
+    //   所以下面单独定义一条 int 通道，由 PROVIDER 的 get_prefs 一并发回。
+    // ============================================================
+
+    /** 总开关（boolean，走既有体系） */
+    public static final String PREFS_NOTIF_WIDTH_ENABLE = "notif_width_enable";
+    /**
+     * 屏宽百分比（int，38~98，单位 %）。
+     *
+     * <p>这是**竖屏**用的比例（历史字段名，保持向后兼容）。
+     * 横屏请用 {@link #PREFS_NOTIF_WIDTH_RATIO_LAND}。
+     */
+    public static final String PREFS_NOTIF_WIDTH_RATIO = "notif_width_ratio";
+    /**
+     * **横屏**屏宽百分比（int，38~98，单位 %）。
+     *
+     * <h2>为什么要和竖屏分开</h2>
+     * 同一台设备上两种方向的「合适宽度」差别很大：
+     * <ul>
+     *   <li>外屏竖屏 1168px：本来就占 83%，几乎不需要放宽（下限就兜住了）</li>
+     *   <li>内屏竖屏 1672px：66% = 1104px 比较舒服</li>
+     *   <li>内屏横屏 2364px：66% = 1560px 才是舒服的宽度</li>
+     * </ul>
+     * 只用一个比例时，调好横屏就得牺牲竖屏（或反过来）。分开后各调各的，
+     * 互不影响 —— 用户 2026-10-19 明确要求。
+     */
+    public static final String PREFS_NOTIF_WIDTH_RATIO_LAND = "notif_width_ratio_land";
+    /** Model 侧 Bundle 里回传比例用的 key（与上面同名，便于排查） */
+    public static final String KEY_NOTIF_WIDTH_RATIO = "notif_width_ratio";
+    /** Model 侧 Bundle 里回传**横屏**比例用的 key。 */
+    public static final String KEY_NOTIF_WIDTH_RATIO_LAND = "notif_width_ratio_land";
+
+    public static final boolean DEFAULT_NOTIF_WIDTH_ENABLE = false;
+    /**
+     * 默认 66%。
+     *
+     * <p>为什么不是更大的值：内屏横屏（2364×1672）下实测 88% = 2080px，两侧各留
+     * 142px，视觉上仍然偏宽、显得空。66% = 1560px 才是舒服的宽度。
+     * 竖屏/外屏有 452dp 下限兜底，不会因此变得比原生更窄。
+     */
+    public static final int DEFAULT_NOTIF_WIDTH_RATIO = 66;
+    /** 横屏默认比例（%）。与竖屏同默认为 66%，用户可各自单独调。 */
+    public static final int DEFAULT_NOTIF_WIDTH_RATIO_LAND = 66;
+    /** 滑杆下限（%）。再往下会撞到 452dp 下限，滑了也没有更窄的效果。 */
+    public static final int MIN_NOTIF_WIDTH_RATIO = 38;
+    /** 滑杆上限（%）。留 2% 呼吸边，避免顶到屏幕物理边缘。 */
+    public static final int MAX_NOTIF_WIDTH_RATIO = 98;
+    /** 下限 452dp = 系统原值，保证任何场景都不会比原生更窄 */
+    public static final int NOTIF_WIDTH_MIN_DP = 452;
+
+    // ── 锁定方向时的旋转提示（v3.45.0）──
+    /**
+     * 开关：锁定方向时，若传感器方向与屏幕方向不一致就弹出系统原生旋转按钮。
+     *
+     * <p>默认关闭。开启后仅作用于「自动旋转已关闭」的场景 ——
+     * 自动旋转开着时系统会自己转，不需要提示。
+     */
+    public static final String PREFS_ROTATION_HINT = "rotation_hint_enable";
+    public static final boolean DEFAULT_ROTATION_HINT = false;    /** 两侧最小留白 48dp，避免顶到物理边缘（折叠屏边缘有弧度） */
+    public static final int NOTIF_WIDTH_MARGIN_DP = 48;
+
+    /**
+     * 诊断开关：记录所有被读取的「宽度类」资源名与值。
+     *
+     * <p>用途：面板主体宽度改好后，顶部「时钟 / 日期 / 运营商」那一行仍是旧宽度，
+     * 但它用的资源名不一定是 {@link #NOTIF_WIDTH_RES_NAMES} 里那几个。开这个开关
+     * 跑一次，日志里就能看到实际读了哪些 header_/carrier_/clock_ 宽度，再据此扩白名单。
+     * 定位完应关掉（默认 false）。
+     */
+    public static final boolean DBG_LOG_WIDTH_RES = false;
+
+    /** 诊断时值得关注的资源名关键词（小写匹配）。 */
+    public static final String[] DBG_WIDTH_KEYWORDS = {
+            "header", "carrier", "clock", "date", "shade", "keyguard", "status_bar", "statusbar"
+    };
+
+    /**
+     * 宽度相关的资源名。
+     *
+     * <p>{@code qs_panel_width} 是**顶部时间卡片（时钟/日期/运营商那一行）的宽度源头**，
+     * 由 REA 反编译 {@code MiuiNotificationHeaderView.updateHeaderResources()} 确认：
+     * <pre>
+     *   MiuiLayoutParamsUtils.updateLayoutParamsWidth(
+     *       resources.getDimensionPixelOffset(R.dimen.qs_panel_width), this);
+     * </pre>
+     * 这个方法每次刷新都会把宽度**重新设回**该资源的值，所以在别处改
+     * {@code layoutParams.width} 会被它覆盖（实测改了 1560 又被摆回 977）。
+     * 从源头改这个资源才是正解 —— 它和 {@code notification_panel_width} 等值，
+     * 因此和通知卡片天然保持同一宽度。
+     *
+     * <h2>⚠️ 为什么不包含 lockscreen / outer_port 那两个</h2>
+     * 这两个名字虽然存在（在 resources.arsc 里），但经实测**不能动**：
+     * <ul>
+     *   <li>{@code notification_panel_width_lockscreen} —— 一旦被改，
+     *       **锁屏状态栏的宽度会跟着变成通知栏的宽度**，与非锁屏状态不一致。
+     *       用户 2026-10-19 明确反馈这是 bug：锁屏状态栏应保持原样。</li>
+     *   <li>{@code notification_panel_width_outer_port} —— 它对应外屏的
+     *       {@code 857}（不是 977），语义与主面板不同，一起改会连带外屏异常。</li>
+     * </ul>
+     * 因此白名单只保留真正需要跟随的入口，其余一律放行原值。
+     */
+    public static final String[] NOTIF_WIDTH_RES_NAMES = {
+            "notification_panel_width",
+            "qs_panel_width"
+    };
+    /** 悬浮通知（HUN）的宽度资源名 */
+    public static final String[] HUN_WIDTH_RES_NAMES = {
+            "heads_up_notification_width",
+            "heads_up_notification_min_width",
+            "notification_heads_up_width"
+    };
+
+    // ── 悬浮通知顶部让位（v3.43.6）──
+    /**
+     * 悬浮通知与状态栏之间的让位距离。
+     *
+     * <p>这是**真实存在**的资源（由 REA 反编译 SystemUI 确认，不是猜的）。
+     * 上面 {@link #HUN_WIDTH_RES_NAMES} 那三个经实测在 APK 里**根本不存在**，
+     * 属于无效白名单，保留仅为兼容，不产生任何效果。
+     *
+     * <p>横屏时状态栏被压缩（本机实测外屏 126px、内屏 140px），
+     * 而系统仍按竖屏的让位量摆放，导致悬浮通知上边缘盖住状态栏
+     * （用户 2026-10-19 截图确认：横屏时间与悬浮通知同一行 → 被盖）。
+     */
+    public static final String HUN_STATUS_BAR_PADDING = "heads_up_status_bar_padding";
+
+    /**
+     * 小米悬浮通知的尺寸查询器。
+     *
+     * <p>由 REA 反编译确认：它只有构造器和
+     * {@code getDimensionByResourceName(String)} 一个查询方法，
+     * 被 {@code DynamicIslandController} 持有（字段名 {@code headsUpManager}）。
+     *
+     * <p>挂它的查询方法可以**实际看到** HUN 按哪些资源摆放，
+     * 用来替代「猜资源名」的做法。
+     */
+    public static final String HUN_DELEGATE_CLASS = "com.miui.systemui.shade.HeadsUpManagerDelegate";
+
+    /**
+     * 横屏时给悬浮通知**追加**的顶部让位（dp）。
+     *
+     * <p>取值依据：横屏状态栏高度约 126px ÷ 密度 2.156 ≈ 58dp，
+     * 取 60dp 保证卡片完整落在状态栏下方且留一点余量。
+     */
+    public static final int HUN_LANDSCAPE_EXTRA_DP = 60;
+
+    // ── 顶部区域对齐（v3.41.4）──
+    /**
+     * 承载「时钟 / 日期 / 运营商」那一行的容器类。
+     *
+     * <p>实测它的层级（2364×1672 横屏）：
+     * <pre>
+     *   MiuiKeyguardStatusBarView          0,0-2364,140     ← 全屏宽
+     *     RelativeLayout (content)         0,0-2364,140
+     *       keyguard_status_bar_left_side  80,0-215,140     ← 左内容固定 x=80 起
+     *       status_icon_area               215,0-2198,140   ← 右内容固定到 x=2198 止
+     * </pre>
+     * 容器是全屏的，内部左右两块却是固定坐标 —— 卡片放大后它们不会跟着走。
+     */
+    public static final String TOP_ALIGN_CLASS =
+            "com.android.systemui.statusbar.phone.MiuiKeyguardStatusBarView";
+    /** 左侧内容容器 id（时钟 / 运营商 / 闹钟）。 */
+    public static final String TOP_ALIGN_LEFT_ID = "keyguard_status_bar_left_side";
+    /** 右侧图标区 id。 */
+    public static final String TOP_ALIGN_RIGHT_ID = "status_icon_area";
+    /**
+     * 通知栏顶部「时钟 / 日期 / 运营商」那一行的容器 id。
+     *
+     * <p>它是**另一个容器**，不在 {@link #TOP_ALIGN_CLASS} 里面：
+     * <pre>
+     *   normal_shade_header            0,0-2364,1672
+     *     MiuiNotificationHeaderView   693,0-1670,198    ← 宽度 977，不跟随卡片
+     *       big_time           (时钟)
+     *       carrier_container  (运营商)
+     * </pre>
+     * 它的宽度来自布局 XML（等于系统默认面板宽），代码里从不设置，
+     * 所以 {@code Resources} hook 拦不到，必须直接改它的 LayoutParams.width。
+     */
+    public static final String TOP_ALIGN_HEADER_ID = "normal_notification_header_view";
+    /**
+     * 上面那个容器的实现类。
+     *
+     * <p>宽度改法：在它自己的 {@code onMeasure} 里把 {@code layoutParams.width}
+     * 改成卡片宽度再转发给父类 —— 这是唯一可靠的时机。试过直接 {@code setLayoutParams}
+     * （在别处调用）会被布局 XML 的规则覆盖，视图宽度纹丝不动。
+     */
+    public static final String TOP_ALIGN_HEADER_CLASS =
+            "com.android.systemui.qs.MiuiNotificationHeaderView";
+
     public static final String[] BLE_UNLOCK_TEXT_BT = {"蓝牙", "bluetooth"};
     public static final String[] BLE_UNLOCK_TEXT_UNLOCK = {"解锁", "unlock"};
     public static final String[] PIN_KEY_IDS = {"key0", "key1", "key2", "key3", "key4", "key5", "key6", "key7", "key8", "key9"};
@@ -143,6 +348,8 @@ public final class Constants {
     public static final String PREFS_QS_EDIT_HIDE = "qs_edit_hide";
     public static final String PREFS_ENABLE_LOG = "enable_log";
     public static final String PREFS_NOTIF_IMPORTANCE = "notif_importance";
-    public static final String[] ALL_PREF_KEYS = {PREFS_GLASS_ENABLED, PREFS_FOCUS_GLASS, PREFS_AOD_BATTERY_SYNC, PREFS_PIN_GLASS, PREFS_NO_FOLD_HISTORY, PREFS_SINK_ENABLED, PREFS_NO_NOTIF_LIMIT, PREFS_KEEP_NOTIF, PREFS_HIDE_BT_UNLOCK, PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_ALLOW_MANAGE_ALL, PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE, PREFS_ENABLE_LOG, PREFS_NOTIF_IMPORTANCE};
-    public static final boolean[] ALL_PREF_DEFAULTS = {true, true, true, true, true, false, true, true, true, true, true, true, false, true, true, false, true};
+    // ⚠️ 这两个数组必须**同序同长**：reloadPrefs 与 StatusProvider 都按下标一一对应取值。
+    //    新增开关只能往**末尾追加**，不可插队（v3.41.2 追加了通知宽度总开关）。
+    public static final String[] ALL_PREF_KEYS = {PREFS_GLASS_ENABLED, PREFS_FOCUS_GLASS, PREFS_AOD_BATTERY_SYNC, PREFS_PIN_GLASS, PREFS_NO_FOLD_HISTORY, PREFS_SINK_ENABLED, PREFS_NO_NOTIF_LIMIT, PREFS_KEEP_NOTIF, PREFS_HIDE_BT_UNLOCK, PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_ALLOW_MANAGE_ALL, PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE, PREFS_ENABLE_LOG, PREFS_NOTIF_IMPORTANCE, PREFS_NOTIF_WIDTH_ENABLE, PREFS_ROTATION_HINT};
+    public static final boolean[] ALL_PREF_DEFAULTS = {true, true, true, true, true, false, true, true, true, true, true, true, false, true, true, false, true, false, false};
 }

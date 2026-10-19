@@ -70,6 +70,35 @@ public class MainHook extends XposedModule {
     private static final AtomicBoolean sMuteScreenOnFlag = new AtomicBoolean(true);
     private static final AtomicBoolean sCancelVibrateScreenOnFlag = new AtomicBoolean(true);
     private static final AtomicBoolean sAllowManageAllFlag = new AtomicBoolean(true);
+
+    // ── 通知宽度调节（v3.41.2）──
+    /** 总开关。宽度是连续值，走单独通道，不参与 ALL_PREF_KEYS 的下标体系。 */
+    public static final AtomicBoolean sNotifWidthEnable = new AtomicBoolean(false);
+    /** **竖屏**屏宽百分比（38~98，单位 %）。热路径只读这一个原子量。 */
+    public static final java.util.concurrent.atomic.AtomicInteger sNotifWidthRatio =
+            new java.util.concurrent.atomic.AtomicInteger(Constants.DEFAULT_NOTIF_WIDTH_RATIO);
+    /**
+     * **横屏**屏宽百分比（38~98，单位 %）。
+     *
+     * <p>与 {@link #sNotifWidthRatio} 相互独立：内外屏、横竖屏的「合适宽度」
+     * 差别很大，共用一个比例会导致调好一个方向就牺牲另一个（用户 2026-10-19 要求分开）。
+     */
+    public static final java.util.concurrent.atomic.AtomicInteger sNotifWidthRatioLand =
+            new java.util.concurrent.atomic.AtomicInteger(Constants.DEFAULT_NOTIF_WIDTH_RATIO_LAND);
+    /**
+     * 锁定方向时的旋转提示开关（v3.45.0）。
+     *
+     * <p>开启后：手机锁定了方向、而重力传感器感受到的方向与屏幕方向不一致时，
+     * 弹出系统原生的手动旋转按钮。
+     */
+    public static final AtomicBoolean sRotationHintEnable = new AtomicBoolean(false);
+    /**
+     * 当前通知卡片实际宽度（px），由 {@link NotifWidth} 每次算出新值时写入，
+     * 供 {@link NotifTopAlign} 把顶部区域对齐到卡片边缘。0 表示还没算过。
+     */
+    public static final java.util.concurrent.atomic.AtomicInteger sNotifWidthCardPx =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+
     private static final Set<Object> sBleUnlockToasts = Collections.newSetFromMap(new WeakHashMap());
     private static final ThreadLocal<Boolean> sInBleUnlock = new ThreadLocal<Boolean>() { // from class: com.abel.hyperosglass.MainHook.1
         /* JADX INFO: Access modifiers changed from: protected */
@@ -129,6 +158,9 @@ public class MainHook extends XposedModule {
                 installQsEditHideHook(defaultClassLoader);
                 installNotificationImportanceFilterHooks(defaultClassLoader);
                 installNotifEnhanceHooks(defaultClassLoader);
+                // ★ v3.41.2 通知宽度调节：hook Resources 的取值方法，
+                //   把写死的 452dp 换成按屏宽比例（适配 内屏/外屏 × 横屏/竖屏）
+                installNotifWidthHooks(defaultClassLoader);
                 installThirdPartyThemeGlassHooks(defaultClassLoader);
             } else if (Constants.SETTINGS_PKG.equals(packageName)) {
                 // 设置：放开被 MIUI 隐藏的「重要性」，并让改动写回通知通道
@@ -204,6 +236,35 @@ public class MainHook extends XposedModule {
         installMuteScreenOnHook(classLoader);
         installAllowManageAllHook(classLoader);
         installFoldNotifHook(classLoader);
+    }
+
+    /**
+     * 通知宽度调节（v3.41.2）。
+     *
+     * <p>与上面那组「通知行为」hook 不同，这一组动的是**布局尺寸** ——
+     * 项目此前从未碰过尺寸，所以单独成组、单独调用（保持
+     * {@link #installNotifEnhanceHooks} 的语义纯净）。
+     *
+     * <p>实现全部在 {@link NotifWidth}，这里只负责把 hook 能力传进去。
+     */
+    private void installNotifWidthHooks(ClassLoader classLoader) {
+        try {
+            NotifWidth.install(this, classLoader);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[通知宽度] 挂载失败: " + th);
+        }
+        // 顶部（时钟/日期/运营商）跟随卡片宽度：卡片变宽后顶部那行要一起撑开
+        try {
+            NotifTopAlign.install(this, classLoader);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[顶部对齐] 挂载失败: " + th);
+        }
+        // 锁定方向时的旋转提示：复用系统原生的 FloatingRotationButton
+        try {
+            RotationHint.install(this, classLoader);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[旋转提示] 挂载失败: " + th);
+        }
     }
 
     private static Field findField(Class<?> cls, String str) {
@@ -1046,6 +1107,23 @@ public class MainHook extends XposedModule {
             for (int i = 0; i < Constants.ALL_PREF_KEYS.length; i++) {
                 bundle.putBoolean(Constants.ALL_PREF_KEYS[i], this.sPrefs.getBoolean(Constants.ALL_PREF_KEYS[i], Constants.ALL_PREF_DEFAULTS[i]));
             }
+            // ★ v3.41.2 通知宽度比例：连续值不在 ALL_PREF_KEYS（那是 boolean[]）里，
+            //   必须单独补一行，否则 applyRealPrefs 里的 getInt 永远拿默认值。
+            try {
+                bundle.putInt(Constants.KEY_NOTIF_WIDTH_RATIO,
+                        this.sPrefs.getInt(Constants.PREFS_NOTIF_WIDTH_RATIO, Constants.DEFAULT_NOTIF_WIDTH_RATIO));
+            } catch (Throwable unused) {
+                bundle.putInt(Constants.KEY_NOTIF_WIDTH_RATIO, Constants.DEFAULT_NOTIF_WIDTH_RATIO);
+            }
+            // ★ v3.44.5 横屏比例：与竖屏分开，同样走这条 int 通道
+            try {
+                bundle.putInt(Constants.KEY_NOTIF_WIDTH_RATIO_LAND,
+                        this.sPrefs.getInt(Constants.PREFS_NOTIF_WIDTH_RATIO_LAND,
+                                Constants.DEFAULT_NOTIF_WIDTH_RATIO_LAND));
+            } catch (Throwable unused) {
+                bundle.putInt(Constants.KEY_NOTIF_WIDTH_RATIO_LAND,
+                        Constants.DEFAULT_NOTIF_WIDTH_RATIO_LAND);
+            }
             applyRealPrefs(bundle);
         } catch (Throwable th) {
             LogUtil.logAlways("读取设置失败: " + th);
@@ -1105,6 +1183,23 @@ public class MainHook extends XposedModule {
         thread.start();
     }
 
+    /**
+     * 把比例夹到合法区间（{@link Constants#MIN_NOTIF_WIDTH_RATIO} ~
+     * {@link Constants#MAX_NOTIF_WIDTH_RATIO}）。
+     *
+     * <p>配置有可能被手工改坏（或旧版本遗留越界值），越界会让宽度离谱到
+     * 超出屏幕，所以每次读到都做一次兜底。竖屏、横屏两个比例共用这段逻辑。
+     */
+    private static int clampRatio(int ratio) {
+        if (ratio < Constants.MIN_NOTIF_WIDTH_RATIO) {
+            return Constants.MIN_NOTIF_WIDTH_RATIO;
+        }
+        if (ratio > Constants.MAX_NOTIF_WIDTH_RATIO) {
+            return Constants.MAX_NOTIF_WIDTH_RATIO;
+        }
+        return ratio;
+    }
+
     private void applyRealPrefs(Bundle bundle) {
         try {
             boolean z = bundle.getBoolean(Constants.PREFS_SINK_ENABLED, true);
@@ -1124,6 +1219,28 @@ public class MainHook extends XposedModule {
             boolean z15 = bundle.getBoolean(Constants.PREFS_ALLOW_MANAGE_ALL, true);
             boolean z16 = bundle.getBoolean(Constants.PREFS_ENABLE_LOG, false);
             boolean z17 = bundle.getBoolean(Constants.PREFS_NOTIF_IMPORTANCE, true);
+            // 通知宽度（v3.41.2）：开关走 boolean 体系；比例是连续值，走单独 int 通道
+            boolean widthOn = bundle.getBoolean(Constants.PREFS_NOTIF_WIDTH_ENABLE, Constants.DEFAULT_NOTIF_WIDTH_ENABLE);
+            int widthRatio = bundle.getInt(Constants.KEY_NOTIF_WIDTH_RATIO, Constants.DEFAULT_NOTIF_WIDTH_RATIO);
+            // 横屏比例（v3.44.5）：与竖屏完全独立
+            int widthRatioLand = bundle.getInt(Constants.KEY_NOTIF_WIDTH_RATIO_LAND,
+                    Constants.DEFAULT_NOTIF_WIDTH_RATIO_LAND);
+            // 比例做一次范围兜底：配置可能被手工改坏，越界会导致宽度离谱
+            widthRatio = clampRatio(widthRatio);
+            widthRatioLand = clampRatio(widthRatioLand);
+            sNotifWidthEnable.set(widthOn);
+            sNotifWidthRatio.set(widthRatio);
+            sNotifWidthRatioLand.set(widthRatioLand);
+            // 旋转提示开关（v3.45.0）：走 boolean 体系，直接按 key 读
+            sRotationHintEnable.set(bundle.getBoolean(Constants.PREFS_ROTATION_HINT,
+                    Constants.DEFAULT_ROTATION_HINT));
+            // 开关刚被打开时，控制器/传感器可能还没就绪 —— 主动补一次，
+            // 否则要等导航栏下次重建才会注册传感器（那样用户会觉得「开了没反应」）。
+            try {
+                RotationHint.onPrefsChanged();
+            } catch (Throwable unused) {
+                // 不影响其他配置生效
+            }
             this.sSinkEnabled = z;
             this.sGlassEnabled = z2;
             this.sNotifImportance = z17;

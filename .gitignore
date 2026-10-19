@@ -24,3 +24,8 @@ refs/
 
 # 一次性修复脚本
 fix_nav_pref.py
+
+# 手工编译产物
+build_manual/
+build_dex/
+build_dex_fix/
