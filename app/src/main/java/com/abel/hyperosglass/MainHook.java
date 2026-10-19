@@ -159,9 +159,11 @@ public class MainHook extends XposedModule {
                 installQsEditHideHook(defaultClassLoader);
                 installNotificationImportanceFilterHooks(defaultClassLoader);
                 installNotifEnhanceHooks(defaultClassLoader);
+                LogUtil.logAlways("[诊断] 即将安装通知宽度/旋转提示 hooks");
                 // ★ v3.41.2 通知宽度调节：hook Resources 的取值方法，
                 //   把写死的 452dp 换成按屏宽比例（适配 内屏/外屏 × 横屏/竖屏）
                 installNotifWidthHooks(defaultClassLoader);
+                LogUtil.logAlways("[诊断] 通知宽度/旋转提示 hooks 安装返回");
                 installThirdPartyThemeGlassHooks(defaultClassLoader);
             } else if (Constants.SETTINGS_PKG.equals(packageName)) {
                 // 设置：放开被 MIUI 隐藏的「重要性」，并让改动写回通知通道

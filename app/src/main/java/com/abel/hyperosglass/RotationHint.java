@@ -74,6 +74,18 @@ public final class RotationHint {
 
     /** 传感器回调到实际弹按钮之间的稳定延时（ms），过滤转动过程中的抖动 */
     private static final long STABLE_DELAY_MS = 350L;
+    /**
+     * 「收→显」之间留的间隔（毫秒）。
+     *
+     * <p>同步连调会让位置瞬间跳变（生硬）；留出收起动画的时间后，
+     * 位置切换会跟随系统自己的淡入淡出，视觉上平滑。
+     * 90ms 是实测比较自然的取值 —— 再大会觉得卡顿，再小仍然生硬。
+     */
+    private static final long RELOCATE_SHOW_DELAY_MS = 90L;
+    /** 镜像按钮的 View（系统按钮在右侧时，左侧再放一个同样的按钮）。 */
+    private static volatile android.view.View sMirrorView;
+    /** 镜像按钮所在的窗口管理器。 */
+    private static volatile android.view.WindowManager sMirrorWm;
 
     /** 拿到的 RotationButtonController 实例（反射调用，避免编译期依赖） */
     private static volatile Object sController;
@@ -96,6 +108,16 @@ public final class RotationHint {
     private static final Handler sMain = new Handler(Looper.getMainLooper());
     /** 最近一次已提示过的目标方向（Surface.ROTATION_*），-1 表示未提示 */
     private static volatile int sLastHintedRotation = -1;
+    /** 传感器此刻感知到的手机物理姿态（Surface.ROTATION_*），落点与显示判断都用它。 */
+    private static volatile int sSensorTargetRotation = -1;
+    /** 屏幕锁定方向（Surface.ROTATION_*），0/1/2/3。用于把角落顺时针补转。 */
+    private static volatile int sScreenRotation = -1;
+    /** 系统 FloatingRotationButton 实例 */
+    private static volatile Object sRotationButton;
+    /** 去抖：待确认方向 */
+    private static volatile int sPendingRotation = -1;
+    /** 去抖 token 与等待时长 */
+    private static final Object STABLE_TOKEN = new Object();
 
     private RotationHint() {
     }
@@ -238,28 +260,558 @@ public final class RotationHint {
      * 边距沿用系统自己的 {@code defaultMargin}，不自己造数字，
      * 这样跟系统视觉规范一致。
      */
-    private static void overridePosition(Object pos) {
-        Class<?> c = pos.getClass();
-        int margin = 0;
+    /**
+     * 按**系统自己的左/右规则**给出落点。
+     *
+     * <h2>用户的要求（2026-10-19，最简洁的一次表述）</h2>
+     * <blockquote>
+     *   直接用系统预设的 button right、button left 之类的去定位置就好了。
+     *   它把这个 button left 定义在哪儿，就出现在哪儿。
+     * </blockquote>
+     * 也就是说：**不要自己算坐标**，只用系统那套「左 / 右」二选一，
+     * 由系统自己把它放到对应的角上。
+     *
+     * <h2>系统的规则</h2>
+     * {@code FloatingRotationButtonPositionCalculator} 里用
+     * {@code floatingRotationButtonPositionLeft} 这个布尔值决定左/右，
+     * 四个方向的取值（REA 反编译 + 本机日志实测）：
+     * <pre>
+     *   rotation 0 → 85 = BOTTOM|RIGHT   右下
+     *   rotation 1 → 53 = TOP|RIGHT      右上
+     *   rotation 2 → 51 = TOP|LEFT       左上
+     *   rotation 3 → 83 = BOTTOM|LEFT    左下
+     * </pre>
+     * 注意括号：0/1 走 RIGHT 一侧、2/3 走 LEFT 一侧。
+     * 我们只要把 {@code sensor}（手机物理姿态）填进系统这个表即可 ——
+     * 位置完全由系统决定，我们不改任何 View / LayoutParams，
+     * 因此**不会崩溃**（前面用 updateViewLayout 的做法会让 SystemUI 强转异常）。
+     *
+     * <h2>四个姿态的目标角落（用户逐项确认）</h2>
+     * <pre>
+     *   0 竖立     → 右下   3 向左倒 → 左下
+     *   2 倒置     → 左上   1 向右倒 → 右上
+     * </pre>
+     */
+    /**
+     * 在系统按钮的**对侧**再放一个同样外观的按钮，方便左右手操作。
+     *
+     * <p>做法：直接用系统的 {@code FloatingRotationButtonView} 类（图标、形状、点击反馈
+     * 全部原生一致），加载系统资源 {@code accessibility_rotate_button} 作为图标，
+     * 放进一个独立的小悬浮窗口，贴在系统按钮的对侧。
+     *
+     * <p>只在「按钮正在显示」时挂镜像；系统按钮收起时镜像也要收起。
+     */
+    /**
+     * 在系统按钮的**对侧**再放一个外观一致的按钮，方便左右手操作。
+     *
+     * <h2>做法</h2>
+     * 系统按钮本身的 Drawable 已经是当前方向对应的那个「预示图标」，
+     * 直接把它拿到手、画到一个 {@link android.widget.ImageView} 上，
+     * 放进独立悬浮窗口贴到对侧 —— 外观与系统完全一致，
+     * 且不需要反射构造系统内部 View（那条路在本机取不到实例）。
+     *
+     * <h2>为什么不再用 isAttachedToWindow 判断</h2>
+     * 实测「收→显」过程中它会是 false（日志：attached=false 但 kv=true），
+     * 导致镜像永远建不起来。改为直接用按钮自身的可见性判断。
+     */
+    private static void syncMirrorButton() {
+        Context ctx = sContext;
+        Object btn = sRotationButton;
+        if (ctx == null || btn == null) {
+            return;
+        }
         try {
-            // defaultMargin 是外面那个 Calculator 的字段，这里用固定 dp 值更稳
-            Context ctx = sContext;
-            if (ctx != null) {
-                margin = (int) (16 * ctx.getResources().getDisplayMetrics().density);
+            Object kv = readField(btn, "mKeyButtonView");
+            if (!(kv instanceof android.view.View)) {
+                return;
+            }
+            android.view.View keyView = (android.view.View) kv;
+
+            // 按钮不可见 → 镜像也收起
+            if (keyView.getVisibility() != android.view.View.VISIBLE
+                    || keyView.getAlpha() < 0.05f) {
+                removeMirrorButton();
+                return;
+            }
+
+            // 取系统按钮当前的图标（已经是当前方向对应的预示图标）
+            android.graphics.drawable.Drawable bg = keyView.getBackground();
+            if (bg == null) {
+                LogUtil.logAlwaysOnce("rh-mirror-nobg", "[旋转提示] 镜像：系统按钮无背景图，跳过");
+                return;
+            }
+
+            android.view.WindowManager wm = getMirrorWm(ctx);
+            if (wm == null) {
+                return;
+            }
+
+            // 判断系统按钮在画面左还是右，镜像放对侧
+            Object posObj = readField(btn, "mPosition");
+            int g = 0;
+            if (posObj != null) {
+                Object gv = readField(posObj, "gravity");
+                if (gv instanceof Integer) {
+                    g = (Integer) gv;
+                }
+            }
+            boolean sysIsLeft = (g & android.view.Gravity.LEFT) == android.view.Gravity.LEFT;
+            boolean sysIsTop = (g & android.view.Gravity.TOP) == android.view.Gravity.TOP;
+            int mirrorGravity = sysIsLeft
+                    ? (sysIsTop ? (android.view.Gravity.TOP | android.view.Gravity.RIGHT)
+                                : (android.view.Gravity.BOTTOM | android.view.Gravity.RIGHT))
+                    : (sysIsTop ? (android.view.Gravity.TOP | android.view.Gravity.LEFT)
+                                : (android.view.Gravity.BOTTOM | android.view.Gravity.LEFT));
+
+            int size = (int) (48 * ctx.getResources().getDisplayMetrics().density);
+            int margin = (int) (16 * ctx.getResources().getDisplayMetrics().density);
+
+            android.widget.ImageView mv = (android.widget.ImageView) sMirrorView;
+            if (mv == null) {
+                mv = new android.widget.ImageView(ctx);
+                sMirrorView = mv;
+            }
+            // 每次都用最新的图标（方向变了图标也会变）
+            mv.setImageDrawable(bg.getConstantState() != null
+                    ? bg.getConstantState().newDrawable() : bg);
+            mv.setScaleType(android.widget.ImageView.ScaleType.FIT_CENTER);
+
+            if (mv.getParent() != null) {
+                android.view.WindowManager.LayoutParams lp = getMirrorLp();
+                if (lp != null) {
+                    lp.gravity = mirrorGravity;
+                    lp.x = (mirrorGravity & android.view.Gravity.LEFT) != 0 ? margin : -margin;
+                    lp.y = (mirrorGravity & android.view.Gravity.TOP) != 0 ? margin : -margin;
+                    wm.updateViewLayout(mv, lp);
+                }
+                return;
+            }
+
+            android.view.WindowManager.LayoutParams lp = new android.view.WindowManager.LayoutParams();
+            lp.width = size;
+            lp.height = size;
+            // TYPE_NAVIGATION_BAR_PANEL = 2024（非公开常量，用字面值）
+            lp.type = 2024;
+            lp.flags = android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                    | android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                    | android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                    | android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS;
+            lp.gravity = mirrorGravity;
+            lp.x = (mirrorGravity & android.view.Gravity.LEFT) != 0 ? margin : -margin;
+            lp.y = (mirrorGravity & android.view.Gravity.TOP) != 0 ? margin : -margin;
+            lp.format = android.graphics.PixelFormat.TRANSLUCENT;
+            lp.setTitle("RotationMirror");
+            sMirrorLp = lp;
+            wm.addView(mv, lp);
+            LogUtil.logAlways("[旋转提示] 已挂镜像按钮 gravity=" + mirrorGravity
+                    + " size=" + size);
+        } catch (Throwable th) {
+            LogUtil.logAlwaysOnce("rh-mirror-fail", "[旋转提示] 镜像按钮失败: " + th);
+        }
+    }
+
+    /** 镜像按钮的 LayoutParams（保存下来供更新用）。 */
+    private static volatile android.view.WindowManager.LayoutParams sMirrorLp;
+
+    private static android.view.WindowManager.LayoutParams getMirrorLp() {
+        return sMirrorLp;
+    }
+
+    private static android.view.WindowManager getMirrorWm(Context ctx) {
+        android.view.WindowManager wm = sMirrorWm;
+        if (wm == null) {
+            wm = (android.view.WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
+            sMirrorWm = wm;
+        }
+        return wm;
+    }
+
+    /** 用系统类造一个和原生一模一样的旋转按钮。 */
+    private static android.view.View buildMirrorView(Context ctx) {
+        try {
+            Class<?> cls = Class.forName(
+                    "com.android.systemui.shared.rotation.FloatingRotationButtonView",
+                    false, ctx.getClassLoader());
+            android.view.View v = null;
+            // 优先用 (Context, AttributeSet) 构造器
+            try {
+                java.lang.reflect.Constructor<?> c =
+                        cls.getConstructor(Context.class, android.util.AttributeSet.class);
+                v = (android.view.View) c.newInstance(ctx, null);
+            } catch (NoSuchMethodException e) {
+                java.lang.reflect.Constructor<?> c =
+                        cls.getConstructor(Context.class, android.util.AttributeSet.class, int.class);
+                v = (android.view.View) c.newInstance(ctx, null, 0);
+            }
+            if (v == null) {
+                return null;
+            }
+            // 用系统资源做图标
+            android.content.res.Resources res = ctx.getResources();
+            int id = res.getIdentifier("accessibility_rotate_button", "drawable",
+                    "com.android.systemui");
+            if (id != 0) {
+                v.setBackground(res.getDrawable(id, null));
+            }
+            return v;
+        } catch (Throwable unused) {
+            return null;
+        }
+    }
+
+    private static void removeMirrorButton() {
+        try {
+            android.view.View mv = sMirrorView;
+            android.view.WindowManager wm = sMirrorWm;
+            if (mv != null && wm != null && mv.getParent() != null) {
+                wm.removeView(mv);
             }
         } catch (Throwable unused) {
-            margin = 40;
+            // 移除失败无所谓
         }
+    }
+
+    /**
+     * 给按钮所在的容器加 padding，让整个按钮朝屏幕中心内缩。
+     *
+     * <p>为什么不用 translation：容器窗口只有 192px、按钮 112px，
+     * 位移上限只有 ±40px，超出就被裁掉（实测 tx=133 按钮完全消失）。
+     *
+     * <p>为什么 padding 安全：它只改 View 的 padding 属性，
+     * <b>不碰 LayoutParams</b>，因此不会触发系统内部
+     * {@code (FrameLayout.LayoutParams) view.getLayoutParams()} 的强转崩溃。
+     */
+    private static void applyContainerInset(Context ctx, boolean isLeft, boolean isBottom) {
+        try {
+            Object btn = sRotationButton;
+            if (btn == null) {
+                return;
+            }
+            Object kv = readField(btn, "mKeyButtonView");
+            if (!(kv instanceof android.view.View)) {
+                return;
+            }
+            Object parent = ((android.view.View) kv).getParent();
+            if (!(parent instanceof android.view.View)) {
+                return;
+            }
+            android.view.View pv = (android.view.View) parent;
+            int inset;
+            try {
+                inset = (int) (20 * ctx.getResources().getDisplayMetrics().density);
+            } catch (Throwable unused) {
+                inset = 42;
+            }
+            // 朝屏幕中心方向挤压：LEFT 侧压右边、RIGHT 侧压左边；
+            // BOTTOM 侧压上边、TOP 侧压下边。这样内容整体朝中心移动。
+            int left = isLeft ? 0 : inset;
+            int right = isLeft ? inset : 0;
+            int top = isBottom ? inset : 0;
+            int bottom = isBottom ? 0 : inset;
+            if (pv.getPaddingLeft() != left || pv.getPaddingRight() != right
+                    || pv.getPaddingTop() != top || pv.getPaddingBottom() != bottom) {
+                pv.setPadding(left, top, right, bottom);
+                LogUtil.logAlways("[旋转提示] 容器内缩 L" + left + " T" + top
+                        + " R" + right + " B" + bottom);
+            }
+        } catch (Throwable unused) {
+            // 加不上就只靠 translation
+        }
+    }
+
+    /**
+     * 让系统重新算一次位置。
+     *
+     * <p>用系统自己的 {@code setRotateSuggestionButtonState} 先收后显，
+     * 系统会重走一遍布局流程，届时 {@code calculatePosition} 被再次调用，
+     * 按最新传感器方向给出落点。
+     *
+     * <p>⚠️ 只用这一条通道 —— 绝不调 {@code updateViewLayout} 或改 LayoutParams，
+     * 那会让 SystemUI 在 {@code (FrameLayout.LayoutParams)} 强转处崩溃。
+     */
+    /** 上次重排的目标方向与时间，用于防抖。 */
+    private static volatile int sLastRelocatedSensor = -2;
+    private static volatile long sLastRelocateAt = 0L;
+    /** 重排最小间隔：同一方向的重复请求在这段时间内直接忽略。 */
+    private static final long RELOCATE_MIN_INTERVAL_MS = 400L;
+
+    private static void relocate() {
+        if (!MainHook.sRotationHintEnable.get()) {
+            return;
+        }
+        // ⚠️ 防抖：实测重排会在 2ms 内被连调 3~5 次
+        //   （传感器抖动 + 多个入口重复触发），日志暴刷、按钮反复闪，
+        //   用户看到的「渐入渐出没效果」就是这么来的。
+        //   同一方向在 RELOCATE_MIN_INTERVAL_MS 内只执行一次。
+        int curSensor = sSensorTargetRotation;
+        long now = android.os.SystemClock.uptimeMillis();
+        if (curSensor == sLastRelocatedSensor
+                && now - sLastRelocateAt < RELOCATE_MIN_INTERVAL_MS) {
+            return;
+        }
+        sLastRelocatedSensor = curSensor;
+        sLastRelocateAt = now;
+
+        Object controller = sController;
+        if (controller == null) {
+            return;
+        }
+        try {
+            Object btn = sRotationButton;
+            if (btn == null) {
+                btn = readField(controller, "mRotationButton");
+                sRotationButton = btn;
+            }
+            if (btn == null) {
+                return;
+            }
+            Object showing = readField(btn, "mIsShowing");
+            if (!(showing instanceof Boolean) || !((Boolean) showing).booleanValue()) {
+                return;   // 没显示就别动，避免把它弹出来
+            }
+            Method set = null;
+            for (Method m : controller.getClass().getDeclaredMethods()) {
+                if ("setRotateSuggestionButtonState".equals(m.getName())
+                        && m.getParameterTypes().length == 2) {
+                    set = m;
+                    break;
+                }
+            }
+            if (set == null) {
+                return;
+            }
+            set.setAccessible(true);
+            // ⚠️ 原来是「收→显」两个 invoke **同步连调**，系统来不及走动画帧，
+            //    位置瞬间跳过去 —— 用户反馈「非常非常生硬」。
+            //    这里把「显」延迟一小段时间再发，给系统留出收起动画的时间，
+            //    位置切换就会跟着系统的淡入淡出一起走，柔和不突兀。
+            set.invoke(controller, Boolean.FALSE, Boolean.FALSE);
+            final Method setM = set;
+            sMain.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        setM.invoke(sController, Boolean.TRUE, Boolean.FALSE);
+                        LogUtil.logAlways("[旋转提示] 已按方向重排（收→显）");
+                        syncMirrorButton();
+                    } catch (Throwable unused) {
+                        // 失败就保持收起状态，下一次方向变化会再试
+                    }
+                }
+            }, RELOCATE_SHOW_DELAY_MS);
+        } catch (Throwable th) {
+            LogUtil.logAlwaysOnce("rh-relocate-fail", "[旋转提示] 重排失败: " + th);
+        }
+    }
+
+    /** 沿继承链读一个字段（私有/父类都能读到）。 */
+    private static Object readField(Object obj, String name) {
+        if (obj == null) {
+            return null;
+        }
+        Class<?> c = obj.getClass();
+        while (c != null) {
+            try {
+                java.lang.reflect.Field f = c.getDeclaredField(name);
+                f.setAccessible(true);
+                return f.get(obj);
+            } catch (NoSuchFieldException e) {
+                c = c.getSuperclass();
+            } catch (Throwable unused) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * **不干预系统落点** —— 保持系统默认位置。
+     *
+     * <h2>为什么改成不动</h2>
+     * 用户 2026-10-19 决定：「算了，恢复系统默认的容器和默认的位置吧，
+     * 只考虑增加镜像，以及旋钮在快速切换位置时的一个过渡」。
+     *
+     * <h2>之前的尝试为什么都走不通</h2>
+     * 系统把按钮放在一个 <b>192×192 的悬浮窗口</b>里，按钮本身 112×112，
+     * 所以窗口内可用位移只有 {@code (192-112)/2 = 40px}。实测：
+     * <ul>
+     *   <li>translation 超过 ±40 → 按钮被容器裁掉，甚至完全消失（tx=133 时不可见）；</li>
+     *   <li>padding 无效 —— 按钮尺寸固定，padding 只改变居中位置，仍受 40px 限制；</li>
+     *   <li>改 View 的 LayoutParams / updateViewLayout → SystemUI 强转崩溃（两次）。</li>
+     * </ul>
+     * 想让按钮真正远离边缘，必须换掉整个容器窗口，代价是要自绘按钮、
+     * 失去系统原生的方向预示图标与动画 —— 用户不采纳。
+     *
+     * <p>所以这里直接 return，把落点完全交还给系统；镜像与过渡动画另行处理。
+     */
+    /**
+     * 按传感器方向 + 屏幕锁定方向的**夹角**决定按钮落在哪个角。
+     *
+     * <h2>用户最终确认的行为（2026-10-19）</h2>
+     * <blockquote>
+     *   算了，恢复系统默认的容器和默认的位置吧，只考虑增加镜像，
+     *   以及旋钮在快速切换位置时的一个过渡。
+     * </blockquote>
+     * 也就是：<b>位置只用系统自带的四个角落</b>，不做任何自定义内缩；
+     * 但按钮要跟着传感器方向换角落（这正是 v3.78 用户评价「完美」的行为）。
+     *
+     * <h2>为什么 translation 必须为 0</h2>
+     * 系统把按钮放在 <b>192×192 的悬浮窗口</b>里、按钮本身 112×112，
+     * 窗口内可用位移只有 {@code (192-112)/2 = 40px}。实测超出就被裁：
+     * tx=133 时按钮完全消失、tx=-93 时被边缘截掉。
+     * 而 padding 无效（按钮尺寸固定），改 LayoutParams 会崩。
+     * <b>所以这里把 translation 明确置 0</b> —— 只换 gravity，
+     * 位置永远是系统原生的角落，绝不裁切。
+     *
+     * <h2>夹角换算</h2>
+     * gravity 的角落是相对<b>画面</b>的（画面方向 = rotation）；
+     * 我们要的「手机物理姿态对应的角落」是相对<b>手机实体</b>的。
+     * 两者相差一个 rotation：
+     * <pre>
+     *   画面角 = (物理目标角 − rotation + 4) % 4
+     * </pre>
+     * rotation=0（竖屏锁定）时二者相等。
+     * 角落编号按顺时针：0=左上 1=右上 3=右下 2=左下。
+     */
+    /**
+     * 用系统自带的「左 / 右」开关决定按钮在屏幕的哪一侧 —— 不自己算任何坐标。
+     *
+     * <h2>用户的要求（2026-10-19，最终定稿）</h2>
+     * <blockquote>
+     *   你把容器和旋钮的图标位置都恢复默认啊，通过 button left、button right
+     *   之类的来调用。
+     * </blockquote>
+     * 也就是：<b>容器保持系统默认、图标保持系统默认、边距保持系统默认</b>，
+     * 我们只告诉系统「这次要用左边那个还是右边那个」。
+     * 系统那四个原生落点（本机实测）就是：
+     * <pre>
+     *   rotation 0 → 85 = BOTTOM|RIGHT   右下
+     *   rotation 1 → 53 = TOP|RIGHT      右上
+     *   rotation 2 → 51 = TOP|LEFT       左上
+     *   rotation 3 → 83 = BOTTOM|LEFT    左下
+     * </pre>
+     * 它们本来就带有系统设计好的边距（translation 由系统填，通常是 ±69），
+     * 所以<b>我们绝不能再改 translation</b> —— 一改就会把按钮推出 192px 的容器窗口
+     * （实测 tx=±133 消失、tx=-93 被裁、tx=0 贴边超出）。
+     *
+     * <h2>做法</h2>
+     * 只设 {@code gravity}（选系统四个原生角落之一），translation 完全不动，
+     * 保持系统通过 {@code floatingRotationButtonPositionLeft} 之类算好的原值。
+     */
+    /** 沿继承链读一个 int 字段，读不到返回 Integer.MIN_VALUE。 */
+    private static int readIntField(Object obj, String name) {
+        Object v = readField(obj, name);
+        return v instanceof Integer ? (Integer) v : Integer.MIN_VALUE;
+    }
+
+    private static void overridePosition(Object pos) {
+        Context ctx = sContext;
+        int sensor = sSensorTargetRotation;
+        if (ctx == null || sensor < 0) {
+            return;
+        }
+
+        // 物理目标角（用户逐项确认）：
+        //   0 竖立 → 右下    1 → 左下    2 倒置 → 左上    3 → 右上
+        int physical;
+        switch (sensor) {
+            case 1:
+                physical = 2;   // 左下
+                break;
+            case 2:
+                physical = 0;   // 左上
+                break;
+            case 3:
+                physical = 1;   // 右上
+                break;
+            case 0:
+            default:
+                physical = 3;   // 右下
+                break;
+        }
+
+        // 夹角换算：画面角 = (物理角 − 屏幕旋转) % 4
+        final int[] CW = {0, 1, 3, 2};          // 顺时针：左上→右上→右下→左下
+        int rot = sScreenRotation >= 0 ? sScreenRotation : 0;
+        int physIdx = 0;
+        for (int i = 0; i < 4; i++) {
+            if (CW[i] == physical) {
+                physIdx = i;
+                break;
+            }
+        }
+        int screenIdx = ((physIdx - rot) % 4 + 4) % 4;
+        int corner = CW[screenIdx];
+
+        int gravity;
+        switch (corner) {
+            case 0:
+                gravity = android.view.Gravity.TOP | android.view.Gravity.LEFT;
+                break;
+            case 1:
+                gravity = android.view.Gravity.TOP | android.view.Gravity.RIGHT;
+                break;
+            case 2:
+                gravity = android.view.Gravity.BOTTOM | android.view.Gravity.LEFT;
+                break;
+            case 3:
+            default:
+                gravity = android.view.Gravity.BOTTOM | android.view.Gravity.RIGHT;
+                break;
+        }
+
+        // 边距：直接用系统实测值（本机四组：69/80/68/80，量级一致）。
+        // 用 16dp ≈ 34px 会略小于系统值，但仍在 192px 容器内、不会裁切；
+        // 想要和系统原生完全一致可改成 69/80，这里取一个统一的安全值。
+        int margin;
+        try {
+            margin = (int) (30 * ctx.getResources().getDisplayMetrics().density);
+        } catch (Throwable unused) {
+            margin = 65;
+        }
+
+        // ⚠️ gravity 与 translation **必须成对设置**！
+        //   系统原来那四组值是配好对的（本机实测，即系统自己算出来的默认边距）：
+        //     BOTTOM|RIGHT (85) → tx=-69 ty=-69
+        //     TOP|RIGHT    (53) → tx=-80 ty= 80
+        //     TOP|LEFT     (51) → tx= 68 ty= 68
+        //     BOTTOM|LEFT  (83) → tx= 80 ty=-80
+        //   只换 gravity 而不动 translation，两者就会错配 ——
+        //   实测：给 83(左下) 却留着 80/-80 之外的系统值，
+        //   按钮被 tx=+80 往右推、ty=-80 往下推出屏幕，四个方向里三个直接看不见。
+        //   所以这里按角落一并写入对应的边距（这正是系统自己的规则）。
+        int tx;
+        int ty;
+        switch (corner) {
+            case 0:   // 左上
+                tx = margin;
+                ty = margin;
+                break;
+            case 1:   // 右上
+                tx = -margin;
+                ty = margin;
+                break;
+            case 2:   // 左下
+                tx = margin;
+                ty = -margin;
+                break;
+            case 3:   // 右下
+            default:
+                tx = -margin;
+                ty = -margin;
+                break;
+        }
+
         boolean changed = false;
-        changed |= setIntField(pos, "gravity",
-                android.view.Gravity.BOTTOM | android.view.Gravity.RIGHT);
-        // 右下角：往屏幕内侧收 → x 为负，y 为负
-        changed |= setIntField(pos, "translationX", -margin);
-        changed |= setIntField(pos, "translationY", -margin);
+        changed |= setIntField(pos, "gravity", gravity);
+        changed |= setIntField(pos, "translationX", tx);
+        changed |= setIntField(pos, "translationY", ty);
         if (changed) {
-            LogUtil.logAlwaysOnce("rh-pos-ok",
-                    "[旋转提示] 已把系统按钮落点改到右下角 margin=" + margin);
+            LogUtil.logAlways("[旋转提示] 落点 传感器=" + sensor + " 屏幕=" + rot
+                    + " 角落=" + corner + " gravity=" + gravity
+                    + " tx=" + tx + " ty=" + ty);
         }
+
     }
 
     /** 往反射出来的 Position 上写一个 int 字段。 */
@@ -426,6 +978,11 @@ public final class RotationHint {
                 return;
             }
             sController = controller;
+            try {
+                refreshScreenRotation(sContext);
+            } catch (Throwable unused) {
+                // 拿不到就沿用缓存
+            }
             sShowMethod = null;
             sCanShowMethod = null;
             if (navBar instanceof android.view.View) {
@@ -473,7 +1030,10 @@ public final class RotationHint {
             if (sm == null) {
                 return;
             }
-            Sensor sensor = sm.getDefaultSensor(SENSOR_TYPE_DEVICE_ORIENTATION);
+            // ⚠️ 实测（2026-10-19）：type=27 device_orientation 在本机**两个实例都不工作**
+            //   （Non-wakeup 只回调一次值恒 0；Wakeup 也只回调一次，转动后不报）。
+            //   只有加速度计能持续上报，所以优先用它。
+            Sensor sensor = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
             if (sensor == null) {
                 // 退回加速度计，兼容没有 device_orientation 的机型
                 sensor = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
@@ -495,7 +1055,7 @@ public final class RotationHint {
                 @Override
                 public void onAccuracyChanged(Sensor sensor2, int accuracy) {
                 }
-            }, sensor, SensorManager.SENSOR_DELAY_NORMAL);
+            }, sensor, SensorManager.SENSOR_DELAY_UI);
             sSensorRegistered = true;
             LogUtil.logAlways("[旋转提示] 已注册方向传感器: " + sensor.getName()
                     + "（type=" + sensor.getType() + "）");
@@ -520,10 +1080,8 @@ public final class RotationHint {
             return;
         }
         int degrees;
-        if (event.sensor.getType() == SENSOR_TYPE_DEVICE_ORIENTATION) {
-            degrees = normalizeDegrees((int) v[0]);
-        } else {
-            // 加速度计：用 x/y 分量反推设备倾斜方向
+        if (event.sensor.getType() == Sensor.TYPE_ACCELEROMETER) {
+            // 重力分量反推设备姿态：v[0]=x、v[1]=y（竖立时 y≈+9.8）
             if (v.length < 2) {
                 return;
             }
@@ -532,6 +1090,8 @@ public final class RotationHint {
                 angle += 360;
             }
             degrees = normalizeDegrees((int) Math.round(angle / 90.0) * 90);
+        } else {
+            degrees = normalizeDegrees((int) v[0]);
         }
 
         final int target = degreesToSurfaceRotation(degrees);
@@ -540,6 +1100,25 @@ public final class RotationHint {
         }
         // 去抖：传感器很灵敏，转动过程中会连续上报；延时后再判断，
         // 只按「停稳后的方向」决定弹不弹。
+        // ⭐ 记录传感器方向，供落点使用（纯传感器驱动）
+        if (sSensorTargetRotation != target) {
+            sSensorTargetRotation = target;
+            LogUtil.logAlways("[旋转提示] 传感器方向=" + target);
+            // calculatePosition 只在按钮**首次显示**时被调用一次，
+            // 之后方向变了系统不会重算 —— 所以主动用系统自己的
+            // setRotateSuggestionButtonState 收→显一次，逼它重走布局，
+            // 届时 calculatePosition 会按新的传感器方向给出落点。
+            // ⚠️ 只用这个方法，**绝不碰 LayoutParams / updateViewLayout**（那会崩溃）。
+            sMain.post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        relocate();
+                    } catch (Throwable unused) {
+                    }
+                }
+            });
+        }
         sMain.removeCallbacksAndMessages(BOUNCE_TOKEN);
         sMain.postDelayed(new Runnable() {
             @Override
@@ -640,6 +1219,28 @@ public final class RotationHint {
     }
 
     /** 当前屏幕的 Surface 旋转值；拿不到返回 -1。 */
+    /** 刷新「SystemUI 所在屏」的旋转方向（用 DisplayManager，比 getDefaultDisplay 稳）。 */
+    private static void refreshScreenRotation(Context ctx) {
+        try {
+            android.hardware.display.DisplayManager dm =
+                    (android.hardware.display.DisplayManager)
+                            ctx.getSystemService(Context.DISPLAY_SERVICE);
+            if (dm == null) {
+                return;
+            }
+            android.view.Display d = dm.getDisplay(android.view.Display.DEFAULT_DISPLAY);
+            if (d != null) {
+                int now = d.getRotation();
+                if (sScreenRotation != now) {
+                    sScreenRotation = now;
+                    LogUtil.logAlways("[旋转提示] 屏幕方向=" + now);
+                }
+            }
+        } catch (Throwable unused) {
+            // 拿不到就沿用缓存
+        }
+    }
+
     private static int currentSurfaceRotation(Context ctx) {
         try {
             android.view.WindowManager wm =
