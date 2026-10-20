@@ -1189,23 +1189,6 @@ public class MainHook extends XposedModule {
     }
 
     /* JADX INFO: Access modifiers changed from: private */
-    /**
-     * 内屏固定横屏（摄像头右上角）。
-     *
-     * <p>用户 2026-10-20：「当自动旋转是关闭的时候，展开内屏就固定在这个状态」。
-     *
-     * <p>实现：开关打开 + 系统自动旋转关闭 + 当前处于内屏时，
-     * 把 {@code user_rotation} 写成 {@link Constants#INNER_FIXED_ROTATION}（270°，
-     * 实测内屏挖孔落在右侧 = 摄像头在右上角）。
-     *
-     * <p>两个前置判断的理由：
-     * <ul>
-     *   <li>自动旋转开着时系统自己管方向，我们再写 {@code user_rotation}
-     *       会和用户手动转动打架；</li>
-     *   <li>外屏不该被这条规则影响（本机内屏短边 1672、外屏 1168，
-     *       用短边 ≥1500 区分）。</li>
-     * </ul>
-     */
     // ============================================================
     // 内屏固定横屏 —— 状态机版
     //
@@ -1228,6 +1211,8 @@ public class MainHook extends XposedModule {
     private static volatile int sSavedUserInner = -1;
     /** 模块当前是否持有「未还原的改动」。 */
     private static volatile boolean sHasPendingChange = false;
+    /** 是否正处于「展开后跟随」的 5 秒窗口内 —— 期间不再重复触发，否则会把计时器重置。 */
+    private static volatile boolean sFollowing = false;
 
     /**
      * 检查用户是否在这期间**手动改过**设置。
@@ -1283,8 +1268,7 @@ public class MainHook extends XposedModule {
                 return;
             }
             if (sSavedAutoInner >= 0) {
-                android.provider.Settings.System.putInt(
-                        cr, "accelerometer_rotation_inner", sSavedAutoInner);
+                callWindowManagerRotation(sSavedAutoInner == 0);
                 LogUtil.logAlways("[内屏固定] 已还原自动旋转锁定=" + sSavedAutoInner);
             }
             if (sSavedUserInner >= 0) {
@@ -1304,6 +1288,97 @@ public class MainHook extends XposedModule {
         sInnerWrittenAuto = -1;
         sInnerWrittenUser = -1;
         sHasPendingChange = false;
+        sFollowing = false;
+    }
+
+    /**
+     * 调系统的折叠屏旋转锁定接口。
+     *
+     * <p>2026-10-20 实测 IWindowManager 可用方向方法：
+     * <pre>
+     *   setRotationLockForFold(boolean, int, boolean)   ← 折叠屏专用
+     *   freezeRotation(int, String)
+     *   thawRotation(String)
+     * </pre>
+     *
+     * <p>为什么不直接写 {@code Settings.System}：
+     * WMS 的 {@code mUserRotationInner} 完全不跟随设置写入，
+     * 锁定后会翻到 180°（摄像头在底部）。
+     */
+    private static Object getWindowManagerService() {
+        try {
+            Class<?> sm = Class.forName("android.os.ServiceManager");
+            java.lang.reflect.Method getService =
+                    sm.getDeclaredMethod("getService", String.class);
+            getService.setAccessible(true);
+            Object binder = getService.invoke(null, "window");
+            if (binder == null) {
+                return null;
+            }
+            Class<?> stub = Class.forName("android.view.IWindowManager$Stub");
+            java.lang.reflect.Method asInterface =
+                    stub.getDeclaredMethod("asInterface", android.os.IBinder.class);
+            asInterface.setAccessible(true);
+            return asInterface.invoke(null, binder);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[内屏固定] 取 IWindowManager 失败: " + th);
+            return null;
+        }
+    }
+
+    private static boolean callWindowManagerRotation(boolean locked) {
+        // ① 首选：折叠屏专用接口
+        try {
+            Object wm = getWindowManagerService();
+            if (wm != null) {
+                java.lang.reflect.Method m =
+                        wm.getClass().getMethod("setRotationLockForFold",
+                                boolean.class, int.class, boolean.class);
+                m.setAccessible(true);
+                // ✅ 2026-10-20 用 app_process 直接调用 WMS 实测确认：
+                //   第三个参数（isFold）语义：
+                //     true  → 操作**外屏**（mUserRotationModeOuter）
+                //     false → 操作**内屏**（mUserRotationModeInner）
+                //
+                //   实测记录：
+                //     setRotationLockForFold(false, -1, false)
+                //       → Inner: LOCKED → FREE（解除锁定）✅
+                //     setRotationLockForFold(true, -1, false)
+                //       → Inner: FREE → LOCKED，且锁在 ROTATION_270（当前方向）✅
+                //     Outer 全程不受影响 ✅
+                //
+                //   所以锁内屏必须传 false。
+                m.invoke(wm, locked, -1, false);
+                LogUtil.logAlways("[内屏固定] setRotationLockForFold("
+                        + locked + ", -1, false) 调用成功（目标=内屏）");
+                return true;
+            }
+        } catch (Throwable th) {
+            LogUtil.logAlways("[内屏固定] setRotationLockForFold 失败: " + th);
+        }
+        // ② 次选：freeze / thaw
+        try {
+            Object wm = getWindowManagerService();
+            if (wm == null) {
+                return false;
+            }
+            if (locked) {
+                java.lang.reflect.Method m =
+                        wm.getClass().getMethod("freezeRotation", int.class, String.class);
+                m.setAccessible(true);
+                m.invoke(wm, -1, "HyperOSGlass");
+            } else {
+                java.lang.reflect.Method m =
+                        wm.getClass().getMethod("thawRotation", String.class);
+                m.setAccessible(true);
+                m.invoke(wm, "HyperOSGlass");
+            }
+            LogUtil.logAlways("[内屏固定] freeze/thawRotation → " + locked);
+            return true;
+        } catch (Throwable th) {
+            LogUtil.logAlways("[内屏固定] freeze/thawRotation 失败: " + th);
+        }
+        return false;
     }
 
     static void applyInnerFixedLandscape() {
@@ -1376,9 +1451,9 @@ public class MainHook extends XposedModule {
                 // ── 开关关：设为横屏并锁定（合上时还原）──
                 sSavedAutoInner = autoNow;
                 sSavedUserInner = userNow;
-                android.provider.Settings.System.putInt(
-                        cr, KEY_USER, Constants.INNER_FIXED_ROTATION);
-                android.provider.Settings.System.putInt(cr, KEY_AUTO, 0);
+                // 📌 2026-10-20：改用系统的旋转锁定接口，而不是直接写设置
+                //    （写设置 WMS 不跟随，会锁到错误方向）
+                callWindowManagerRotation(true);
                 sInnerWrittenUser = Constants.INNER_FIXED_ROTATION;
                 sInnerWrittenAuto = 0;
                 sHasPendingChange = true;
@@ -1388,13 +1463,22 @@ public class MainHook extends XposedModule {
             }
 
             // ── 开关开：解除锁定 → 5 秒 → 恢复锁定 ──
+            // ⚠️ 2026-10-20 实测问题：applyInnerFixedLandscape() 会被多个入口
+            //   （DisplayListener、亮屏、配置变化）连续调用，导致「解除锁定」
+            //   被重复执行、计时器被重置，用户感觉不到 5 秒。
+            //   所以用 sFollowing 标记：一旦进入跟随窗口，期间直接忽略。
+            if (sFollowing) {
+                LogUtil.logAlways("[内屏固定] 正在跟随中，忽略重复触发");
+                return;
+            }
             if (autoNow != 0) {
                 LogUtil.logAlways("[内屏固定] 内屏本来就是自动旋转，不干预");
                 return;
             }
+            sFollowing = true;
             sSavedAutoInner = autoNow;
             sSavedUserInner = -1;          // 方向值不动，只动锁定开关
-            android.provider.Settings.System.putInt(cr, KEY_AUTO, 1);
+            callWindowManagerRotation(false);
             sInnerWrittenAuto = 1;
             sInnerWrittenUser = -1;
             sHasPendingChange = true;
@@ -1413,7 +1497,8 @@ public class MainHook extends XposedModule {
                             clearPendingChange();
                             return;
                         }
-                        android.provider.Settings.System.putInt(crF, KEY_AUTO, 0);
+                        callWindowManagerRotation(true);
+                        sFollowing = false;
                         LogUtil.logAlways("[内屏固定] 5 秒到，已恢复旋转锁定");
                         // 锁定值就是我们写进去的那个（0），无需再还原
                         clearPendingChange();
