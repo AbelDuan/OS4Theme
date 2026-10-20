@@ -219,7 +219,24 @@ public final class Constants {
      * </pre>
      * 所以取 3（即 ROTATION_270）。
      */
-    public static final int INNER_FIXED_ROTATION = 3;    /** 两侧最小留白 48dp，避免顶到物理边缘（折叠屏边缘有弧度） */
+    public static final int INNER_FIXED_ROTATION = 3;
+
+    /**
+     * 内屏展开时联动自动旋转（用户 2026-10-20 要求）。
+     *
+     * <p>开关语义：
+     * <ul>
+     *   <li><b>关</b>：展开内屏 → 直接设成横屏（摄像头右上角）并保持锁定。</li>
+     *   <li><b>开</b>：展开时若内屏**已锁定方向**，则先打开自动旋转，
+     *       跟随传感器 3 秒，3 秒后把当时的方向重新锁定下来；
+     *       若内屏本来就是自动旋转状态，则不做任何额外动作。</li>
+     * </ul>
+     */
+    public static final String PREFS_INNER_FOLLOW_ROTATION = "inner_follow_rotation";
+    public static final boolean DEFAULT_INNER_FOLLOW_ROTATION = false;
+
+    /** 开启联动时，跟随传感器的时长（毫秒）。 */
+    public static final long INNER_FOLLOW_DURATION_MS = 5000L;    /** 两侧最小留白 48dp，避免顶到物理边缘（折叠屏边缘有弧度） */
     public static final int NOTIF_WIDTH_MARGIN_DP = 48;
 
     /**
@@ -381,6 +398,6 @@ public final class Constants {
     public static final String PREFS_NOTIF_IMPORTANCE = "notif_importance";
     // ⚠️ 这两个数组必须**同序同长**：reloadPrefs 与 StatusProvider 都按下标一一对应取值。
     //    新增开关只能往**末尾追加**，不可插队（v3.41.2 追加了通知宽度总开关）。
-    public static final String[] ALL_PREF_KEYS = {PREFS_GLASS_ENABLED, PREFS_FOCUS_GLASS, PREFS_AOD_BATTERY_SYNC, PREFS_PIN_GLASS, PREFS_NO_FOLD_HISTORY, PREFS_SINK_ENABLED, PREFS_NO_NOTIF_LIMIT, PREFS_KEEP_NOTIF, PREFS_HIDE_BT_UNLOCK, PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_ALLOW_MANAGE_ALL, PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE, PREFS_ENABLE_LOG, PREFS_NOTIF_IMPORTANCE, PREFS_NOTIF_WIDTH_ENABLE, PREFS_ROTATION_HINT, PREFS_INNER_FIXED_LANDSCAPE};
-    public static final boolean[] ALL_PREF_DEFAULTS = {true, true, true, true, true, false, true, true, true, true, true, true, false, true, true, false, true, false, false, false};
+    public static final String[] ALL_PREF_KEYS = {PREFS_GLASS_ENABLED, PREFS_FOCUS_GLASS, PREFS_AOD_BATTERY_SYNC, PREFS_PIN_GLASS, PREFS_NO_FOLD_HISTORY, PREFS_SINK_ENABLED, PREFS_NO_NOTIF_LIMIT, PREFS_KEEP_NOTIF, PREFS_HIDE_BT_UNLOCK, PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_ALLOW_MANAGE_ALL, PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE, PREFS_ENABLE_LOG, PREFS_NOTIF_IMPORTANCE, PREFS_NOTIF_WIDTH_ENABLE, PREFS_ROTATION_HINT, PREFS_INNER_FIXED_LANDSCAPE, PREFS_INNER_FOLLOW_ROTATION};
+    public static final boolean[] ALL_PREF_DEFAULTS = {true, true, true, true, true, false, true, true, true, true, true, true, false, true, true, false, true, false, false, false, false};
 }

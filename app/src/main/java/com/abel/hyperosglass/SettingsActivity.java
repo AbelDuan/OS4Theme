@@ -356,6 +356,9 @@ public class SettingsActivity extends Activity {
         addSwitch(linearLayoutRotationHint, "内屏固定横屏（摄像头在右上角）",
                 Constants.PREFS_INNER_FIXED_LANDSCAPE,
                 Constants.DEFAULT_INNER_FIXED_LANDSCAPE);
+        addSwitch(linearLayoutRotationHint, "展开时联动自动旋转（跟随 5 秒后锁定）",
+                Constants.PREFS_INNER_FOLLOW_ROTATION,
+                Constants.DEFAULT_INNER_FOLLOW_ROTATION);
         linearLayout.addView(linearLayoutRotationHint, cardLp());
 
         LinearLayout linearLayoutNewCard7 = newCard();
