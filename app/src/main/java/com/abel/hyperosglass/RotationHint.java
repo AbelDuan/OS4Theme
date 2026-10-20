@@ -569,11 +569,27 @@ public final class RotationHint {
         // 边距：直接用系统实测值（本机四组：69/80/68/80，量级一致）。
         // 用 16dp ≈ 34px 会略小于系统值，但仍在 192px 容器内、不会裁切；
         // 想要和系统原生完全一致可改成 69/80，这里取一个统一的安全值。
+        // ⚠️ 位移量必须**同时满足两个约束**：
+        //   ① 不超出按钮所在容器的可移动空间；
+        //   ② 与系统原生边距接近，视觉才协调。
+        //
+        //   容器实测固定 192px、按钮 112px，可移动空间只有
+        //   (192 - 112) / 2 = 40px —— 超过就会被容器裁掉。
+        //   之前写死 30dp：内屏 density=2.16 → 65px（已超出 40，勉强可见），
+        //   外屏 density=2.75 → **82px**，超出太多 → 按钮被裁切。
+        //   所以这里按 40px 硬上限夹取，并留一点余量。
+        final int CONTAINER_SLACK_PX = 40;
         int margin;
         try {
-            margin = (int) (30 * ctx.getResources().getDisplayMetrics().density);
+            margin = (int) (20 * ctx.getResources().getDisplayMetrics().density);
+            if (margin > CONTAINER_SLACK_PX) {
+                margin = CONTAINER_SLACK_PX;
+            }
+            if (margin < 12) {
+                margin = 12;
+            }
         } catch (Throwable unused) {
-            margin = 65;
+            margin = 40;
         }
 
         // ⚠️ gravity 与 translation **必须成对设置**！

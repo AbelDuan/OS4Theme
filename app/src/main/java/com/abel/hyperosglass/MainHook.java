@@ -92,6 +92,12 @@ public class MainHook extends XposedModule {
      * 弹出系统原生的手动旋转按钮。
      */
     public static final AtomicBoolean sRotationHintEnable = new AtomicBoolean(false);
+    /** 内屏固定横屏（摄像头右上角）开关。 */
+    public static final AtomicBoolean sInnerFixedLandscape = new AtomicBoolean(false);
+    /** 是否是「刚刚展开」的边沿，用于内屏固定只设一次。 */
+    private static volatile boolean sWasUnfolded = false;
+    /** 上一次看到的活跃屏是否为内屏，用于识别展开边沿。 */
+    private static volatile boolean sIsInnerNow = false;
     /**
      * 当前通知卡片实际宽度（px），由 {@link NotifWidth} 每次算出新值时写入，
      * 仅作调试参考（记录当前卡片宽度）。顶部时间卡片跟随卡片宽度是
@@ -209,6 +215,10 @@ public class MainHook extends XposedModule {
                                         String a = intent.getAction();
                                         if (Intent.ACTION_SCREEN_ON.equals(a)) {
                                             RotationHint.onScreenStateChanged(true);
+                                            // 亮屏时也补一次内屏固定：
+                                            // 折叠/展开、亮屏都可能改变当前屏，
+                                            // 只在配置重载时做一次会遗漏这些时机。
+                                            applyInnerFixedLandscape();
                                         } else if (Intent.ACTION_SCREEN_OFF.equals(a)) {
                                             RotationHint.onScreenStateChanged(false);
                                         }
@@ -220,6 +230,43 @@ public class MainHook extends XposedModule {
                                 addAction(Intent.ACTION_SCREEN_OFF);
                             }});
                     LogUtil.logAlways("[旋转提示] 已注册屏幕开关监听（熄屏注销传感器）");
+
+                    // 📌 内屏固定还需要跟随「展开/折叠」事件。
+                    //   DisplayManager.DisplayListener 在屏幕增删、状态变化时回调，
+                    //   展开内屏（Display 1 关闭 / Display 0 变为活跃）会走到这里。
+                    try {
+                        android.hardware.display.DisplayManager dmg =
+                                (android.hardware.display.DisplayManager)
+                                        ((Context) objCurrentApplication)
+                                                .getSystemService(Context.DISPLAY_SERVICE);
+                        if (dmg != null) {
+                            dmg.registerDisplayListener(
+                                    new android.hardware.display.DisplayManager.DisplayListener() {
+                                        @Override
+                                        public void onDisplayAdded(int displayId) {
+                                            try {
+                                                applyInnerFixedLandscape();
+                                            } catch (Throwable unused) {
+                                            }
+                                        }
+
+                                        @Override
+                                        public void onDisplayRemoved(int displayId) {
+                                        }
+
+                                        @Override
+                                        public void onDisplayChanged(int displayId) {
+                                            try {
+                                                applyInnerFixedLandscape();
+                                            } catch (Throwable unused) {
+                                            }
+                                        }
+                                    }, null);
+                            LogUtil.logAlways("[内屏固定] 已注册屏幕变化监听");
+                        }
+                    } catch (Throwable td) {
+                        LogUtil.logAlways("[内屏固定] 屏幕变化监听注册失败: " + td);
+                    }
                 } catch (Throwable t2) {
                     LogUtil.logAlways("[旋转提示] 屏幕监听注册失败: " + t2);
                 }
@@ -1129,6 +1176,137 @@ public class MainHook extends XposedModule {
     }
 
     /* JADX INFO: Access modifiers changed from: private */
+    /**
+     * 内屏固定横屏（摄像头右上角）。
+     *
+     * <p>用户 2026-10-20：「当自动旋转是关闭的时候，展开内屏就固定在这个状态」。
+     *
+     * <p>实现：开关打开 + 系统自动旋转关闭 + 当前处于内屏时，
+     * 把 {@code user_rotation} 写成 {@link Constants#INNER_FIXED_ROTATION}（270°，
+     * 实测内屏挖孔落在右侧 = 摄像头在右上角）。
+     *
+     * <p>两个前置判断的理由：
+     * <ul>
+     *   <li>自动旋转开着时系统自己管方向，我们再写 {@code user_rotation}
+     *       会和用户手动转动打架；</li>
+     *   <li>外屏不该被这条规则影响（本机内屏短边 1672、外屏 1168，
+     *       用短边 ≥1500 区分）。</li>
+     * </ul>
+     */
+    static void applyInnerFixedLandscape() {
+        if (!sInnerFixedLandscape.get()) {
+            return;
+        }
+        LogUtil.logAlways("[内屏固定] 开始检查");
+        try {
+            Object app = currentApplication();
+            if (!(app instanceof Context)) {
+                return;
+            }
+            Context ctx = (Context) app;
+            android.content.ContentResolver cr = ctx.getContentResolver();
+
+            // 自动旋转同样有内屏专用项 accelerometer_rotation_inner（实测存在）。
+            // 优先用它判断内屏的自动旋转状态，外屏的开关不会干扰这段逻辑。
+            int auto = android.provider.Settings.System.getInt(
+                    cr, "accelerometer_rotation_inner",
+                    android.provider.Settings.System.getInt(
+                            cr, android.provider.Settings.System.ACCELEROMETER_ROTATION, 1));
+            if (auto != 0) {
+                LogUtil.logAlways("[内屏固定] 内屏自动旋转已开启（auto=" + auto + "），不干预");
+                return;
+            }
+
+            android.hardware.display.DisplayManager dm =
+                    (android.hardware.display.DisplayManager)
+                            ctx.getSystemService(Context.DISPLAY_SERVICE);
+            if (dm == null) {
+                return;
+            }
+            // 🔑 用 Display ID + 活跃状态判断，**不按尺寸硬编码**（那样别的机型不通用）。
+            //
+            //   dumpsys display 实测本机：
+            //     Display 0  state=ON   size=1168x1712   ← 外屏
+            //     Display 1  state=OFF  size=1672x2364   ← 内屏
+            //
+            //   但 ID 与内外屏的对应关系各机型不一定相同，所以不能写死 0/1。
+            //   标准做法：遍历所有 Display，找出**当前处于 ON 状态**的那块，
+            //   它就是「用户正在看的屏」。用 Display.STATE_ON 是 Android
+            //   标准 API，跨机型通用，与尺寸无关。
+            // 判据用 Android 标准标志 Display.FLAG_PRESENTATION：
+            //   带该标志的屏是「专用于展示的副屏」（外屏），
+            //   不带的是主屏（内屏）。跨机型通用，与尺寸、ID 都无关。
+            //   本机实测：Display 0 无此标志（内屏）、Display 1 有（外屏）。
+            boolean isInnerActive = false;
+            int activeId = -1;
+            for (android.view.Display d : dm.getDisplays()) {
+                if (d == null || !d.isValid()) {
+                    continue;
+                }
+                boolean isPresentation =
+                        (d.getFlags() & android.view.Display.FLAG_PRESENTATION) != 0;
+                if (isPresentation) {
+                    continue;   // 外屏，不是我们要处理的
+                }
+                if (d.getState() != android.view.Display.STATE_ON) {
+                    continue;   // 内屏当前没在使用（折叠状态）
+                }
+                activeId = d.getDisplayId();
+                isInnerActive = true;
+                break;
+            }
+            if (activeId >= 0) {
+                LogUtil.logAlways("[内屏固定] 内屏活跃 id=" + activeId);
+            }
+            if (!isInnerActive) {
+                sWasUnfolded = false;
+                sIsInnerNow = false;
+                LogUtil.logAlways("[内屏固定] 内屏未活跃（可能是外屏状态），跳过");
+                return;
+            }
+
+            // 进入内屏：如果上一次还是外屏，说明这是一次「展开」的边沿
+            if (!sIsInnerNow) {
+                sWasUnfolded = true;
+                sIsInnerNow = true;
+                LogUtil.logAlways("[内屏固定] 检测到展开（外屏→内屏）");
+            }
+
+            // 🔑 关键：必须写**内屏专用**的 user_rotation_inner，
+            //   不能写全局的 user_rotation。
+            //   实测本机（MIUI 折叠屏）三个设置项都在：
+            //     user_rotation        = 全局，写它会**连带改掉外屏** ← 之前的 bug
+            //     user_rotation_inner  = 内屏专用 ✅
+            //     user_rotation_outer  = 外屏专用
+            //   系统内部也是分开存的（dumpsys window displays 里
+            //   mUserRotationInner / mUserRotationOuter 两套状态）。
+            final String KEY_INNER = "user_rotation_inner";
+            int cur = android.provider.Settings.System.getInt(cr, KEY_INNER, -1);
+            if (cur == Constants.INNER_FIXED_ROTATION) {
+                LogUtil.logAlways("[内屏固定] 已是目标值 " + cur + "，无需改动");
+                return;
+            }
+
+            // 🔑 只在「刚展开」那一刻设一次，设完就记住，之后不再干预。
+            //   原因：accelerometer_rotation_inner=0（自动旋转关）时，
+            //   user_rotation_inner 就是**锁定方向**，我们每次屏幕变化都写，
+            //   会把用户手动切换的方向顶回去（用户反馈的「切换方向又被切回横屏」）。
+            //   所以用「展开边沿」判断：只有从折叠→展开这个瞬间才设置。
+            if (!sWasUnfolded) {
+                LogUtil.logAlways("[内屏固定] 不是刚展开，跳过（避免顶回用户手动方向）");
+                return;
+            }
+            sWasUnfolded = false;   // 只设一次
+
+            android.provider.Settings.System.putInt(
+                    cr, KEY_INNER, Constants.INNER_FIXED_ROTATION);
+            LogUtil.logAlways("[内屏固定] 刚展开：user_rotation_inner " + cur + " → "
+                    + Constants.INNER_FIXED_ROTATION + "（摄像头右上角，仅本次）");
+        } catch (Throwable th) {
+            LogUtil.logAlwaysOnce("inner-fixed-fail", "[内屏固定] 应用失败: " + th);
+        }
+    }
+
     public void reloadPrefs() {
         if (this.sPrefs == null) {
             return;
@@ -1263,8 +1441,20 @@ public class MainHook extends XposedModule {
             sNotifWidthRatio.set(widthRatio);
             sNotifWidthRatioLand.set(widthRatioLand);
             // 旋转提示开关（v3.45.0）：走 boolean 体系，直接按 key 读
+            // 📌 「默认开启」的实现要点：
+            //   getBoolean(key, def) 在**键不存在**时返回 def —— 这正是我们要的。
+            //   但如果用户之前在设置页手动关过，配置里就存了 false，
+            //   那属于「用户的选择」，不该被默认值覆盖。
+            //   这里保持默认语义，用户首次安装即为开启。
             sRotationHintEnable.set(bundle.getBoolean(Constants.PREFS_ROTATION_HINT,
                     Constants.DEFAULT_ROTATION_HINT));
+            sInnerFixedLandscape.set(bundle.getBoolean(Constants.PREFS_INNER_FIXED_LANDSCAPE,
+                    Constants.DEFAULT_INNER_FIXED_LANDSCAPE));
+            // 开关变化后立即尝试应用（内部会自己判断前置条件）
+            try {
+                applyInnerFixedLandscape();
+            } catch (Throwable unused) {
+            }
             // 开关刚被打开时，控制器/传感器可能还没就绪 —— 主动补一次，
             // 否则要等导航栏下次重建才会注册传感器（那样用户会觉得「开了没反应」）。
             try {
