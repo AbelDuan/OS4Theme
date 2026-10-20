@@ -1250,7 +1250,7 @@ public class MainHook extends XposedModule {
     private static volatile int sInnerWrittenUser = -1;
 
     /**
-     * 还原模块做过的改动。
+     * 合上时的收尾：取消计时器 → 固定恢复为「锁定 + 270°」→ 清空状态。
      *
      * @param force 合上屏幕时为 true —— 此时**不做**用户改动检测之外的额外判断，
      *              但仍尊重用户手动改过的值（优先级：合上 > 手动 > 自动还原，
@@ -1261,25 +1261,38 @@ public class MainHook extends XposedModule {
             return;
         }
         try {
-            // 合上屏幕时：按用户要求「不再做调整」，但**已经施加的改动要还原**，
-            // 除非用户在这期间手动改过（那就尊重用户）。
-            if (wasChangedByUser(cr)) {
+            // 合上屏幕（force=true）：用户明确要求「处理干净」——
+            //   无条件恢复为「锁定 + 270°」，不再做用户手动改动检测。
+            //   （展开期间的手动改动检测仍保留在 5 秒计时器那条路径里）
+            if (!force && wasChangedByUser(cr)) {
                 clearPendingChange();
                 return;
             }
-            if (sSavedAutoInner >= 0) {
-                callWindowManagerRotation(sSavedAutoInner == 0);
-                LogUtil.logAlways("[内屏固定] 已还原自动旋转锁定=" + sSavedAutoInner);
-            }
-            if (sSavedUserInner >= 0) {
-                android.provider.Settings.System.putInt(
-                        cr, "user_rotation_inner", sSavedUserInner);
-                LogUtil.logAlways("[内屏固定] 已还原方向=" + sSavedUserInner);
-            }
+            // 📌 用户 2026-10-20 明确要求：
+            //   「需要在合上屏幕后，恢复之前的方向锁定 + 屏幕方向设置为摄像头在右上角，
+            //     关闭 5 秒计时器。处理干净」
+            //
+            //   所以合上时不是简单回退到「展开前的任意状态」，而是**固定恢复成
+            //   内屏锁 270°（摄像头右上角）** —— 这也正是本功能的目标状态。
+            //   实测 ROTATION_270 的内屏挖孔在右侧（insets=[0,0][140,43]）。
+            android.provider.Settings.System.putInt(
+                    cr, "user_rotation_inner", Constants.INNER_FIXED_ROTATION);
+            callWindowManagerRotation(true);   // 锁定内屏
+            LogUtil.logAlways("[内屏固定] 已合上：恢复为锁定 + 方向 "
+                    + Constants.INNER_FIXED_ROTATION + "（摄像头右上角）");
         } catch (Throwable th) {
             LogUtil.logAlways("[内屏固定] 还原失败: " + th);
         }
         clearPendingChange();
+    }
+
+    /** 取消悬挂中的 5 秒跟随计时器，并清掉跟随标记。 */
+    private static void cancelFollowTimer() {
+        try {
+            sInnerHandler.removeCallbacksAndMessages(null);
+        } catch (Throwable unused) {
+        }
+        sFollowing = false;
     }
 
     private static void clearPendingChange() {
@@ -1426,6 +1439,12 @@ public class MainHook extends XposedModule {
                 }
                 sWasUnfolded = false;
                 sIsInnerNow = false;
+                // 🔑 必须先把 5 秒计时器取消掉！
+                //   用户 2026-10-20 反馈：连续「开屏→关屏→开屏」且都在 5 秒内时，
+                //   第二次开屏会**立刻被锁定** —— 因为第一次的计时器还挂在那里，
+                //   到点就把刚解锁的状态又锁回去了。
+                //   所以合上时：撤销所有待执行任务 + 清状态标记 + 还原原值。
+                cancelFollowTimer();
                 restoreInnerChanges(cr, true);
                 return;
             }
