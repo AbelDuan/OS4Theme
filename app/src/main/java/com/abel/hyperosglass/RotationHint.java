@@ -145,7 +145,17 @@ public final class RotationHint {
      * 快速转动时传感器会途经中间方向（0→90→180），
      * 计数会被反复重置，导致按钮停在旧位置不动。
      */
-    private static final long STABLE_MS = 800L;
+    /**
+     * 稳态时长。
+     *
+     * <p>2026-10-22 实测（baselines/rotation-timing-20261022.log）：
+     * 取 800ms 时，从「传感器方向变化」到「旋钮真正出现」的实测延迟是
+     * <b>中位数 862ms、全部样本落在 855–874ms</b> —— 完全是这个常量决定的，
+     * 没有方向差异（270° 的中位数 844ms 反而更快，只是有两次异常值拉高了均值）。
+     *
+     * <p>用户要的原始值是 500ms，延迟会降到约 560ms。
+     */
+    private static final long STABLE_MS = 500L;
     /** 当前候选方向。 */
     private static volatile int sStableTarget = -1;
     /**
