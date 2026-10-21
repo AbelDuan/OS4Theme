@@ -1281,6 +1281,11 @@ public class MainHook extends XposedModule {
         }
     }
 
+    /** 供 RotationHint 的按钮点击使用。 */
+    static Object getWindowManagerServicePublic() {
+        return getWindowManagerService();
+    }
+
     private static boolean callWindowManagerRotation(boolean locked) {
         // ① 首选：折叠屏专用接口
         try {

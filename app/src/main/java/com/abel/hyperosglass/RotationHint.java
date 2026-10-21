@@ -110,6 +110,56 @@ public final class RotationHint {
 
     /** 传感器是否已注册 */
     private static volatile boolean sSensorRegistered;
+    /**
+     * 最近一次检测到「设备在运动」的时刻。
+     *
+     * <p>2026-10-22 用户建议：
+     * <b>「如果是因为传感器效率的问题，给传感器增加一个短时间的轮询也可以，
+     * 比如我们是 500ms 去决定方向，那么就进行环境内的轮询」</b>。
+     *
+     * <p>为什么需要它：{@code TYPE_DEVICE_ORIENTATION} 是 <b>on-change</b> 传感器，
+     * 只在方向跨过边界时上报一次。实测高强度快速旋转时，两次上报间隔能到 3 秒以上，
+     * 中间无论怎么转都不会有事件 —— 按钮就停在旧角度不动。
+     *
+     * <p>所以额外挂一路 <b>加速度计</b>（连续型，10Hz）只做一件事：
+     * 判断设备是不是还在动。只要在动，按钮就收起、并推迟显示判定。
+     */
+    /** 上次安排显示判定的时刻，避免高频重排导致「永远不显示」。 */
+    private static volatile long sLastScheduleAt = 0L;
+
+    // ── 重力轮询（持续型，10Hz）──────────────────────────────────────
+    //  2026-10-22 用户实测：TYPE_DEVICE_ORIENTATION 是 on-change 类型，
+    //  实测会出现「卡在某个方向、转到其他三个方向都没反应，
+    //  必须再路过那个方向才解锁」—— 因为期间传感器一个事件都不发。
+    //
+    //  所以额外挂一路持续型的重力传感器，用标准公式自己算设备朝向：
+    //      roll = atan2(gx, gy)          // 设备绕屏幕法线的转角
+    //      rotation = (round(roll/90) + 4) % 4
+    //  验证：roll 0→0、-90→3(270)、180→2、+90→1(90)，与 Android 定义一致。
+    //
+    //  为避免抖动，要求**连续 3 次（约 300ms）算出同一方向**才采纳。
+    private static volatile float sLastGx = 0f;
+    private static volatile float sLastGy = 0f;
+    /** 方向传感器最后一次上报的时刻。轮询只在它沉默时兜底。 */
+    private static volatile long sLastSensorReportAt = 0L;
+    private static volatile int sPendingAccelRotation = -1;
+    private static volatile int sAccelSameCount = 0;
+    private static volatile SensorEventListener sAccelListener;
+    /** 轮询的兜底停止任务（单例，避免累积）。 */
+    private static final Runnable sPollStopTask = new Runnable() {
+        @Override
+        public void run() {
+            stopGravityPolling();
+        }
+    };
+    private static volatile float sLastGz = 0f;
+    /** 最近一次检测到运动的时刻（用于判断「这一轮旋转是否结束」）。 */
+    private static volatile long sLastMotionAt = 0L;
+    /** 运动判定阈值（三轴变化量之和）。取值教训见下：太小会被噪声一直触发。 */
+    private static final float MOTION_THRESHOLD = 3.5f;
+
+
+
     /** 已注册的传感器监听器与 SensorManager，用于注销（省电）。 */
     private static volatile SensorEventListener sListener;
     private static volatile SensorManager sSensorMgr;
@@ -155,7 +205,20 @@ public final class RotationHint {
      *
      * <p>用户要的原始值是 500ms，延迟会降到约 560ms。
      */
-    private static final long STABLE_MS = 500L;
+    /**
+     * 稳态时长。
+     *
+     * <p>2026-10-22 用户实测反馈「多转几次后延迟比较高，跟不上传感器」。
+     *
+     * <p>关键认识：{@code TYPE_DEVICE_ORIENTATION} 是 on-change 传感器，
+     * <b>它上报一次就代表方向已经跨过边界、进入新的一格</b>，
+     * 连续上报说明人还在转。所以这里的等待只需要覆盖「连续上报之间的间隔」，
+     * 用来防止转动过程中按钮乱闪，不需要等很久。
+     *
+     * <p>取值过程：800 → 500 → 380 → <b>180</b>。
+     * 180ms 足以滤掉转动过程中的连续上报，又不至于让人觉得「跟不上」。
+     */
+    private static final long STABLE_MS = 180L;
     /** 当前候选方向。 */
     private static volatile int sStableTarget = -1;
     /**
@@ -241,6 +304,14 @@ public final class RotationHint {
             //   由我们自己的稳态逻辑在 500ms 后调 setState(true)」。
             installVisibilityHook(module, cl);
 
+            // 点击旋钮 → 把屏幕转到传感器当前朝向（接受旋转建议）
+            RotationButtonOverlay.get().setOnClick(new Runnable() {
+                @Override
+                public void run() {
+                    applyRotationSuggestion();
+                }
+            });
+
             // ⚠️ 还差最后一块：上面三个回调都要等「导航栏下次动」才触发，
             //    而 SystemUI 启动后导航栏可能长时间不重建 —— 那样传感器永远注册不上。
             //    所以这里**主动去现有视图树里捞一次**（延迟几秒，等 SystemUI 建完视图）。
@@ -322,8 +393,12 @@ public final class RotationHint {
                                     // 我们自己请求的显示，直接放行
                                     return chain.proceed();
                                 }
-                                if (wantShow && MainHook.sRotationHintEnable.get()
-                                        && !isStableForShow()) {
+                                // 🔑 2026-10-22 用户反馈「偶尔弹出两个按钮」：
+                                //   原来是「未稳态才拦」，稳态达成时系统请求被放行，
+                                //   于是系统按钮和我们的自绘按钮同时出现。
+                                //   现在改为：只要模块开着，系统的按钮**一律不显示**，
+                                //   旋转提示完全由自绘悬浮窗负责。
+                                if (wantShow && MainHook.sRotationHintEnable.get()) {
                                     // ⚠️ 2026-10-22 反编译确认：**绝对不能用 return null**。
                                     //
                                     //   setRotateSuggestionButtonState 里维护着
@@ -381,130 +456,55 @@ public final class RotationHint {
 
 
 
-    /** 找 controller 的 setRotateSuggestionButtonState(boolean, boolean)。 */
-    private static Method findSetStateMethod(Object controller) {
-        try {
-            for (Method m : controller.getClass().getDeclaredMethods()) {
-                if ("setRotateSuggestionButtonState".equals(m.getName())
-                        && m.getParameterTypes().length == 2) {
-                    m.setAccessible(true);
-                    return m;
-                }
-            }
-        } catch (Throwable unused) {
-        }
-        return null;
-    }
+
+
+
+
+
+
+
+
 
 
 
     /**
-     * 用系统自己的完整入口，把浮窗整体移到新角落。
+     * 点击旋钮：把屏幕转到传感器当前朝向。
      *
-     * <p>2026-10-22 反编译确认（MiuiSystemUI.apk, FloatingRotationButton）：
-     * <pre>
-     *   adjustViewPositionAndCreateLayoutParams() {
-     *       rotation = wm.getDefaultDisplay().getRotation();   // 锁定后永远不变
-     *       pos = mPositionCalculator.calculatePosition(rotation);
-     *       lp.gravity = pos.gravity;                          // ← 浮窗在哪个角
-     *       mKeyButtonView.lp.gravity = pos.gravity;           // ← 容器内对齐
-     *       updateTranslation(pos, false);                     // ← ±40px 微调
-     *   }
-     * </pre>
-     *
-     * <p>所以「按钮停在旧角落」的真正原因：
-     * 浮窗的 {@code WindowManager.LayoutParams.gravity} 只在 addView 时算过一次，
-     * 之后系统只调 {@code updateTranslation()}，而它只能改 ±40px 的偏移，
-     * 无法跨屏移动。
-     *
-     * <p>正确做法：重新调一次上面这个入口（它内部会调 calculatePosition，
-     * 我们的 hook 会把结果改成按传感器方向算的落点），
-     * 再用 {@code WindowManager.updateViewLayout()} 应用。
+     * <p>用的还是系统的旋转锁定接口 {@code freezeRotation(rotation, packageName)}，
+     * 不写任何 Settings 值，符合「只用系统开关」的约束。
      */
-    private static void updateFloatingWindowPosition() {
-        Object controller = sController;
-        if (controller == null) {
+    private static void applyRotationSuggestion() {
+        final int target = sSensorTargetRotation;
+        if (target < 0) {
             return;
         }
         try {
-            Object fbtn = getField(controller, "mRotationButton");
-            if (fbtn == null) {
-                LogUtil.logAlwaysOnce("rh-nofbtn", "[旋转提示] 拿不到 mRotationButton");
+            Object wm = MainHook.getWindowManagerServicePublic();
+            if (wm == null) {
+                LogUtil.logAlways("[旋转提示] 点击失败：拿不到 WMS");
                 return;
             }
-            java.lang.reflect.Method adjust = null;
-            for (java.lang.reflect.Method m : fbtn.getClass().getDeclaredMethods()) {
-                if ("adjustViewPositionAndCreateLayoutParams".equals(m.getName())) {
-                    adjust = m;
-                    break;
-                }
-            }
-            if (adjust == null) {
-                LogUtil.logAlwaysOnce("rh-noadjust",
-                        "[旋转提示] 找不到 adjustViewPositionAndCreateLayoutParams");
-                return;
-            }
-            adjust.setAccessible(true);
-            Object lpObj = adjust.invoke(fbtn);
-            if (!(lpObj instanceof android.view.WindowManager.LayoutParams)) {
-                return;
-            }
-            android.view.WindowManager.LayoutParams lp =
-                    (android.view.WindowManager.LayoutParams) lpObj;
-            Object container = getField(fbtn, "mKeyButtonContainer");
-            Object wmObj = getField(fbtn, "mWindowManager");
-            if (container instanceof android.view.View
-                    && wmObj instanceof android.view.WindowManager) {
-                ((android.view.WindowManager) wmObj).updateViewLayout(
-                        (android.view.View) container, lp);
-                LogUtil.logAlways("[旋转提示] 浮窗已重定位 gravity=" + lp.gravity);
-            }
+            java.lang.reflect.Method m = wm.getClass()
+                    .getMethod("freezeRotation", int.class, String.class);
+            m.setAccessible(true);
+            m.invoke(wm, target, "HyperOSGlass");
+            LogUtil.logAlways("[旋转提示] 已接受旋转建议，转到 rotation=" + target);
+            hideButtonNow();
         } catch (Throwable th) {
-            LogUtil.logAlways("[旋转提示] 浮窗重定位失败: " + th);
+            LogUtil.logAlways("[旋转提示] 点击旋转失败: " + th);
         }
+    }
+
+    /** 供 RotationButtonOverlay 取系统图标用。 */
+    static Object controllerForIcon() {
+        return sController;
     }
 
 
 
-
-
-    /**
-     * 强制把旋转按钮清场：容器摘出窗口 + mIsShowing 置 false。
-     *
-     * <p>只做一件事，不做状态判断 —— 状态不一致时这才是唯一可靠的起点。
-     */
-    private static void forceClearButton(Object controller) {
-        try {
-            Object fbtn = getField(controller, "mRotationButton");
-            if (fbtn == null) {
-                return;
-            }
-            Object container = getField(fbtn, "mKeyButtonContainer");
-            Object wm = getField(fbtn, "mWindowManager");
-            if (container instanceof android.view.View
-                    && wm instanceof android.view.WindowManager) {
-                android.view.View v = (android.view.View) container;
-                if (v.isAttachedToWindow()) {
-                    try {
-                        ((android.view.WindowManager) wm).removeViewImmediate(v);
-                    } catch (Throwable unused) {
-                    }
-                }
-            }
-            // 标志归零
-            Class<?> c = fbtn.getClass();
-            while (c != null && c != Object.class) {
-                try {
-                    java.lang.reflect.Field f = c.getDeclaredField("mIsShowing");
-                    f.setAccessible(true);
-                    f.setBoolean(fbtn, false);
-                    break;
-                } catch (java.lang.NoSuchFieldException unused) {
-                }
-                c = c.getSuperclass();
-            }
-        } catch (Throwable unused) {
-        }
+    /** 供 RotationButtonOverlay 取系统图标用。 */
+    static Object getFieldForIcon(Object obj, String name) {
+        return getField(obj, name);
     }
 
     /** 读对象的字段（含父类）。 */
@@ -537,87 +537,32 @@ public final class RotationHint {
     }
 
     /**
-     * 稳态达到且方向与屏幕不同 → 弹出旋钮。
+     * 稳态达到且方向与屏幕不同 → 在对应角落显示按钮。
      *
-     * <p>逻辑保持最简（用户 2026-10-22）：
-     * <b>先确保收起（幂等，清掉系统内部状态），再显示，最后把浮窗挪到正确角落。</b>
-     * 不再做 mIsShowing / isAttachedToWindow 之类的状态猜测 ——
-     * 先 hide 一次就让状态归零，比判断十种异常组合可靠。
+     * <p>2026-10-22 起改用自绘悬浮窗（{@link RotationButtonOverlay}）：
+     * 位置由我们自己的公式算成绝对坐标，一次 {@code updateViewLayout} 就到位，
+     * 不再和系统 FloatingRotationButton 的 mIsShowing 状态机纠缠。
      */
     private static void showNow(int targetRotation, int current) {
-        Object controller = sController;
-        if (controller == null) {
-            return;
-        }
-        Method setState = findSetStateMethod(controller);
-        if (setState == null) {
-            return;
-        }
-        try {
-            // 🔑 关键一步：**强制清场**。
-            //
-            //   2026-10-22 用户实测「0 度→180 度就再也不出现」：
-            //   系统的 hide() 是 removeViewImmediate + mIsShowing=false，
-            //   但它有前置判断，标志一旦不同步，容器可能留在窗口上；
-            //   此时再 addView 会抛 "View has already been added"，
-            //   异常被吞掉 → 屏幕上什么都没有。
-            //
-            //   这里不管状态如何，先把容器从窗口上摘掉、把标志置 false，
-            //   再走系统的显示流程。比判断一堆异常组合简单得多。
-            forceClearButton(controller);
-
-            sOurShowRequest = true;
-            try {
-                setState.invoke(controller, Boolean.TRUE, Boolean.FALSE);
-            } finally {
-                sOurShowRequest = false;
-            }
-            sShownFor = targetRotation;
-            sLastShowAt = android.os.SystemClock.uptimeMillis();
-            LogUtil.logAlways("[旋转提示] 已显示（当前=" + current
-                    + " 目标=" + targetRotation + "）");
-            updateFloatingWindowPosition();
-        } catch (Throwable th) {
-            LogUtil.logAlways("[旋转提示] 显示按钮失败: " + th);
-        }
-    }
-
-
-    /**
-     * 现在是否满足「可以显示」的稳态条件。
-     *
-     * <p>用户 2026-10-22：<b>「希望能有一个等待并判断，直到达到稳态的状态，
-     * 这样的话其实能避免所有的问题」</b>。
-     *
-     * <p>判据（三条必须全部满足）：
-     * <ol>
-     *   <li>传感器方向已经稳定满 {@link #STABLE_MS}；</li>
-     *   <li>传感器方向 ≠ 当前屏幕方向；</li>
-     *   <li>传感器方向已知、屏幕方向也拿得到。</li>
-     * </ol>
-     */
-    private static boolean isStableForShow() {
-        int sensor = sSensorTargetRotation;
-        if (sensor < 0) {
-            return false;   // 还不知道方向，先别显示
-        }
         Context ctx = sContext;
         if (ctx == null) {
-            return false;
+            return;
         }
-        int cur = currentSurfaceRotation(ctx);
-        if (cur < 0) {
-            return false;
-        }
-        if (sensor == cur) {
-            return false;   // 方向一致，不该显示
-        }
-        if (sensor != sStableTarget) {
-            return false;   // 方向刚变，还没进入稳态
-        }
-        long now = android.os.SystemClock.uptimeMillis();
-        return now - sStableSince >= STABLE_MS;
+        int corner = RotationButtonOverlay.cornerFor(targetRotation, current);
+        RotationButtonOverlay.get().show(ctx, corner);
+        sShownFor = targetRotation;
+        // 每个画面都有等待时间：超时内没有新的方向变化就自动退出
+        sMain.removeCallbacks(sAutoHideTask);
+        sMain.postDelayed(sAutoHideTask, AUTO_HIDE_MS);
+        // ⚠️ 不在这里停止轮询：按钮显示之后用户很可能继续转，
+        //   而方向事件是 on-change 类型会漏报，必须有人继续盯着。
+        //   轮询会在「确认静止」后自行停止（见轮询里的静止判断）。
+        LogUtil.logAlways("[旋转提示] 已显示（当前=" + current
+                + " 目标=" + targetRotation + " 角落=" + corner + "）");
     }
+
+
+
 
 
     /**
@@ -899,46 +844,22 @@ public final class RotationHint {
         return false;
     }
 
-    /** 立即收起旋转按钮（方向已一致，不该显示）。 */
+    /**
+     * 收起按钮。
+     *
+     * <p>2026-10-22 性能修正：这里原来还每次反射调用系统的
+     * {@code setRotateSuggestionButtonState(false, true)}，但系统按钮已经被
+     * 显隐 hook 彻底拦住、永远不会出现 —— 那次反射（遍历 declaredMethods +
+     * setAccessible + invoke）纯属多余开销，而且会让「方向一变就收起」
+     * 慢上几毫秒。现在只操作我们自己的悬浮窗。
+     */
     private static void hideButtonNow() {
-        Object controller = sController;
-        if (controller == null) {
-            return;
-        }
-        // ⚠️ 这里**不能**因为 sShownFor<0 就跳过 —— 系统的按钮可能正显示着
-        //   而我们并不知道（系统的显示路径不止 showAndLogRotationSuggestion）。
-        //   用户 2026-10-21 反馈「转到别的方向按钮也不消失」，
-        //   所以每次方向变化都无条件收一次。
         sShownFor = -1;
-        try {
-            Method set = null;
-            for (Method m : controller.getClass().getDeclaredMethods()) {
-                if ("setRotateSuggestionButtonState".equals(m.getName())
-                        && m.getParameterTypes().length == 2) {
-                    set = m;
-                    break;
-                }
-            }
-            if (set == null) {
-                LogUtil.logAlwaysOnce("rh-noset", "[旋转提示] 找不到 setState 方法");
-                return;
-            }
-            set.setAccessible(true);
-            // ⚠️ 2026-10-22：第二个参数必须传 true（立即隐藏），不能传 false。
-            //   反编译确认 setRotateSuggestionButtonState 的隐藏分支：
-            //     z2=true  → 直接 hide()，立即生效
-            //     z2=false → 先播 100ms 的 alpha 动画，动画结束才 hide()
-            //               而且若此时已有动画在跑，整个分支会直接 return，
-            //               按钮就卡在旧位置不消失 ——
-            //               正是用户看到的「旋钮在 90 度停留很久」。
-            set.invoke(controller, Boolean.FALSE, Boolean.TRUE);
-        } catch (Throwable th) {
-            LogUtil.logAlways("[旋转提示] setState 收起失败: " + th);
-        }
-        // ⚠️ 2026-10-21：曾在这里再调 hideControllerViews() 强制 setVisibility(GONE)，
-        //   实测会让系统内部状态与真实视图不一致 → 之后按钮再也不出现。
-        //   现在只用系统的接口收，不再直接动 View。
+        sMain.removeCallbacks(sAutoHideTask);
+        RotationButtonOverlay.get().hideNow();
     }
+
+
 
 
 
@@ -1305,6 +1226,12 @@ public final class RotationHint {
             if (sm == null) {
                 return;
             }
+            // 🔑 2026-10-22 关键修复：SensorManager 必须在这里就存好。
+            //   原来只在下面「方向传感器」分支里赋值，而本机走的是
+            //   OrientationEventListener 分支（提前 return），
+            //   导致 sSensorMgr 一直是 null → startGravityPolling() 一进去就返回
+            //   → 重力轮询**从未真正启动过**（日志里也从来没有它的记录）。
+            sSensorMgr = sm;
             // ⚠️ 实测（2026-10-19）：Wakeup 版 device_orientation 在**首次注册后
             //   只回调一次**（日志里「传感器方向=0」只出现一次，之后方向再也不更新），
             //   导致按钮位置固定在左上角。这条路不可用，回退到下面的
@@ -1326,6 +1253,11 @@ public final class RotationHint {
                             }
                         }
                     };
+            // ⚠️ 2026-10-22 关键修复：重力轮询必须在两条分支之前注册。
+            //   之前它被放在下面的「传感器」分支里，而系统只要支持
+            //   OrientationEventListener 就会提前 return ——
+            //   于是重力轮询根本没注册（日志里始终没有「已注册重力轮询」），
+            //   表现为「按钮停在旧界面好几秒」。
             if (oel.canDetectOrientation()) {
                 oel.enable();
                 sOel = oel;
@@ -1357,6 +1289,10 @@ public final class RotationHint {
             sListener = l;
             sSensorMgr = sm;
             sm.registerListener(l, sensor, 66667);
+
+
+
+
             sSensorRegistered = true;
             LogUtil.logAlways("[旋转提示] 已注册方向传感器: " + sensor.getName()
                     + "（type=" + sensor.getType() + "）");
@@ -1403,6 +1339,254 @@ public final class RotationHint {
      * <p>两条来源共用这里：系统同款的 {@code OrientationEventListener} 与
      * 手写的加速度计监听，避免逻辑重复。
      */
+    /**
+     * 安排「稳态后显示」的判定任务。
+     *
+     * <p>抽出来是为了让两处都能调用：
+     * <ol>
+     *   <li>方向变化时；</li>
+     *   <li><b>运动检测把按钮收起之后</b> ——
+     *       这是 2026-10-22 用户反馈「转着转着按钮就丢了」的真正原因：
+     *       运动检测只调了 hideButtonNow()，却没安排重新显示，
+     *       而方向传感器又是 on-change 类型不会再上报，按钮就永远回不来了。</li>
+     * </ol>
+     */
+
+
+    /**
+     * 用重力向量算设备朝向。
+     *
+     * @return rotation(0..3)；设备接近平放（重力在水平面分量太小）时返回 -1
+     */
+    private static int rotationFromGravity(float gx, float gy) {
+        double level = Math.hypot(gx, gy);
+        if (level < 5.0) {
+            return -1;   // 平放，算不准，不参与
+        }
+        double roll = Math.toDegrees(Math.atan2(gx, gy));
+        int idx = (int) Math.round(roll / 90.0);
+        return ((idx % 4) + 4) % 4;
+    }
+
+    /**
+     * 按需启动重力轮询 —— **只在「传感器刚旋转的那一下」工作，静默时完全关闭**。
+     *
+     * <p>2026-10-22 用户明确要求：
+     * <b>「轮询这一块只存在于工作的那一下、传感器旋转的那一下，
+     * 其他静默的时候不要使用轮询」</b>。
+     *
+     * <p>所以不常驻注册。生命周期：
+     * <pre>
+     *   方向变化      → 启动（这时才知道要盯着，看方向是否还在变）
+     *   按钮显示出来  → 停止（已经判定完成）
+     *   超过 3 秒     → 自动停止（兜底，避免异常路径下常驻）
+     * </pre>
+     */
+    private static void startGravityPolling() {
+        SensorManager sm = sSensorMgr;
+        if (sm == null || sAccelListener != null) {
+            return;
+        }
+        try {
+            android.hardware.Sensor grav =
+                    sm.getDefaultSensor(android.hardware.Sensor.TYPE_GRAVITY);
+            if (grav == null) {
+                grav = sm.getDefaultSensor(
+                        android.hardware.Sensor.TYPE_ACCELEROMETER);
+            }
+            if (grav == null) {
+                return;
+            }
+            final android.hardware.SensorEventListener gl =
+                    new android.hardware.SensorEventListener() {
+                        @Override
+                        public void onSensorChanged(android.hardware.SensorEvent e) {
+                            try {
+                                float gx = e.values[0];
+                                float gy = e.values[1];
+                                float gz = e.values[2];
+                                // 运动量：三轴变化之和
+                                float delta = Math.abs(gx - sLastGx)
+                                        + Math.abs(gy - sLastGy)
+                                        + Math.abs(gz - sLastGz);
+                                sLastGx = gx;
+                                sLastGy = gy;
+                                sLastGz = gz;
+                                long nowTick = android.os.SystemClock
+                                        .uptimeMillis();
+                                if (delta > MOTION_THRESHOLD) {
+                                    sLastMotionAt = nowTick;
+                                } else if (sShownFor >= 0
+                                        && nowTick - sLastMotionAt > 3000L) {
+                                    // 按钮已经显示、且确认静止 3 秒
+                                    // → 这一轮旋转结束，关掉轮询。
+                                    //   原来只等 1 秒：旋转间隙稍一停顿轮询就关了，
+                                    //   下次方向事件漏报时又没人盯着，表现为周期性延迟。
+                                    stopGravityPolling();
+                                    return;
+                                }
+                                int rot = rotationFromGravity(gx, gy);
+                                if (rot < 0) {
+                                    // 设备接近平放：判断不了朝向，不参与判定。
+                                    // 用户明确说这里「不用管」——
+                                    // 按钮的退场交给下面的显示超时处理。
+                                    sPendingAccelRotation = -1;
+                                    sAccelSameCount = 0;
+                                    return;
+                                }
+                                if (rot == sPendingAccelRotation) {
+                                    sAccelSameCount++;
+                                } else {
+                                    sPendingAccelRotation = rot;
+                                    sAccelSameCount = 1;
+                                }
+                                // 连续 2 次（约 200ms）同一方向即采纳
+                                if (sAccelSameCount < 2
+                                        || rot == sSensorTargetRotation) {
+                                    return;
+                                }
+                                long nowPoll = android.os.SystemClock
+                                        .uptimeMillis();
+                                // 方向事件沉默 200ms 就交给轮询接管。
+                                // 实测本机方向事件间隔常达 1~2.5 秒（几乎不上报），
+                                // 轮询是主力，门槛必须低。
+                                if (nowPoll - sLastSensorReportAt < 200L) {
+                                    return;   // 方向事件还活跃，轮询不参与
+                                }
+                                LogUtil.logAlways("[旋转提示] 重力轮询兜底："
+                                        + "方向事件已沉默，方向=" + rot);
+                                onOrientationDegrees(((4 - rot) % 4) * 90);
+                            } catch (Throwable unused) {
+                            }
+                        }
+
+                        @Override
+                        public void onAccuracyChanged(
+                                android.hardware.Sensor sensor2, int acc) {
+                        }
+                    };
+            long tReg = android.os.SystemClock.uptimeMillis();
+            sAccelListener = gl;
+            // 重置运动基准，避免上一次的残留值导致开局就误判
+            sLastGx = 0f;
+            sLastGy = 0f;
+            sLastGz = 0f;
+            sLastMotionAt = android.os.SystemClock.uptimeMillis();
+            sm.registerListener(gl, grav, 100000);
+            LogUtil.logAlways("[旋转提示] 重力轮询启动（旋转窗口内）");
+            // 兜底：最多工作 3 秒
+            // 兜底停止：只保留一个，重复启动时先取消旧的。
+            // ⚠️ 原来每次都 post 一个新的 8 秒任务，连转十次就有十个任务
+            //   在同一时刻集中执行 —— 表现为「转三五次就卡一下」。
+            //   现在改成单例任务，并把上限放宽到 30 秒（正常由「静止」结束）。
+            LogUtil.logAlways("[旋转提示] 重力轮询注册耗时 "
+                    + (android.os.SystemClock.uptimeMillis() - tReg) + "ms");
+            sMain.removeCallbacks(sPollStopTask);
+            sMain.postDelayed(sPollStopTask, 60000L);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[旋转提示] 重力轮询启动失败: " + th);
+        }
+    }
+
+    /** 停止重力轮询（注销监听，静默期不占用传感器）。 */
+    private static void stopGravityPolling() {
+        SensorManager sm = sSensorMgr;
+        android.hardware.SensorEventListener l = sAccelListener;
+        if (sm != null && l != null) {
+            try {
+                sm.unregisterListener(l);
+            } catch (Throwable unused) {
+            }
+        }
+        sAccelListener = null;
+        sPendingAccelRotation = -1;
+        sAccelSameCount = 0;
+        sLastGx = 0f;
+        sLastGy = 0f;
+        sLastGz = 0f;
+    }
+
+
+    /**
+     * 显示超时任务。
+     *
+     * <p>2026-10-22 用户要求：
+     * <b>「每一个画面都有等待时间。等待时间之后，如果它没有旋转到下一个传感器，
+     * 你就可以直接计时退出了」</b>。
+     *
+     * <p>所以按钮出现后开始计时，这段时间内没有新的方向变化就自动收起 ——
+     * 这也是系统原生旋转按钮的行为。顺带解决了「手机放桌上按钮一直不消失」。
+     */
+    private static final long AUTO_HIDE_MS = 3000L;
+    private static final Runnable sAutoHideTask = new Runnable() {
+        @Override
+        public void run() {
+            if (sShownFor >= 0) {
+                LogUtil.logAlways("[旋转提示] 显示超时，自动收起");
+                hideButtonNow();
+            }
+        }
+    };
+
+    private static void scheduleShow(final int stableTarget) {
+        long nowSchedule = android.os.SystemClock.uptimeMillis();
+        // 节流：必须明显小于 STABLE_MS，否则会把计时重置掉、按钮出不来。
+        if (nowSchedule - sLastScheduleAt < 100L) {
+            return;
+        }
+        sLastScheduleAt = nowSchedule;
+        final long startedAt = nowSchedule;
+        final long plannedAt = startedAt + STABLE_MS + 40L;
+        Runnable showTask = new Runnable() {
+            @Override
+            public void run() {
+                if (sPendingShow == this) {
+                    sPendingShow = null;
+                }
+                try {
+                    long nowExec = android.os.SystemClock.uptimeMillis();
+                    long late = nowExec - plannedAt;
+                    if (late > 100L) {
+                        LogUtil.logAlways("[旋转提示] 显示任务被推迟 " + late
+                                + "ms（计划=" + plannedAt + " 实际=" + nowExec + "）");
+                    }
+                    if (sSensorTargetRotation != stableTarget) {
+                        return;
+                    }
+                    // 等待期间的方向确认交给重力轮询（10Hz，带连续确认）。
+                    // ⚠️ 曾在这里再挂一个 40ms 的复查，结果两个方向源互相覆盖：
+                    //   传感器报 A、重力算 B，两边轮流触发「方向变化」，
+                    //   计时被无限重置，按钮反而更晚出现。
+                    if (android.os.SystemClock.uptimeMillis() - startedAt
+                            < STABLE_MS) {
+                        return;
+                    }
+                    Context ctx = sContext;
+                    if (ctx == null) {
+                        LogUtil.logAlways("[旋转提示] 稳态到点但 ctx 为空");
+                        return;
+                    }
+                    int cur = currentSurfaceRotation(ctx);
+                    if (cur < 0) {
+                        LogUtil.logAlways("[旋转提示] 拿不到屏幕方向，放弃本次显示");
+                        return;
+                    }
+                    if (stableTarget == cur) {
+                        LogUtil.logAlways("[旋转提示] 稳态方向与屏幕一致，隐藏旋钮");
+                        hideButtonNow();
+                        return;
+                    }
+                    showNow(stableTarget, cur);
+                } catch (Throwable unused) {
+                }
+            }
+        };
+        cancelPendingShow();
+        sPendingShow = showTask;
+        // 先等一个稳态时间，再进入 40ms 一次的方向复查
+        sMain.postDelayed(showTask, STABLE_MS + 40L);
+    }
+
     private static void onOrientationDegrees(int degrees) {
         if (!MainHook.sRotationHintEnable.get()) {
             return;
@@ -1411,11 +1595,14 @@ public final class RotationHint {
         if (target < 0) {
             return;
         }
+        // 记录方向传感器仍然活跃（它是第一优先级）
+        sLastSensorReportAt = android.os.SystemClock.uptimeMillis();
         // 去抖：传感器很灵敏，转动过程中会连续上报；延时后再判断，
         // 只按「停稳后的方向」决定弹不弹。
         // ⭐ 记录传感器方向，供落点使用（纯传感器驱动）
         if (sSensorTargetRotation != target) {
             sSensorTargetRotation = target;
+            sStableTarget = target;
             sStableSince = android.os.SystemClock.uptimeMillis();
             LogUtil.logAlways("[旋转提示] 传感器方向=" + target);
 
@@ -1435,60 +1622,16 @@ public final class RotationHint {
             //   这也正是用户要求的「旋钮消失并重新进入稳态计时」。
             // 立即收起
             // 旋钮没显示 → 走「立即收起（保险）+ 500ms 稳态后显示」
-            sMain.post(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        hideButtonNow();
-                    } catch (Throwable unused) {
-                    }
-                }
-            });
+            // 立即收起（hideNow 内部会判断线程，无需再 post 一帧）
+            hideButtonNow();
 
-            final int stableTarget = target;
-            final long startedAt = sStableSince;
-            Runnable showTask = new Runnable() {
-                @Override
-                public void run() {
-                    if (sPendingShow == this) {
-                        sPendingShow = null;
-                    }
-                    try {
-                        // 这期间方向又变了 → 放弃
-                        if (sSensorTargetRotation != stableTarget) {
-                            return;
-                        }
-                        // 稳态时间不够 → 等下一次
-                        if (android.os.SystemClock.uptimeMillis() - startedAt
-                                < STABLE_MS) {
-                            return;
-                        }
-                        // 方向与当前屏幕一致 → 直接不处理
-                        Context ctx = sContext;
-                        if (ctx == null) {
-                            LogUtil.logAlways("[旋转提示] 稳态到点但 ctx 为空");
-                            return;
-                        }
-                        int cur = currentSurfaceRotation(ctx);
-                        if (cur < 0) {
-                            return;
-                        }
-                        if (stableTarget == cur) {
-                            // ⚠️ 2026-10-22 用户实测：270→0→90（与屏幕一致）时，
-                            //   旋钮停在了 90 的位置没有消失。
-                            //   原因是这里只 return，没确保之前那个旋钮被收起来。
-                            //   方向一致时必须**主动收一次**。
-                            LogUtil.logAlways("[旋转提示] 稳态方向与屏幕一致，隐藏旋钮");
-                            hideButtonNow();
-                            return;
-                        }
-                        showNow(stableTarget, cur);
-                    } catch (Throwable unused) {
-                    }
-                }
-            };
-            sPendingShow = showTask;
-            sMain.postDelayed(showTask, STABLE_MS + 40L);
+            // 方向变化必须强制重新安排（清掉节流时间戳），
+            // 否则会被 200ms 节流挡掉，按钮不出现。
+            sLastScheduleAt = 0L;
+            // 只在「刚发生旋转」这一刻启动轮询，静默期不占用传感器
+            startGravityPolling();
+            scheduleShow(target);
+
         }
         // ⚠️ 2026-10-21 删除：这里原来还有一次**无条件**的 maybeShowHint 调用，
         //   等于每次传感器回调（每 66ms）都走一遍显示判断 ——
