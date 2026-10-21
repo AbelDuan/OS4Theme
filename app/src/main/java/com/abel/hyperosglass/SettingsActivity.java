@@ -353,9 +353,6 @@ public class SettingsActivity extends Activity {
                         + "仅在「自动旋转」关闭时生效 —— 开着时系统会自己转。");
         addSwitch(linearLayoutRotationHint, "方向不一致时提示旋转",
                 Constants.PREFS_ROTATION_HINT, Constants.DEFAULT_ROTATION_HINT);
-        addSwitch(linearLayoutRotationHint, "内屏固定横屏（摄像头在右上角）",
-                Constants.PREFS_INNER_FIXED_LANDSCAPE,
-                Constants.DEFAULT_INNER_FIXED_LANDSCAPE);
         addSwitch(linearLayoutRotationHint, "展开时联动自动旋转（跟随 5 秒后锁定）",
                 Constants.PREFS_INNER_FOLLOW_ROTATION,
                 Constants.DEFAULT_INNER_FOLLOW_ROTATION);

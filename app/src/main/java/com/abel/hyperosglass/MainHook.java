@@ -93,7 +93,6 @@ public class MainHook extends XposedModule {
      */
     public static final AtomicBoolean sRotationHintEnable = new AtomicBoolean(false);
     /** 内屏固定横屏（摄像头右上角）开关。 */
-    public static final AtomicBoolean sInnerFixedLandscape = new AtomicBoolean(false);
     /** 展开时联动自动旋转（3 秒跟随后锁定）。 */
     public static final AtomicBoolean sInnerFollowRotation = new AtomicBoolean(false);
     /** 内屏联动的延时任务调度器（独立线程，不打扰主线程）。 */
@@ -226,12 +225,14 @@ public class MainHook extends XposedModule {
                                             applyInnerFixedLandscape();
                                         } else if (Intent.ACTION_SCREEN_OFF.equals(a)) {
                                             RotationHint.onScreenStateChanged(false);
-                                            // 用户要求：「哪怕锁屏也要复原旋屏开关状态」
+                                            // 熄屏等同「合上」：取消计时并打开旋转锁，
+                                            // 避免计时器在息屏期间到点乱改设置。
                                             try {
-                                                android.content.ContentResolver crOff =
-                                                        ((Context) objCurrentApplication)
-                                                                .getContentResolver();
-                                                restoreInnerChanges(crOff, true);
+                                                if (sFollowing) {
+                                                    cancelFollowTimer();
+                                                    callWindowManagerRotation(true);
+                                                    LogUtil.logAlways("[内屏联动] 熄屏取消计时，已打开旋转锁");
+                                                }
                                             } catch (Throwable unused) {
                                             }
                                         }
@@ -1207,18 +1208,15 @@ public class MainHook extends XposedModule {
     // ============================================================
 
     /** 模块改动前的原始值快照；-1 表示没有需要还原的改动。 */
-    private static volatile int sSavedAutoInner = -1;
-    private static volatile int sSavedUserInner = -1;
     /** 模块当前是否持有「未还原的改动」。 */
-    private static volatile boolean sHasPendingChange = false;
     /** 是否正处于「展开后跟随」的 5 秒窗口内 —— 期间不再重复触发，否则会把计时器重置。 */
     private static volatile boolean sFollowing = false;
+    /** 合上时我们是否主动关闭了旋转锁定（用于判断后续开关是否被别人改动）。 */
+    /** 我们写入（或期望）的 accelerometer_rotation_inner 值：1=未锁定 0=锁定。 */
+    private static volatile int sLockSnapshot = -1;
     /** 内屏面积基准（运行时校准，跨展开/合上不变）。-1 未校准。 */
-    private static volatile int sInnerAreaBase = -1;
     /** 见过的最小屏幕面积（= 外屏），用于反推内屏基准。 */
-    private static volatile int sMinAreaSeen = -1;
     /** 见过的最大屏幕面积（= 内屏候选）。 */
-    private static volatile int sMaxAreaSeen = -1;
     /** 进程判断缓存：-1 未判定，0 否，1 是。 */
     private static volatile int sIsSystemUiProc = -1;
 
@@ -1228,34 +1226,8 @@ public class MainHook extends XposedModule {
      * <p>判据：我们记下「我们写进去的值」，如果现在的值不是这个值，
      * 说明被别的东西（用户手动操作）改过了 —— 那就放弃还原，尊重用户。
      */
-    private static boolean wasChangedByUser(android.content.ContentResolver cr) {
-        try {
-            if (sSavedAutoInner >= 0) {
-                int now = android.provider.Settings.System.getInt(
-                        cr, "accelerometer_rotation_inner", -1);
-                if (now != sInnerWrittenAuto) {
-                    LogUtil.logAlways("[内屏固定] 检测到用户手动改了自动旋转（"
-                            + sInnerWrittenAuto + " → " + now + "），放弃还原");
-                    return true;
-                }
-            }
-            if (sSavedUserInner >= 0) {
-                int now = android.provider.Settings.System.getInt(
-                        cr, "user_rotation_inner", -1);
-                if (now != sInnerWrittenUser) {
-                    LogUtil.logAlways("[内屏固定] 检测到用户手动改了方向（"
-                            + sInnerWrittenUser + " → " + now + "），放弃还原");
-                    return true;
-                }
-            }
-        } catch (Throwable unused) {
-        }
-        return false;
-    }
 
     /** 模块最近一次写入的值，用于识别「是否被用户手动改过」。 */
-    private static volatile int sInnerWrittenAuto = -1;
-    private static volatile int sInnerWrittenUser = -1;
 
     /**
      * 合上时的收尾：取消计时器 → 固定恢复为「锁定 + 270°」→ 清空状态。
@@ -1264,38 +1236,6 @@ public class MainHook extends XposedModule {
      *              但仍尊重用户手动改过的值（优先级：合上 > 手动 > 自动还原，
      *              合上只是「触发还原」，不代表可以覆盖用户的手动设置）
      */
-    private static void restoreInnerChanges(android.content.ContentResolver cr, boolean force) {
-        // force=true 表示「合上屏幕」：即使没有挂起的改动，也要把内屏
-        // 预设成「锁定 + 270°」，这样下次展开直接就是横屏（摄像头右上角），
-        // 不会出现「展开后先是竖屏、等 5 秒才转横屏」。
-        if (!sHasPendingChange && !force) {
-            return;
-        }
-        try {
-            // 合上屏幕（force=true）：用户明确要求「处理干净」——
-            //   无条件恢复为「锁定 + 270°」，不再做用户手动改动检测。
-            //   （展开期间的手动改动检测仍保留在 5 秒计时器那条路径里）
-            if (!force && wasChangedByUser(cr)) {
-                clearPendingChange();
-                return;
-            }
-            // 📌 用户 2026-10-20 明确要求：
-            //   「需要在合上屏幕后，恢复之前的方向锁定 + 屏幕方向设置为摄像头在右上角，
-            //     关闭 5 秒计时器。处理干净」
-            //
-            //   所以合上时不是简单回退到「展开前的任意状态」，而是**固定恢复成
-            //   内屏锁 270°（摄像头右上角）** —— 这也正是本功能的目标状态。
-            //   实测 ROTATION_270 的内屏挖孔在右侧（insets=[0,0][140,43]）。
-            android.provider.Settings.System.putInt(
-                    cr, "user_rotation_inner", Constants.INNER_FIXED_ROTATION);
-            callWindowManagerRotation(true);   // 锁定内屏
-            LogUtil.logAlways("[内屏固定] 已合上：恢复为锁定 + 方向 "
-                    + Constants.INNER_FIXED_ROTATION + "（摄像头右上角）");
-        } catch (Throwable th) {
-            LogUtil.logAlways("[内屏固定] 还原失败: " + th);
-        }
-        clearPendingChange();
-    }
 
     /** 取消悬挂中的 5 秒跟随计时器，并清掉跟随标记。 */
     private static void cancelFollowTimer() {
@@ -1303,15 +1243,6 @@ public class MainHook extends XposedModule {
             sInnerHandler.removeCallbacksAndMessages(null);
         } catch (Throwable unused) {
         }
-        sFollowing = false;
-    }
-
-    private static void clearPendingChange() {
-        sSavedAutoInner = -1;
-        sSavedUserInner = -1;
-        sInnerWrittenAuto = -1;
-        sInnerWrittenUser = -1;
-        sHasPendingChange = false;
         sFollowing = false;
     }
 
@@ -1405,29 +1336,6 @@ public class MainHook extends XposedModule {
         return false;
     }
 
-    /**
-     * 把内屏转到指定角度（0=竖屏 1=90° 2=180° 3=270°）。
-     *
-     * <p>用 {@code IWindowManager.setRotationAtAngleIfAllowed}——这是系统自己
-     * 设置方向的接口。注意：**只有内屏处于 ON 状态时调用才有效**，
-     * 合盖状态下内屏是 OFF，任何接口都改不动它。
-     */
-    private static void setInnerRotationAngle(int rotation) {
-        try {
-            Object wm = getWindowManagerService();
-            if (wm == null) {
-                return;
-            }
-            java.lang.reflect.Method m = wm.getClass().getMethod(
-                    "setRotationAtAngleIfAllowed", int.class, String.class);
-            m.setAccessible(true);
-            m.invoke(wm, rotation * 90, "HyperOSGlass");
-            LogUtil.logAlways("[内屏固定] 已把内屏转到 " + (rotation * 90) + "°");
-        } catch (Throwable th) {
-            LogUtil.logAlways("[内屏固定] 设置内屏角度失败: " + th);
-        }
-    }
-
     /** 只允许 SystemUI 进程执行内屏固定逻辑，避免多进程互相覆盖设置。 */
     private static boolean isSystemUiProc() {
         int cached = sIsSystemUiProc;
@@ -1450,78 +1358,87 @@ public class MainHook extends XposedModule {
     }
 
     /**
-     * 判断当前活跃屏是不是内屏。
+     * 判断当前是否处于「展开（内屏）」状态。
      *
-     * <p>⚠️ 不能用 FLAG_PRESENTATION：实测合盖时**活跃的外屏不带该标志**，
-     * 会被误判成内屏（用户反馈「外屏竖屏展开后内屏也竖屏」）。
+     * <p>用**澎湃自己的设备状态参数** {@code current_device_state}（Settings.Global），
+     * 这是系统自己维护的折叠状态，比任何几何推算都可靠、也更通用。
      *
-     * <p>也不能用 Display ID：它是动态分配的，「Display 0」永远指当前活跃屏。
+     * <p>实测本机（2026-10-21）：
+     * <pre>
+     *   展开：current_device_state = 3   （Display 0 = 2364x1672 内屏）
+     *   合上：current_device_state = 0   （Display 0 = 1168x1712 外屏）
+     * </pre>
      *
-     * <p>正确做法：折叠屏的**内屏必然比外屏大**。两块屏同时在线时把大面积
-     * 记为「内屏基准」，之后用基准比对（基准是运行时学的，不硬编码分辨率）。
+     * <p>踩过的坑（都不再用）：
+     * <ul>
+     *   <li>Display ID —— 动态分配，「Display 0」永远是当前活跃屏；</li>
+     *   <li>FLAG_PRESENTATION —— 活跃的外屏不带该标志，合上时误判成内屏；</li>
+     *   <li>屏幕面积 —— 合上时只列出外屏一块，它自然成了「最大」，
+     *       而且换了机型不一定成立。</li>
+     * </ul>
      */
-    private static boolean isInnerDisplayActive(android.hardware.display.DisplayManager dm) {
-        java.util.List<android.view.Display> all = new java.util.ArrayList<>();
+    private static boolean isInnerDisplayActive(android.hardware.display.DisplayManager dm,
+                                                android.content.ContentResolver cr) {
+        try {
+            int st = android.provider.Settings.Global.getInt(
+                    cr, "current_device_state", -1);
+            if (st >= 0) {
+                boolean inner = (st == 3);
+                LogUtil.logAlways("[内屏固定] current_device_state=" + st
+                        + " → 内屏=" + inner);
+                return inner;
+            }
+        } catch (Throwable th) {
+            LogUtil.logAlways("[内屏固定] 读 current_device_state 失败: " + th);
+        }
+        // 兜底（非澎湃机型）：用「面积最大的屏」判断
+        int best = -1;
+        int activeArea = -1;
         for (android.view.Display d : dm.getDisplays()) {
-            if (d != null && d.isValid()) {
-                all.add(d);
-            }
-        }
-        // 校准内屏基准：折叠屏展开时两块屏同时在线，
-        //   但合盖时只列出外屏一块 —— 所以不能只靠「同时在线」校准。
-        //   做法：持续记录见过的最大/最小面积，
-        //   一旦最大 > 最小，说明见过两块屏，最大那个就是内屏。
-        for (android.view.Display d : all) {
-            android.util.DisplayMetrics mx = new android.util.DisplayMetrics();
-            d.getRealMetrics(mx);
-            int a = mx.widthPixels * mx.heightPixels;
-            if (a <= 0) {
-                continue;
-            }
-            if (sMinAreaSeen <= 0 || a < sMinAreaSeen) {
-                sMinAreaSeen = a;
-            }
-            if (a > sMaxAreaSeen) {
-                sMaxAreaSeen = a;
-            }
-        }
-        if (sMaxAreaSeen > 0 && sMinAreaSeen > 0 && sMaxAreaSeen > sMinAreaSeen) {
-            if (sInnerAreaBase != sMaxAreaSeen) {
-                sInnerAreaBase = sMaxAreaSeen;
-                LogUtil.logAlways("[内屏固定] 校准内屏面积基准=" + sMaxAreaSeen
-                        + "（外屏基准=" + sMinAreaSeen + "）");
-            }
-        }
-
-        // 找当前活跃屏
-        for (android.view.Display d : all) {
-            if (d.getState() != android.view.Display.STATE_ON) {
+            if (d == null || !d.isValid()) {
                 continue;
             }
             android.util.DisplayMetrics mx = new android.util.DisplayMetrics();
             d.getRealMetrics(mx);
             int a = mx.widthPixels * mx.heightPixels;
-            if (sInnerAreaBase <= 0) {
-                // 从未见过两块屏（开机就一直合着）：保守认为不是内屏
-                LogUtil.logAlways("[内屏固定] 内屏基准未校准，保守判为非内屏");
-                return false;
+            if (a > best) {
+                best = a;
             }
-            boolean inner = (a == sInnerAreaBase);
-            LogUtil.logAlways("[内屏固定] 活跃屏 id=" + d.getDisplayId()
-                    + " " + mx.widthPixels + "x" + mx.heightPixels
-                    + " area=" + a + " 基准=" + sInnerAreaBase + " → 内屏=" + inner);
+            if (d.getState() == android.view.Display.STATE_ON) {
+                activeArea = a;
+            }
+        }
+        if (best > 0 && activeArea > 0) {
+            boolean inner = (activeArea == best);
+            LogUtil.logAlways("[内屏联动] 兜底判据 area=" + activeArea
+                    + " 最大=" + best + " → 内屏=" + inner);
             return inner;
         }
         return false;
     }
 
+    /**
+     * 内屏展开时的旋转锁定联动（用户 2026-10-21 最终方案）。
+     *
+     * <p>规则：
+     * <ol>
+     *   <li>展开时若「屏幕旋转锁」是**打开**的 → 关掉它，让屏幕自由旋转，
+     *       5 秒后自动打开锁定；</li>
+     *   <li>展开时旋转锁**本来就是关闭**的 → 完全无视，不等待、不改写；</li>
+     *   <li>5 秒内**合上屏幕** → 立即停止计时，并打开旋转锁；</li>
+     *   <li>5 秒内**用户手动改了开关** → 视为用户已做选择，停止计时不覆盖。</li>
+     * </ol>
+     *
+     * <p>⚠️ 全程**不写任何方向值**（user_rotation_inner 等一律不碰），
+     * 只切换系统的旋转锁定开关（accelerometer_rotation_inner）。
+     * 锁定后锁在哪个方向完全由系统当前值决定。
+     */
     static void applyInnerFixedLandscape() {
-        if (!sInnerFixedLandscape.get()) {
+        if (!sInnerFollowRotation.get()) {
             return;
         }
-        // ⚠️ 模块作用域含 systemui / settings / miui 插件三个进程，
-        //   实测 settings 进程也在跑这段逻辑，与 systemui 互相覆盖设置。
-        //   只允许 SystemUI 执行。
+        // 模块作用域含 systemui / settings / miui 插件三个进程，
+        // 只允许 SystemUI 执行，避免多进程互相覆盖设置。
         if (!isSystemUiProc()) {
             return;
         }
@@ -1531,7 +1448,7 @@ public class MainHook extends XposedModule {
                 return;
             }
             Context ctx = (Context) app;
-            android.content.ContentResolver cr = ctx.getContentResolver();
+            final android.content.ContentResolver cr = ctx.getContentResolver();
 
             android.hardware.display.DisplayManager dm =
                     (android.hardware.display.DisplayManager)
@@ -1540,23 +1457,21 @@ public class MainHook extends XposedModule {
                 return;
             }
 
-            boolean isInnerActive = isInnerDisplayActive(dm);
+            boolean isInnerActive = isInnerDisplayActive(dm, cr);
 
-            // ── 合上屏幕 / 切到外屏 ──
-            //   优先级最高：立即还原模块做过的改动，然后不再调整。
+            // ── 合上 / 切到外屏 ──
             if (!isInnerActive) {
                 if (sIsInnerNow) {
-                    LogUtil.logAlways("[内屏固定] 已合上（内屏不再活跃），还原并停止");
+                    LogUtil.logAlways("[内屏联动] 已合上");
                 }
                 sWasUnfolded = false;
                 sIsInnerNow = false;
-                // 🔑 必须先把 5 秒计时器取消掉！
-                //   用户 2026-10-20 反馈：连续「开屏→关屏→开屏」且都在 5 秒内时，
-                //   第二次开屏会**立刻被锁定** —— 因为第一次的计时器还挂在那里，
-                //   到点就把刚解锁的状态又锁回去了。
-                //   所以合上时：撤销所有待执行任务 + 清状态标记 + 还原原值。
-                cancelFollowTimer();
-                restoreInnerChanges(cr, true);
+                // 规则 3：5 秒内合上 → 立即停止计时，并把旋转锁打开
+                if (sFollowing) {
+                    cancelFollowTimer();
+                    callWindowManagerRotation(true);
+                    LogUtil.logAlways("[内屏联动] 合上时仍在计时，已取消并打开旋转锁");
+                }
                 return;
             }
 
@@ -1564,87 +1479,62 @@ public class MainHook extends XposedModule {
             if (!sIsInnerNow) {
                 sWasUnfolded = true;
                 sIsInnerNow = true;
-                LogUtil.logAlways("[内屏固定] 检测到展开（外屏→内屏）");
+                LogUtil.logAlways("[内屏联动] 检测到展开");
             }
             if (!sWasUnfolded) {
-                return;   // 不是刚展开，什么都不做
+                return;
             }
             sWasUnfolded = false;
 
-            final String KEY_AUTO = "accelerometer_rotation_inner";
-            final String KEY_USER = "user_rotation_inner";
-            int autoNow = android.provider.Settings.System.getInt(cr, KEY_AUTO, 1);
-            int userNow = android.provider.Settings.System.getInt(cr, KEY_USER, 0);
-            LogUtil.logAlways("[内屏固定] 展开时状态：auto=" + autoNow + " user=" + userNow);
-
-            if (!sInnerFollowRotation.get()) {
-                // ── 开关关：设为横屏并锁定（合上时还原）──
-                sSavedAutoInner = autoNow;
-                sSavedUserInner = userNow;
-                // 📌 2026-10-20：改用系统的旋转锁定接口，而不是直接写设置
-                //    （写设置 WMS 不跟随，会锁到错误方向）
-                callWindowManagerRotation(true);
-                sInnerWrittenUser = Constants.INNER_FIXED_ROTATION;
-                sInnerWrittenAuto = 0;
-                sHasPendingChange = true;
-                LogUtil.logAlways("[内屏固定] 开关关：设为横屏 " + Constants.INNER_FIXED_ROTATION
-                        + " 并锁定（原值 auto=" + autoNow + " user=" + userNow + "，合上时还原）");
-                return;
-            }
-
-            // ── 开关开：解除锁定 → 5 秒 → 恢复锁定 ──
-            // ⚠️ 2026-10-20 实测问题：applyInnerFixedLandscape() 会被多个入口
-            //   （DisplayListener、亮屏、配置变化）连续调用，导致「解除锁定」
-            //   被重复执行、计时器被重置，用户感觉不到 5 秒。
-            //   所以用 sFollowing 标记：一旦进入跟随窗口，期间直接忽略。
+            // 已在计时中（多次入口重复触发）：忽略
             if (sFollowing) {
-                LogUtil.logAlways("[内屏固定] 正在跟随中，忽略重复触发");
+                LogUtil.logAlways("[内屏联动] 计时中，忽略重复触发");
                 return;
             }
-            if (autoNow != 0) {
-                LogUtil.logAlways("[内屏固定] 内屏本来就是自动旋转，不干预");
-                return;
-            }
-            sFollowing = true;
-            // 📌 展开瞬间先把内屏转到 270°（摄像头右上角），再解除锁定。
-            //   原因（2026-10-21 实测）：合盖时内屏 state=OFF，
-            //   WMS 的方向接口对它**完全无效**（setRotationAtAngleIfAllowed、
-            //   freezeRotation 都试过，user_rotation_inner 纹丝不动）。
-            //   只有在内屏刚变 ON 的这一刻设置才生效。
-            setInnerRotationAngle(Constants.INNER_FIXED_ROTATION);
-            sSavedAutoInner = autoNow;
-            sSavedUserInner = -1;          // 方向值不动，只动锁定开关
-            callWindowManagerRotation(false);
-            sInnerWrittenAuto = 1;
-            sInnerWrittenUser = -1;
-            sHasPendingChange = true;
-            LogUtil.logAlways("[内屏固定] 开关开：解除锁定，"
-                    + Constants.INNER_FOLLOW_DURATION_MS + "ms 后恢复");
 
-            final android.content.ContentResolver crF = cr;
+            // 读当前旋转锁状态：0 = 锁定；1 = 未锁定（可自由旋转）
+            int autoNow = android.provider.Settings.System.getInt(
+                    cr, "accelerometer_rotation_inner", -1);
+            if (autoNow != 0) {
+                // 规则 2：本来就是未锁定 → 完全无视
+                LogUtil.logAlways("[内屏联动] 展开时旋转锁已是关闭状态（auto="
+                        + autoNow + "），不干预");
+                return;
+            }
+
+            // 规则 1：锁定中 → 关掉锁定，5 秒后恢复
+            sFollowing = true;
+            sLockSnapshot = 1;          // 我们期望的值：1 = 未锁定
+            callWindowManagerRotation(false);
+            LogUtil.logAlways("[内屏联动] 展开：已关闭旋转锁，"
+                    + Constants.INNER_FOLLOW_DURATION_MS + "ms 后恢复锁定");
+
             sInnerHandler.postDelayed(new Runnable() {
                 @Override
                 public void run() {
                     try {
-                        if (!sHasPendingChange) {
-                            return;   // 已经被还原/放弃，不重复操作
+                        if (!sFollowing) {
+                            return;   // 已被合上/取消
                         }
-                        if (wasChangedByUser(crF)) {
-                            clearPendingChange();
+                        // 规则 4：计时期间用户手动改过 → 尊重用户，不覆盖
+                        int now = android.provider.Settings.System.getInt(
+                                cr, "accelerometer_rotation_inner", -1);
+                        if (now != sLockSnapshot) {
+                            LogUtil.logAlways("[内屏联动] 计时期间开关被改动（期望="
+                                    + sLockSnapshot + " 实际=" + now + "），放弃锁定");
                             return;
                         }
                         callWindowManagerRotation(true);
-                        sFollowing = false;
-                        LogUtil.logAlways("[内屏固定] 5 秒到，已恢复旋转锁定");
-                        // 锁定值就是我们写进去的那个（0），无需再还原
-                        clearPendingChange();
+                        LogUtil.logAlways("[内屏联动] 计时结束，已打开旋转锁");
                     } catch (Throwable th) {
-                        LogUtil.logAlways("[内屏固定] 恢复锁定失败: " + th);
+                        LogUtil.logAlways("[内屏联动] 打开锁定失败: " + th);
+                    } finally {
+                        sFollowing = false;
                     }
                 }
             }, Constants.INNER_FOLLOW_DURATION_MS);
         } catch (Throwable th) {
-            LogUtil.logAlways("[内屏固定] 异常: " + th);
+            LogUtil.logAlways("[内屏联动] 异常: " + th);
         }
     }
 
@@ -1789,8 +1679,6 @@ public class MainHook extends XposedModule {
             //   这里保持默认语义，用户首次安装即为开启。
             sRotationHintEnable.set(bundle.getBoolean(Constants.PREFS_ROTATION_HINT,
                     Constants.DEFAULT_ROTATION_HINT));
-            sInnerFixedLandscape.set(bundle.getBoolean(Constants.PREFS_INNER_FIXED_LANDSCAPE,
-                    Constants.DEFAULT_INNER_FIXED_LANDSCAPE));
             sInnerFollowRotation.set(bundle.getBoolean(Constants.PREFS_INNER_FOLLOW_ROTATION,
                     Constants.DEFAULT_INNER_FOLLOW_ROTATION));
             // 开关变化后立即尝试应用（内部会自己判断前置条件）

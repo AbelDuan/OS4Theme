@@ -198,33 +198,9 @@ public final class Constants {
     public static final boolean DEFAULT_ROTATION_HINT = true;
 
     /**
-     * 内屏固定横屏（摄像头在右上角）。
+     * 内屏展开时联动自动旋转（用户 2026-10-21 最终方案）。
      *
-     * <p>用户 2026-10-20 要求：「当自动旋转是关闭的时候，展开内屏就固定在这个状态」。
-     * 打开后：自动旋转关闭时，把内屏的 {@code user_rotation} 固定为
-     * {@link #INNER_FIXED_ROTATION}（270°，实测挖孔落在右侧 = 摄像头右上角）。
-     */
-    public static final String PREFS_INNER_FIXED_LANDSCAPE = "inner_fixed_landscape";
-    public static final boolean DEFAULT_INNER_FIXED_LANDSCAPE = false;
-
-    /**
-     * 内屏固定方向的 {@code user_rotation} 值。
-     *
-     * <p>本机实测（dumpsys window displays）内屏挖孔位置：
-     * <pre>
-     *   ROTATION_0   insets=[0,140][0,0]    顶部
-     *   ROTATION_90  insets=[140,0][0,0]    左侧
-     *   ROTATION_180 无挖孔
-     *   ROTATION_270 insets=[0,0][140,43]   右侧  ← 摄像头右上角
-     * </pre>
-     * 所以取 3（即 ROTATION_270）。
-     */
-    public static final int INNER_FIXED_ROTATION = 3;
-
-    /**
-     * 内屏展开时联动自动旋转（用户 2026-10-20 要求）。
-     *
-     * <p>开关语义：
+     * <p>语义：
      * <ul>
      *   <li><b>关</b>：展开内屏 → 直接设成横屏（摄像头右上角）并保持锁定。</li>
      *   <li><b>开</b>：展开时若内屏**已锁定方向**，则先打开自动旋转，
@@ -236,7 +212,9 @@ public final class Constants {
     public static final boolean DEFAULT_INNER_FOLLOW_ROTATION = false;
 
     /** 开启联动时，跟随传感器的时长（毫秒）。 */
-    public static final long INNER_FOLLOW_DURATION_MS = 5000L;    /** 两侧最小留白 48dp，避免顶到物理边缘（折叠屏边缘有弧度） */
+    public static final long INNER_FOLLOW_DURATION_MS = 5000L;
+    /** 展开后先锁定在 270° 保持多久，再解除锁定开始跟随（毫秒）。
+     *  太短会导致 270° 还没生效就被解锁覆盖，内屏仍是竖屏（摄像头在顶部）。 */
     public static final int NOTIF_WIDTH_MARGIN_DP = 48;
 
     /**
@@ -398,6 +376,6 @@ public final class Constants {
     public static final String PREFS_NOTIF_IMPORTANCE = "notif_importance";
     // ⚠️ 这两个数组必须**同序同长**：reloadPrefs 与 StatusProvider 都按下标一一对应取值。
     //    新增开关只能往**末尾追加**，不可插队（v3.41.2 追加了通知宽度总开关）。
-    public static final String[] ALL_PREF_KEYS = {PREFS_GLASS_ENABLED, PREFS_FOCUS_GLASS, PREFS_AOD_BATTERY_SYNC, PREFS_PIN_GLASS, PREFS_NO_FOLD_HISTORY, PREFS_SINK_ENABLED, PREFS_NO_NOTIF_LIMIT, PREFS_KEEP_NOTIF, PREFS_HIDE_BT_UNLOCK, PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_ALLOW_MANAGE_ALL, PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE, PREFS_ENABLE_LOG, PREFS_NOTIF_IMPORTANCE, PREFS_NOTIF_WIDTH_ENABLE, PREFS_ROTATION_HINT, PREFS_INNER_FIXED_LANDSCAPE, PREFS_INNER_FOLLOW_ROTATION};
+    public static final String[] ALL_PREF_KEYS = {PREFS_GLASS_ENABLED, PREFS_FOCUS_GLASS, PREFS_AOD_BATTERY_SYNC, PREFS_PIN_GLASS, PREFS_NO_FOLD_HISTORY, PREFS_SINK_ENABLED, PREFS_NO_NOTIF_LIMIT, PREFS_KEEP_NOTIF, PREFS_HIDE_BT_UNLOCK, PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_ALLOW_MANAGE_ALL, PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE, PREFS_ENABLE_LOG, PREFS_NOTIF_IMPORTANCE, PREFS_NOTIF_WIDTH_ENABLE, PREFS_ROTATION_HINT, PREFS_INNER_FOLLOW_ROTATION};
     public static final boolean[] ALL_PREF_DEFAULTS = {true, true, true, true, true, false, true, true, true, true, true, true, false, true, true, false, true, false, false, false, false};
 }
