@@ -1213,6 +1213,14 @@ public class MainHook extends XposedModule {
     private static volatile boolean sHasPendingChange = false;
     /** 是否正处于「展开后跟随」的 5 秒窗口内 —— 期间不再重复触发，否则会把计时器重置。 */
     private static volatile boolean sFollowing = false;
+    /** 内屏面积基准（运行时校准，跨展开/合上不变）。-1 未校准。 */
+    private static volatile int sInnerAreaBase = -1;
+    /** 见过的最小屏幕面积（= 外屏），用于反推内屏基准。 */
+    private static volatile int sMinAreaSeen = -1;
+    /** 见过的最大屏幕面积（= 内屏候选）。 */
+    private static volatile int sMaxAreaSeen = -1;
+    /** 进程判断缓存：-1 未判定，0 否，1 是。 */
+    private static volatile int sIsSystemUiProc = -1;
 
     /**
      * 检查用户是否在这期间**手动改过**设置。
@@ -1257,7 +1265,10 @@ public class MainHook extends XposedModule {
      *              合上只是「触发还原」，不代表可以覆盖用户的手动设置）
      */
     private static void restoreInnerChanges(android.content.ContentResolver cr, boolean force) {
-        if (!sHasPendingChange) {
+        // force=true 表示「合上屏幕」：即使没有挂起的改动，也要把内屏
+        // 预设成「锁定 + 270°」，这样下次展开直接就是横屏（摄像头右上角），
+        // 不会出现「展开后先是竖屏、等 5 秒才转横屏」。
+        if (!sHasPendingChange && !force) {
             return;
         }
         try {
@@ -1394,8 +1405,124 @@ public class MainHook extends XposedModule {
         return false;
     }
 
+    /**
+     * 把内屏转到指定角度（0=竖屏 1=90° 2=180° 3=270°）。
+     *
+     * <p>用 {@code IWindowManager.setRotationAtAngleIfAllowed}——这是系统自己
+     * 设置方向的接口。注意：**只有内屏处于 ON 状态时调用才有效**，
+     * 合盖状态下内屏是 OFF，任何接口都改不动它。
+     */
+    private static void setInnerRotationAngle(int rotation) {
+        try {
+            Object wm = getWindowManagerService();
+            if (wm == null) {
+                return;
+            }
+            java.lang.reflect.Method m = wm.getClass().getMethod(
+                    "setRotationAtAngleIfAllowed", int.class, String.class);
+            m.setAccessible(true);
+            m.invoke(wm, rotation * 90, "HyperOSGlass");
+            LogUtil.logAlways("[内屏固定] 已把内屏转到 " + (rotation * 90) + "°");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[内屏固定] 设置内屏角度失败: " + th);
+        }
+    }
+
+    /** 只允许 SystemUI 进程执行内屏固定逻辑，避免多进程互相覆盖设置。 */
+    private static boolean isSystemUiProc() {
+        int cached = sIsSystemUiProc;
+        if (cached >= 0) {
+            return cached == 1;
+        }
+        boolean r = false;
+        try (java.io.BufferedReader br = new java.io.BufferedReader(
+                new java.io.FileReader("/proc/self/cmdline"))) {
+            StringBuilder sb = new StringBuilder();
+            int ch;
+            while ((ch = br.read()) > 0) {
+                sb.append((char) ch);
+            }
+            r = "com.android.systemui".equals(sb.toString());
+        } catch (Throwable unused) {
+        }
+        sIsSystemUiProc = r ? 1 : 0;
+        return r;
+    }
+
+    /**
+     * 判断当前活跃屏是不是内屏。
+     *
+     * <p>⚠️ 不能用 FLAG_PRESENTATION：实测合盖时**活跃的外屏不带该标志**，
+     * 会被误判成内屏（用户反馈「外屏竖屏展开后内屏也竖屏」）。
+     *
+     * <p>也不能用 Display ID：它是动态分配的，「Display 0」永远指当前活跃屏。
+     *
+     * <p>正确做法：折叠屏的**内屏必然比外屏大**。两块屏同时在线时把大面积
+     * 记为「内屏基准」，之后用基准比对（基准是运行时学的，不硬编码分辨率）。
+     */
+    private static boolean isInnerDisplayActive(android.hardware.display.DisplayManager dm) {
+        java.util.List<android.view.Display> all = new java.util.ArrayList<>();
+        for (android.view.Display d : dm.getDisplays()) {
+            if (d != null && d.isValid()) {
+                all.add(d);
+            }
+        }
+        // 校准内屏基准：折叠屏展开时两块屏同时在线，
+        //   但合盖时只列出外屏一块 —— 所以不能只靠「同时在线」校准。
+        //   做法：持续记录见过的最大/最小面积，
+        //   一旦最大 > 最小，说明见过两块屏，最大那个就是内屏。
+        for (android.view.Display d : all) {
+            android.util.DisplayMetrics mx = new android.util.DisplayMetrics();
+            d.getRealMetrics(mx);
+            int a = mx.widthPixels * mx.heightPixels;
+            if (a <= 0) {
+                continue;
+            }
+            if (sMinAreaSeen <= 0 || a < sMinAreaSeen) {
+                sMinAreaSeen = a;
+            }
+            if (a > sMaxAreaSeen) {
+                sMaxAreaSeen = a;
+            }
+        }
+        if (sMaxAreaSeen > 0 && sMinAreaSeen > 0 && sMaxAreaSeen > sMinAreaSeen) {
+            if (sInnerAreaBase != sMaxAreaSeen) {
+                sInnerAreaBase = sMaxAreaSeen;
+                LogUtil.logAlways("[内屏固定] 校准内屏面积基准=" + sMaxAreaSeen
+                        + "（外屏基准=" + sMinAreaSeen + "）");
+            }
+        }
+
+        // 找当前活跃屏
+        for (android.view.Display d : all) {
+            if (d.getState() != android.view.Display.STATE_ON) {
+                continue;
+            }
+            android.util.DisplayMetrics mx = new android.util.DisplayMetrics();
+            d.getRealMetrics(mx);
+            int a = mx.widthPixels * mx.heightPixels;
+            if (sInnerAreaBase <= 0) {
+                // 从未见过两块屏（开机就一直合着）：保守认为不是内屏
+                LogUtil.logAlways("[内屏固定] 内屏基准未校准，保守判为非内屏");
+                return false;
+            }
+            boolean inner = (a == sInnerAreaBase);
+            LogUtil.logAlways("[内屏固定] 活跃屏 id=" + d.getDisplayId()
+                    + " " + mx.widthPixels + "x" + mx.heightPixels
+                    + " area=" + a + " 基准=" + sInnerAreaBase + " → 内屏=" + inner);
+            return inner;
+        }
+        return false;
+    }
+
     static void applyInnerFixedLandscape() {
         if (!sInnerFixedLandscape.get()) {
+            return;
+        }
+        // ⚠️ 模块作用域含 systemui / settings / miui 插件三个进程，
+        //   实测 settings 进程也在跑这段逻辑，与 systemui 互相覆盖设置。
+        //   只允许 SystemUI 执行。
+        if (!isSystemUiProc()) {
             return;
         }
         try {
@@ -1413,23 +1540,7 @@ public class MainHook extends XposedModule {
                 return;
             }
 
-            // 判据：FLAG_PRESENTATION 标记外屏（Android 标准，跨机型通用）
-            boolean isInnerActive = false;
-            int activeId = -1;
-            for (android.view.Display d : dm.getDisplays()) {
-                if (d == null || !d.isValid()) {
-                    continue;
-                }
-                if ((d.getFlags() & android.view.Display.FLAG_PRESENTATION) != 0) {
-                    continue;   // 外屏
-                }
-                if (d.getState() != android.view.Display.STATE_ON) {
-                    continue;
-                }
-                activeId = d.getDisplayId();
-                isInnerActive = true;
-                break;
-            }
+            boolean isInnerActive = isInnerDisplayActive(dm);
 
             // ── 合上屏幕 / 切到外屏 ──
             //   优先级最高：立即还原模块做过的改动，然后不再调整。
@@ -1453,7 +1564,7 @@ public class MainHook extends XposedModule {
             if (!sIsInnerNow) {
                 sWasUnfolded = true;
                 sIsInnerNow = true;
-                LogUtil.logAlways("[内屏固定] 检测到展开（外屏→内屏）id=" + activeId);
+                LogUtil.logAlways("[内屏固定] 检测到展开（外屏→内屏）");
             }
             if (!sWasUnfolded) {
                 return;   // 不是刚展开，什么都不做
@@ -1495,6 +1606,12 @@ public class MainHook extends XposedModule {
                 return;
             }
             sFollowing = true;
+            // 📌 展开瞬间先把内屏转到 270°（摄像头右上角），再解除锁定。
+            //   原因（2026-10-21 实测）：合盖时内屏 state=OFF，
+            //   WMS 的方向接口对它**完全无效**（setRotationAtAngleIfAllowed、
+            //   freezeRotation 都试过，user_rotation_inner 纹丝不动）。
+            //   只有在内屏刚变 ON 的这一刻设置才生效。
+            setInnerRotationAngle(Constants.INNER_FIXED_ROTATION);
             sSavedAutoInner = autoNow;
             sSavedUserInner = -1;          // 方向值不动，只动锁定开关
             callWindowManagerRotation(false);
