@@ -32,10 +32,6 @@ public final class Constants {
     public static final boolean DEFAULT_QS_EDIT_HIDE = true;
     public static final boolean DEFAULT_SINK_ENABLED = false;
     public static final String ENTRY_SBN_FIELD = "mSbn";
-    public static final String EXPAND_BUTTON_PILL_ID_NAME = "expand_button_pill";
-    public static final String EXPAND_BUTTON_VIEW_CLASS = "com.android.internal.widget.NotificationOptimizedLinearLayout";
-    public static final int EXPAND_PILL_BG_DARK = 654311423;
-    public static final int EXPAND_PILL_BG_LIGHT = 536870911;
     public static final String FILE_AUTH = "com.abel.hyperosglass.fileprovider";
     public static final String FOCUS_BLUR_CLASS = "com.android.systemui.statusbar.notification.style.vieweffect.FocusNotificationBlurEffect";
     public static final String FOD_ANIM_ITEM_MAP_FIELD = "mAnimItemMap";

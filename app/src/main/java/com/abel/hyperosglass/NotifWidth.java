@@ -49,6 +49,9 @@ public final class NotifWidth {
     private static volatile int sCacheValue = -1;
 
     /** 资源名 → 是否目标资源的判定缓存，避免每次都比对字符串数组 */
+    /** 资源 id → 资源名 缓存（跳过 getResourceName 的 JNI 查表）。 */
+    private static final android.util.SparseArray<String> sIdName =
+            new android.util.SparseArray<>();
     private static final java.util.concurrent.ConcurrentHashMap<String, Boolean> sIsTarget =
             new java.util.concurrent.ConcurrentHashMap<String, Boolean>();
 
@@ -242,15 +245,22 @@ public final class NotifWidth {
             return original;
         }
 
-        String name;
-        try {
-            name = res.getResourceName(id);
-            int slash = name.lastIndexOf('/');
-            if (slash >= 0) {
-                name = name.substring(slash + 1);
+        // 🔑 2026-10-22 性能修正：getResourceName 是跨 JNI 的查表调用。
+        //   长按通知时系统会连续重测布局，Resources 取值被高频命中 ——
+        //   每次都查资源名会让长按动画掉帧，视觉上就是「背景分两三个阶梯跳」。
+        //   这里按资源 id 缓存名字，命中后完全跳过 JNI。
+        String name = sIdName.get(id);
+        if (name == null) {
+            try {
+                name = res.getResourceName(id);
+                int slash = name.lastIndexOf('/');
+                if (slash >= 0) {
+                    name = name.substring(slash + 1);
+                }
+                sIdName.put(id, name);
+            } catch (Throwable unused) {
+                return original;
             }
-        } catch (Throwable unused) {
-            return original;
         }
 
         Boolean target = sIsTarget.get(name);

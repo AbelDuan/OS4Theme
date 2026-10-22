@@ -164,6 +164,20 @@ final class RotationButtonOverlay {
                         mView.setScaleY(1f);
                         mView.setVisibility(View.GONE);
                     }
+                    // 🔑 2026-10-22：隐藏时**彻底移除窗口**，而不是只设 GONE。
+                    //
+                    // 用户反馈「长按通知时，通知背景和整个屏幕的亮度/通透度会变」。
+                    // 我们的悬浮窗用的是 TYPE_NAVIGATION_BAR_PANEL(2024)，
+                    // 一个常驻的透明窗口会参与系统的 dim/覆盖层计算 ——
+                    // 长按通知触发 dim 时，这层也被算进去，视觉上就是整体亮度变了。
+                    // 用完即移除，就不再有任何残留窗口参与计算。
+                    if (mAdded) {
+                        try {
+                            mWm.removeViewImmediate(mView);
+                        } catch (Throwable unused) {
+                        }
+                        mAdded = false;
+                    }
                 } catch (Throwable unused) {
                 }
             }

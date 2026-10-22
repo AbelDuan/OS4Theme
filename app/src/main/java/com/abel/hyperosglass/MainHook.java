@@ -121,8 +121,6 @@ public class MainHook extends XposedModule {
     private static volatile boolean sReloadReceiverRegistered = false;
     private static final AtomicBoolean sSyncRunning = new AtomicBoolean(false);
     private static volatile boolean sSyncDirty = false;
-    private static volatile int sExpandPillId = 0;
-    private static volatile Class<?> sExpandViewClass = null;
     private static volatile Field sFodAuthenField = null;
     private static volatile Field sFodAnimMapField = null;
     private static volatile Field sFodCtxField = null;
@@ -159,7 +157,19 @@ public class MainHook extends XposedModule {
                 installPluginClassLoaderHooks(defaultClassLoader);
                 installPluginClassLoadGuard();
                 installMediaIslandDefense(defaultClassLoader);
-                installExpandButtonColor(defaultClassLoader);
+                // ⛔ 2026-10-22 停用：installExpandButtonColor 误伤所有通知。
+                //
+                // 它 hook 的是 View.setBackground，匹配条件是
+                //   id == expand_button_pill(0x102032a) && 类 == NotificationOptimizedLinearLayout
+                // 但后者是**通知行的通用容器类**，所有通知都用它，
+                // 于是每一条通知的背景都被替换成白透玻璃 ——
+                // 表现为「长按通知时通知横条背景变亮变透明、还分两三个阶梯跳」
+                // （长按会重新 setBackground，于是再替换一次）。
+                //
+                // 实测日志已确认命中对象就是 NotificationOptimizedLinearLayout。
+                // 高度判断也无法区分（命中点是通知行内部的小容器）。
+                // 该功能从未真正命中过「展开按钮」，一直在误伤通知，故停用。
+                // installExpandButtonColor(defaultClassLoader);
                 installLockFodHooks(defaultClassLoader);
                 installHideDismissButtonHook(defaultClassLoader);
                 installFocusGlassHooks(defaultClassLoader);
@@ -2298,145 +2308,14 @@ public class MainHook extends XposedModule {
         }
     }
 
-    private void installExpandButtonColor(ClassLoader classLoader) {
-        if (classLoader == null) {
-            return;
-        }
-        try {
-            try {
-                hook(View.class.getMethod("setBackground", Drawable.class)).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("expand-button-color-bg").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook.9
-                    public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                        if (!MainHook.this.sGlassEnabled) {
-                            return chain.proceed();
-                        }
-                        Object thisObject = chain.getThisObject();
-                        if (thisObject instanceof View) {
-                            View view = (View) thisObject;
-                            if (MainHook.isExpandView(view)) {
-                                Object[] objArr = {MainHook.makeGlassPill(view.getResources())};
-                                if (LogUtil.hitOnce("expand-bg")) {
-                                    LogUtil.logAlways("[展开按钮] setBackground 拦截替换为白透 类=" + view.getClass().getName() + " id=0x" + Integer.toHexString(view.getId()));
-                                }
-                                return chain.proceed(objArr);
-                            }
-                        }
-                        return chain.proceed();
-                    }
-                });
-                LogUtil.logAlways("[展开按钮] 已挂钩 setBackground（v1.6.2 宽泛匹配拦截）");
-            } catch (Throwable th) {
-                LogUtil.logAlways("[展开按钮] setBackground 挂钩失败: " + th);
-            }
-            try {
-                hook(View.class.getMethod("setBackgroundTintList", ColorStateList.class)).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("expand-button-color-tint").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook.10
-                    public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                        if (!MainHook.this.sGlassEnabled) {
-                            return chain.proceed();
-                        }
-                        Object thisObject = chain.getThisObject();
-                        if (thisObject instanceof View) {
-                            View view = (View) thisObject;
-                            if (MainHook.isExpandView(view)) {
-                                Object[] objArr = {null};
-                                if (LogUtil.hitOnce("expand-tint")) {
-                                    LogUtil.logAlways("[展开按钮] setBackgroundTintList 拦截清 tint 类=" + view.getClass().getName() + " id=0x" + Integer.toHexString(view.getId()));
-                                }
-                                return chain.proceed(objArr);
-                            }
-                        }
-                        return chain.proceed();
-                    }
-                });
-                LogUtil.logAlways("[展开按钮] 已挂钩 setBackgroundTintList（v1.6.2 宽泛匹配拦截）");
-            } catch (Throwable th2) {
-                LogUtil.logAlways("[展开按钮] setBackgroundTintList 挂钩失败: " + th2);
-            }
-        } catch (Throwable th3) {
-            LogUtil.logAlways("[展开按钮] 挂钩失败: " + th3);
-        }
-    }
 
     /* JADX INFO: Access modifiers changed from: private */
-    public static boolean isExpandView(View view) {
-        try {
-            int id = view.getId();
-            if (id == -1) {
-                return false;
-            }
-            int iResolveExpandPillId = sExpandPillId;
-            if (iResolveExpandPillId == 0 && (iResolveExpandPillId = resolveExpandPillId(view)) == 0) {
-                return false;
-            }
-            if (iResolveExpandPillId < 0) {
-                return matchExpandByResourceName(view);
-            }
-            if (id != iResolveExpandPillId) {
-                return false;
-            }
-            Class<?> cls = sExpandViewClass;
-            if (cls != null) {
-                return view.getClass() == cls;
-            }
-            if (Constants.EXPAND_BUTTON_VIEW_CLASS.equals(view.getClass().getName())) {
-                sExpandViewClass = view.getClass();
-                return true;
-            }
-            return false;
-        } catch (Throwable unused) {
-            return false;
-        }
-    }
 
-    private static int resolveExpandPillId(View view) {
-        try {
-            Context context = view.getContext();
-            int identifier = context.getResources().getIdentifier(Constants.EXPAND_BUTTON_PILL_ID_NAME, "id", context.getPackageName());
-            if (identifier == 0) {
-                identifier = context.getResources().getIdentifier(Constants.EXPAND_BUTTON_PILL_ID_NAME, "id", Constants.TARGET_PKG);
-            }
-            sExpandPillId = identifier == 0 ? -1 : identifier;
-            LogUtil.log("[展开按钮] 目标 id 解析: expand_button_pill = " + (identifier == 0 ? "失败，走 id 名兜底" : "0x" + Integer.toHexString(identifier)));
-            return sExpandPillId;
-        } catch (Throwable unused) {
-            sExpandPillId = -1;
-            return -1;
-        }
-    }
 
-    private static boolean matchExpandByResourceName(View view) {
-        if (Constants.EXPAND_BUTTON_VIEW_CLASS.equals(view.getClass().getName())) {
-            return Constants.EXPAND_BUTTON_PILL_ID_NAME.equals(viewIdNameOrNull(view));
-        }
-        return false;
-    }
 
-    private static String viewIdNameOrNull(View view) {
-        String resourceEntryName;
-        try {
-            int id = view.getId();
-            if (id == -1 || (resourceEntryName = view.getResources().getResourceEntryName(id)) == null || resourceEntryName.length() == 0 || resourceEntryName.startsWith("0x")) {
-                return null;
-            }
-            return resourceEntryName;
-        } catch (Throwable unused) {
-        }
-        return null;
-    }
 
-    private static String viewIdName(View view) {
-        String strViewIdNameOrNull = viewIdNameOrNull(view);
-        return strViewIdNameOrNull != null ? strViewIdNameOrNull : "0x" + Integer.toHexString(view.getId());
-    }
 
     /* JADX INFO: Access modifiers changed from: private */
-    public static Drawable makeGlassPill(Resources resources) {
-        int i = (resources.getConfiguration().uiMode & 48) == 32 ? Constants.EXPAND_PILL_BG_DARK : Constants.EXPAND_PILL_BG_LIGHT;
-        GradientDrawable gradientDrawable = new GradientDrawable();
-        gradientDrawable.setShape(0);
-        gradientDrawable.setColor(i);
-        gradientDrawable.setCornerRadius(resources.getDisplayMetrics().density * 14.0f);
-        return gradientDrawable;
-    }
 
     private void installLockFodHooks(ClassLoader classLoader) {
         try {
