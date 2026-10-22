@@ -543,9 +543,45 @@ public final class RotationHint {
      * 位置由我们自己的公式算成绝对坐标，一次 {@code updateViewLayout} 就到位，
      * 不再和系统 FloatingRotationButton 的 mIsShowing 状态机纠缠。
      */
+    /**
+     * 当前屏幕的「旋转锁定」是否处于开启状态。
+     *
+     * <p>2026-10-22 用户要求：<b>「方向锁定按钮是关闭的、支持自动旋转的时候，
+     * 旋转图标也会出现」</b> —— 这种情况不该出现提示，因为屏幕会自己转，
+     * 不需要用户去点。
+     *
+     * <p>内屏读 {@code accelerometer_rotation_inner}，外屏读
+     * {@code accelerometer_rotation}；用 {@code current_device_state}
+     * （3 = 展开/内屏，0 = 折叠/外屏）判断当前在哪块屏。
+     *
+     * @return 锁定中返回 true；读不到时返回 true（宁可显示，不让功能整体失效）
+     */
+    private static boolean isRotationLocked(Context ctx) {
+        try {
+            android.content.ContentResolver cr = ctx.getContentResolver();
+            int state = android.provider.Settings.Global.getInt(
+                    cr, "current_device_state", -1);
+            String key = (state == 3)
+                    ? "accelerometer_rotation_inner"
+                    : "accelerometer_rotation";
+            int auto = android.provider.Settings.System.getInt(cr, key, -1);
+            if (auto < 0) {
+                return true;
+            }
+            return auto == 0;   // 0 = 锁定
+        } catch (Throwable unused) {
+            return true;
+        }
+    }
+
     private static void showNow(int targetRotation, int current) {
         Context ctx = sContext;
         if (ctx == null) {
+            return;
+        }
+        // 支持自动旋转（锁已关闭）时不提示：屏幕会自己转，不需要用户点
+        if (!isRotationLocked(ctx)) {
+            LogUtil.logAlways("[旋转提示] 旋转锁未开启，不显示提示");
             return;
         }
         int corner = RotationButtonOverlay.cornerFor(targetRotation, current);

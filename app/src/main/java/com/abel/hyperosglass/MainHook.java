@@ -99,7 +99,6 @@ public class MainHook extends XposedModule {
     private static final android.os.Handler sInnerHandler =
             new android.os.Handler(android.os.Looper.getMainLooper());
     /** 是否是「刚刚展开」的边沿，用于内屏固定只设一次。 */
-    private static volatile boolean sWasUnfolded = false;
     /** 上一次看到的活跃屏是否为内屏，用于识别展开边沿。 */
     private static volatile boolean sIsInnerNow = false;
     /**
@@ -225,6 +224,10 @@ public class MainHook extends XposedModule {
                                             applyInnerFixedLandscape();
                                         } else if (Intent.ACTION_SCREEN_OFF.equals(a)) {
                                             RotationHint.onScreenStateChanged(false);
+                                            // 熄屏后重置内屏状态：用户下次唤醒若仍是
+                                            // 展开态，屏幕变化会重新走到展开逻辑，
+                                            // 不会因为状态残留而被当成「重复触发」。
+                                            sIsInnerNow = false;
                                             // 熄屏等同「合上」：取消计时并打开旋转锁，
                                             // 避免计时器在息屏期间到点乱改设置。
                                             try {
@@ -270,6 +273,12 @@ public class MainHook extends XposedModule {
 
                                         @Override
                                         public void onDisplayChanged(int displayId) {
+                                            try {
+                                                // 屏幕尺寸/状态变了 → 丢弃悬浮窗，
+                                                // 下次显示时按当前屏幕重建
+                                                RotationButtonOverlay.get().reset();
+                                            } catch (Throwable unused) {
+                                            }
                                             try {
                                                 applyInnerFixedLandscape();
                                             } catch (Throwable unused) {
@@ -1469,7 +1478,6 @@ public class MainHook extends XposedModule {
                 if (sIsInnerNow) {
                     LogUtil.logAlways("[内屏联动] 已合上");
                 }
-                sWasUnfolded = false;
                 sIsInnerNow = false;
                 // 规则 3：5 秒内合上 → 立即停止计时，并把旋转锁打开
                 if (sFollowing) {
@@ -1481,15 +1489,18 @@ public class MainHook extends XposedModule {
             }
 
             // ── 进入内屏：识别展开边沿 ──
-            if (!sIsInnerNow) {
-                sWasUnfolded = true;
-                sIsInnerNow = true;
-                LogUtil.logAlways("[内屏联动] 检测到展开");
-            }
-            if (!sWasUnfolded) {
+            // ⚠️ 2026-10-22 用户反馈「展开时关闭自动旋转开关失效」。
+            //   原来这里用 sIsInnerNow + sWasUnfolded 两个状态来识别边沿：
+            //   只要有一次「合上」没有走到（比如熄屏唤醒、监听漏触发），
+            //   sIsInnerNow 就会一直停在 true，之后每次展开都被当成重复触发
+            //   而直接 return —— 功能永久失效，且没有任何日志。
+            //
+            //   现在只用一个状态：只要当前已是内屏就直接返回。
+            if (sIsInnerNow) {
                 return;
             }
-            sWasUnfolded = false;
+            sIsInnerNow = true;
+            LogUtil.logAlways("[内屏联动] 检测到展开");
 
             // 已在计时中（多次入口重复触发）：忽略
             if (sFollowing) {

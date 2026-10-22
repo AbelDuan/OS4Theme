@@ -54,6 +54,8 @@ final class RotationButtonOverlay {
     private int mSizePx;
     private int mMarginPx;
     private boolean mAdded;
+    /** 最近一次使用的 Context，用于屏幕切换后重建。 */
+    private Context mLastCtx;
     private int mShowingCorner = -1;
     private Runnable mOnClick;
 
@@ -231,10 +233,70 @@ final class RotationButtonOverlay {
         return mShowingCorner;
     }
 
-    private void ensureView(Context ctx) {
+    /**
+     * 屏幕切换时丢弃窗口，下次显示时按当前活跃屏幕重建。
+     *
+     * <p>2026-10-22 用户反馈：外屏切内屏后，图标位置沿用了外屏的尺寸
+     * （不在边缘）。根因是窗口创建时绑定的是当时的默认屏幕，
+     * 折叠屏切换后那块屏的尺寸变了，而窗口还留在原屏幕上。
+     */
+    void reset() {
+        final int corner = mShowingCorner;
+        final Context ctx = mLastCtx;
+        Runnable r = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (mView != null && mAdded) {
+                        mWm.removeViewImmediate(mView);
+                    }
+                } catch (Throwable unused) {
+                }
+                mAdded = false;
+                mView = null;
+                mLp = null;
+                mWm = null;
+                mShowingCorner = -1;
+                mSizePx = 0;
+                mMarginPx = 0;
+                // 之前在显示 → 立刻按新屏幕重建，避免按钮凭空消失
+                if (corner >= 0 && ctx != null) {
+                    show(ctx, corner);
+                }
+            }
+        };
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            r.run();
+        } else {
+            MAIN.post(r);
+        }
+    }
+
+    /** 找到当前点亮的那块屏幕的 Context（折叠屏内/外屏尺寸不同）。 */
+    private static Context activeDisplayContext(Context ctx) {
+        try {
+            android.hardware.display.DisplayManager dm =
+                    (android.hardware.display.DisplayManager)
+                            ctx.getSystemService(Context.DISPLAY_SERVICE);
+            if (dm != null) {
+                for (android.view.Display d : dm.getDisplays()) {
+                    if (d.getState() == android.view.Display.STATE_ON) {
+                        return ctx.createDisplayContext(d);
+                    }
+                }
+            }
+        } catch (Throwable unused) {
+        }
+        return ctx;
+    }
+
+    private void ensureView(Context rawCtx) {
         if (mView != null) {
             return;
         }
+        // 绑定到当前点亮的屏幕，而不是默认屏幕
+        Context ctx = activeDisplayContext(rawCtx);
+        mLastCtx = ctx;
         float d = ctx.getResources().getDisplayMetrics().density;
         mSizePx = (int) (SIZE_DP * d);
         mMarginPx = (int) (MARGIN_DP * d);
@@ -373,12 +435,13 @@ final class RotationButtonOverlay {
             //   深色模式 → 浅色底 + 深色图标
             int iconColor;
             int bgColor;
+            // 背景做成半透明（约 78%），能透出下层内容又不影响图标辨识度
             if (dark) {
                 iconColor = 0xFF101014;   // 近黑图标
-                bgColor = 0xF2EDEDED;     // 浅灰底
+                bgColor = 0xC7EDEDED;     // 浅灰底 · 半透明
             } else {
                 iconColor = 0xFFFFFFFF;   // 白图标
-                bgColor = 0xF22A2A2E;     // 深灰底
+                bgColor = 0xC72A2A2E;     // 深灰底 · 半透明
             }
 
             mView.setColorFilter(iconColor);
@@ -414,7 +477,15 @@ final class RotationButtonOverlay {
     /** 按角落写入绝对坐标。避开挖孔/状态栏，用边距兜住。 */
     private void applyPosition(int corner) {
         android.util.DisplayMetrics dm = new android.util.DisplayMetrics();
-        mWm.getDefaultDisplay().getRealMetrics(dm);
+        android.view.Display d = null;
+        try {
+            d = mView.getDisplay();      // 窗口实际所在的屏幕，最准
+        } catch (Throwable unused) {
+        }
+        if (d == null) {
+            d = mWm.getDefaultDisplay();
+        }
+        d.getRealMetrics(dm);
         int sw = dm.widthPixels;
         int sh = dm.heightPixels;
         int right = sw - mSizePx - mMarginPx;
@@ -470,7 +541,7 @@ final class RotationButtonOverlay {
         Bitmap bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
         Canvas c = new Canvas(bmp);
         Paint bg = new Paint(Paint.ANTI_ALIAS_FLAG);
-        bg.setColor(0xE6202020);
+        bg.setColor(0xC7202020);
         c.drawCircle(size / 2f, size / 2f, size * 0.46f, bg);
 
         Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
