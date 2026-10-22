@@ -2495,27 +2495,27 @@ public class MainHook extends XposedModule {
         }
     }
 
+
+
     private void installFocusGlassHooks(final ClassLoader classLoader) {
         try {
-            Class<?> cls = Class.forName(Constants.FOCUS_BLUR_CLASS, false, classLoader);
-            final Class<?> cls2 = Class.forName("com.android.systemui.statusbar.notification.row.ExpandableNotificationRow", false, classLoader);
-            hook(cls.getDeclaredMethod("apply", cls2, Context.class)).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("focus-glass-blur-swap").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook.14
-                public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                    if (!MainHook.sFocusGlassFlag.get()) {
-                        return chain.proceed();
-                    }
-                    Object arg = chain.getArg(0);
-                    Object arg2 = chain.getArg(1);
-                    try {
-                        Class<?> cls3 = Class.forName(Constants.ROW_BLUR_CLASS, false, classLoader);
-                        cls3.getMethod("apply", cls2, Context.class).invoke(cls3.getField("INSTANCE").get(null), arg, arg2);
-                        return null;
-                    } catch (Throwable unused) {
-                        return chain.proceed();
-                    }
-                }
-            });
-            LogUtil.logAlways("[焦点玻璃] 已挂钩 FocusNotificationBlurEffect.apply → NotificationRowBlurEffect");
+            // ⛔ 2026-10-23 停用：不再把 FocusNotificationBlurEffect 替换成
+            // NotificationRowBlurEffect。
+            //
+            // 反编译证据（sysui.apk）显示这两个实现严重不对称：
+            //
+            //   Row.apply  做 5 件事：
+            //     updateRowBackgroundForEffect / setMiViewMaterialTypeCompat(0)
+            //     setCustomBackground(透明) / applyElementViewBlend(加混合色) / 加模糊
+            //   Row.clear  只撤 2 件：
+            //     setMiViewBlurModeCompat(0) / clearMiBackgroundBlendColorCompat
+            //
+            // 也就是「材质类型 0」和「透明背景」永远留在 NotificationBackgroundView 上，
+            // 于是：长按时材质/背景/混合色一次性全换 → 毫无征兆变暗；
+            // 退出时系统分批恢复（先清混合色、再恢复材质）→ 看起来是阶梯式变亮。
+            //
+            // 这是 MIUI 自己 Row 版的不对称，不是系统本来行为。
+            // 恢复原生 Focus 行为后，apply/clear 由系统自己成对管理。
         } catch (Throwable th) {
             LogUtil.logAlways("[焦点玻璃] blur 替换挂钩失败: " + th);
         }

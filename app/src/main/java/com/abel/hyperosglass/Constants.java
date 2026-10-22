@@ -33,7 +33,6 @@ public final class Constants {
     public static final boolean DEFAULT_SINK_ENABLED = false;
     public static final String ENTRY_SBN_FIELD = "mSbn";
     public static final String FILE_AUTH = "com.abel.hyperosglass.fileprovider";
-    public static final String FOCUS_BLUR_CLASS = "com.android.systemui.statusbar.notification.style.vieweffect.FocusNotificationBlurEffect";
     public static final String FOD_ANIM_ITEM_MAP_FIELD = "mAnimItemMap";
     public static final int FOD_FLOW_HAS_ENROLLED_INDEX = 6;
     public static final String FOD_GET_FINGER_ICON_RES_METHOD = "getFingerIconResource";
@@ -106,7 +105,6 @@ public final class Constants {
     public static final String PREFS = "hyperosglass";
     public static final String PREFS_FOD_MODE_LEGACY = "fod_mode";
     public static final String QS_EDIT_CONTROLLER_CLASS = "miui.systemui.controlcenter.panel.main.qs.EditButtonController";
-    public static final String ROW_BLUR_CLASS = "com.android.systemui.statusbar.notification.style.vieweffect.NotificationRowBlurEffect";
     public static final String SBN_SHOWN_AFTER_UNLOCK_FIELD = "mHasShownAfterUnlock";
     public static final String STATUS_AUTHORITY = "com.abel.hyperosglass.status";
     public static final String STATUS_URI = "content://com.abel.hyperosglass.status";
