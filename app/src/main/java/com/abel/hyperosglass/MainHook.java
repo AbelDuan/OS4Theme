@@ -218,9 +218,16 @@ public class MainHook extends XposedModule {
                                         String a = intent.getAction();
                                         if (Intent.ACTION_SCREEN_ON.equals(a)) {
                                             RotationHint.onScreenStateChanged(true);
-                                            // 亮屏时也补一次内屏固定：
-                                            // 折叠/展开、亮屏都可能改变当前屏，
-                                            // 只在配置重载时做一次会遗漏这些时机。
+                                            // 2026-10-22 用户要求：唤醒屏幕也当作
+                                            // 「刚刚打开内屏」判定一次。
+                                            // 先清状态，否则会被「已经是内屏」的
+                                            // 重复触发检查直接挡回去。
+                                            sIsInnerNow = false;
+                                            applyInnerFixedLandscape();
+                                        } else if (Intent.ACTION_USER_PRESENT.equals(a)) {
+                                            // 解锁：同样按「刚刚打开内屏」处理
+                                            LogUtil.logAlways("[内屏联动] 检测到解锁");
+                                            sIsInnerNow = false;
                                             applyInnerFixedLandscape();
                                         } else if (Intent.ACTION_SCREEN_OFF.equals(a)) {
                                             RotationHint.onScreenStateChanged(false);
@@ -245,6 +252,8 @@ public class MainHook extends XposedModule {
                             },
                             new IntentFilter(Intent.ACTION_SCREEN_ON) {{
                                 addAction(Intent.ACTION_SCREEN_OFF);
+                                // 解锁广播：和「刚刚打开内屏」走同一套判定
+                                addAction(Intent.ACTION_USER_PRESENT);
                             }});
                     LogUtil.logAlways("[旋转提示] 已注册屏幕开关监听（熄屏注销传感器）");
 

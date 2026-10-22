@@ -438,10 +438,10 @@ final class RotationButtonOverlay {
             // 背景做成半透明（约 78%），能透出下层内容又不影响图标辨识度
             if (dark) {
                 iconColor = 0xFF101014;   // 近黑图标
-                bgColor = 0xC7EDEDED;     // 浅灰底 · 半透明
+                bgColor = 0x99EDEDED;     // 浅灰底 · 60%
             } else {
                 iconColor = 0xFFFFFFFF;   // 白图标
-                bgColor = 0xC72A2A2E;     // 深灰底 · 半透明
+                bgColor = 0x992A2A2E;     // 深灰底 · 60%
             }
 
             mView.setColorFilter(iconColor);
@@ -541,7 +541,7 @@ final class RotationButtonOverlay {
         Bitmap bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
         Canvas c = new Canvas(bmp);
         Paint bg = new Paint(Paint.ANTI_ALIAS_FLAG);
-        bg.setColor(0xC7202020);
+        bg.setColor(0x99202020);
         c.drawCircle(size / 2f, size / 2f, size * 0.46f, bg);
 
         Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
