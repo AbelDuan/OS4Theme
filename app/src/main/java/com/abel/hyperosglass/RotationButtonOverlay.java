@@ -205,18 +205,31 @@ final class RotationButtonOverlay {
         });
     }
 
-    /** 出现：淡入 + 轻微放大。 */
+    /** 出现：轻微放大（**可见性绝不交给动画**，见下）。 */
     private void fadeIn() {
-        mView.setAlpha(0f);
-        mView.setScaleX(0.82f);
-        mView.setScaleY(0.82f);
-        mView.animate()
-                .alpha(1f)
-                .scaleX(1f)
-                .scaleY(1f)
-                .setDuration(120L)
-                .setInterpolator(new android.view.animation.DecelerateInterpolator())
-                .start();
+        try {
+            mView.animate().cancel();
+            // 🔑 2026-10-24 修复「窗口加了、日志也显示已显示，屏幕上却什么都没有」：
+            //
+            //   原来这里是 setAlpha(0f) + animate().alpha(1f).start()。
+            //   但 show() 里刚刚才 addView，此刻视图**往往还没 attach**，
+            //   ViewPropertyAnimator 的启动依赖 attach/Choreographer —— 动画一旦没跑，
+            //   alpha 就永久停在 0：dumpsys 里窗口 shown=true、HAS_DRAWN，
+            //   SurfaceFlinger 也有缓冲，但整块内容是全透明的，肉眼什么都没有。
+            //   （实测 2026-10-24，lhasa：frame=[1406,142][1530,266] 在位、三张截图一模一样）
+            //
+            //   所以改成「先保证可见」，动画只做缩放这种**不影响可见性**的修饰。
+            mView.setAlpha(1f);
+            mView.setScaleX(0.88f);
+            mView.setScaleY(0.88f);
+            mView.animate()
+                    .scaleX(1f)
+                    .scaleY(1f)
+                    .setDuration(110L)
+                    .setInterpolator(new android.view.animation.DecelerateInterpolator())
+                    .start();
+        } catch (Throwable unused) {
+        }
     }
 
     /** 消失：淡出 + 轻微缩小，动画结束再 GONE。 */

@@ -597,6 +597,177 @@ public final class RotationHint {
                 + " 目标=" + targetRotation + " 角落=" + corner + "）");
     }
 
+    // ── 状态重算（2026-10-24）────────────────────────────────────────────
+    /** 状态监听是否已装。 */
+    private static volatile boolean sWatchersInstalled;
+    /** 最近一次看到的屏幕 rotation，用于过滤 DisplayListener 的重复回调。 */
+    private static volatile int sWatchedScreenRotation = -1;
+
+    /**
+     * 安装「状态变化」监听，让旋钮在**任何**相关状态变化后重算一次。
+     *
+     * <h2>为什么必须有这一层（2026-10-24 修复「锁定旋转后转屏幕不弹旋钮」）</h2>
+     * 原来整个判定只有一个触发点：<b>方向传感器上报新方向</b>
+     * （{@code onOrientationDegrees} 里 {@code sSensorTargetRotation != target} 才往下走）。
+     * 可「该不该显示旋钮」其实取决于**三个**变量的组合：
+     * <pre>
+     *   传感器方向  、  屏幕方向  、  旋转锁开关
+     * </pre>
+     * 只盯第一个，另外两个变了就完全不重算 —— 实测（2026-10-24，lhasa）：
+     * <pre>
+     *   wm user-rotation lock 0     ← 屏幕从 3 转到 0，物理仍是 3
+     *   日志只有「屏幕方向=0」，没有任何判定，旋钮不出现
+     * </pre>
+     * 同理，联动功能那 5 秒「临时解锁 → 到点锁回」也会让锁状态反复变化，
+     * 锁回之后没有任何人重算，于是「锁着、方向也不一致，就是不弹」。
+     *
+     * <p>所以这里补两个监听：
+     * <ol>
+     *   <li>{@code DisplayListener} —— 屏幕方向被系统/应用改掉时；</li>
+     *   <li>{@code ContentObserver} —— 旋转锁开关、折叠状态被改掉时
+     *       （我们自己回写、用户点控制中心开关都会触发）。</li>
+     * </ol>
+     */
+    private static void ensureStateWatchers(Context ctx) {
+        if (sWatchersInstalled || ctx == null) {
+            return;
+        }
+        try {
+            // ① 屏幕方向变化
+            android.hardware.display.DisplayManager dm =
+                    (android.hardware.display.DisplayManager)
+                            ctx.getSystemService(Context.DISPLAY_SERVICE);
+            if (dm != null) {
+                sWatchedScreenRotation = currentSurfaceRotation(ctx);
+                dm.registerDisplayListener(
+                        new android.hardware.display.DisplayManager.DisplayListener() {
+                            @Override
+                            public void onDisplayAdded(int displayId) {
+                            }
+
+                            @Override
+                            public void onDisplayRemoved(int displayId) {
+                                // 折叠屏切换时窗口可能留在旧屏，丢弃待重建
+                                try {
+                                    RotationButtonOverlay.get().reset();
+                                } catch (Throwable unused) {
+                                }
+                                reconcileRotationHint("屏幕被移除");
+                            }
+
+                            @Override
+                            public void onDisplayChanged(int displayId) {
+                                try {
+                                    Context c = sContext;
+                                    if (c == null) {
+                                        return;
+                                    }
+                                    int now = currentSurfaceRotation(c);
+                                    if (now < 0 || now == sWatchedScreenRotation) {
+                                        return;
+                                    }
+                                    sWatchedScreenRotation = now;
+                                    reconcileRotationHint("屏幕方向变化→" + now);
+                                } catch (Throwable unused) {
+                                }
+                            }
+                        }, sMain);
+            }
+
+            // ② 旋转锁 / 折叠状态变化
+            final android.content.ContentResolver cr = ctx.getContentResolver();
+            android.database.ContentObserver obs =
+                    new android.database.ContentObserver(sMain) {
+                        @Override
+                        public void onChange(boolean selfChange) {
+                            reconcileRotationHint("旋转锁/设备状态变化");
+                        }
+                    };
+            cr.registerContentObserver(
+                    Settings.System.getUriFor("accelerometer_rotation"), false, obs);
+            cr.registerContentObserver(
+                    Settings.System.getUriFor("accelerometer_rotation_inner"), false, obs);
+            cr.registerContentObserver(
+                    Settings.Global.getUriFor("current_device_state"), false, obs);
+
+            sWatchersInstalled = true;
+            LogUtil.logAlways("[旋转提示] 已装状态监听（屏幕方向 / 旋转锁）");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[旋转提示] 状态监听安装失败: " + th);
+        }
+    }
+
+    /**
+     * 重算「现在到底该不该显示旋钮」，是唯一的显示判据入口。
+     *
+     * <p>判据（与用户确认过的规则一致）：
+     * <ol>
+     *   <li>开关关着 → 收起；</li>
+     *   <li>旋转锁没开（能自动旋转）→ 收起，屏幕会自己转；</li>
+     *   <li>传感器方向 == 屏幕方向 → 收起，用户姿势已经对了；</li>
+     *   <li>其余 → 显示，且同一目标方向不重复播动画、不重置超时。</li>
+     * </ol>
+     *
+     * <p>注意这**不是**轮询：只在「屏幕方向变了 / 锁开关变了 / 亮屏解锁」
+     * 这些离散事件上跑一次，静默期没有任何定时器。
+     */
+    static void reconcileRotationHint(final String reason) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            sMain.post(new Runnable() {
+                @Override
+                public void run() {
+                    reconcileRotationHint(reason);
+                }
+            });
+            return;
+        }
+        try {
+            if (!MainHook.sRotationHintEnable.get()) {
+                if (sShownFor >= 0) {
+                    hideButtonNow();
+                }
+                return;
+            }
+            Context ctx = sContext;
+            if (ctx == null) {
+                return;
+            }
+            int screen = currentSurfaceRotation(ctx);
+            int sensor = sSensorTargetRotation;
+            if (screen < 0) {
+                // 屏幕方向还没就绪，等 DisplayListener / 传感器下一次上报
+                return;
+            }
+            if (sensor < 0) {
+                // 还不知道物理姿态（进程刚起 / 刚亮屏）：用一路短时重力采样补一个值，
+                // 拿到后 onOrientationDegrees 会自己回到这里重算。
+                startGravityPolling();
+                return;
+            }
+            if (!isRotationLocked(ctx)) {
+                if (sShownFor >= 0) {
+                    LogUtil.logAlways("[旋转提示] " + reason + "：旋转锁未开启，收起");
+                    hideButtonNow();
+                }
+                return;
+            }
+            if (sensor == screen) {
+                if (sShownFor >= 0) {
+                    LogUtil.logAlways("[旋转提示] " + reason + "：方向已一致，收起");
+                    hideButtonNow();
+                }
+                return;
+            }
+            if (sShownFor == sensor) {
+                return;      // 已经在为这个方向显示，别重置超时
+            }
+            LogUtil.logAlways("[旋转提示] " + reason + "：锁着且方向不一致（当前="
+                    + screen + " 目标=" + sensor + "），显示旋钮");
+            showNow(sensor, screen);
+        } catch (Throwable unused) {
+        }
+    }
+
 
 
 
@@ -1268,6 +1439,8 @@ public final class RotationHint {
             //   导致 sSensorMgr 一直是 null → startGravityPolling() 一进去就返回
             //   → 重力轮询**从未真正启动过**（日志里也从来没有它的记录）。
             sSensorMgr = sm;
+            // 🔑 2026-10-24：屏幕方向 / 旋转锁变化也要重算（见 ensureStateWatchers）
+            ensureStateWatchers(ctx);
             // ⚠️ 实测（2026-10-19）：Wakeup 版 device_orientation 在**首次注册后
             //   只回调一次**（日志里「传感器方向=0」只出现一次，之后方向再也不更新），
             //   导致按钮位置固定在左上角。这条路不可用，回退到下面的
@@ -1829,6 +2002,15 @@ public final class RotationHint {
             if (MainHook.sRotationHintEnable.get() && !sSensorRegistered && sContext != null) {
                 ensureSensorRegisteredWith(sContext);
             }
+            // 🔑 2026-10-24：亮屏/唤醒后重算一次。
+            //   熄屏期间传感器被注销，方向可能已经变了但没人记录；
+            //   而且「唤醒 → 转屏幕」是最常见的使用场景，必须在这里有入口。
+            sMain.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    reconcileRotationHint("亮屏/唤醒");
+                }
+            }, 400L);
         } else {
             // 熄屏：立即注销，避免后台常驻唤醒 CPU
             unregisterSensor();
@@ -1850,8 +2032,16 @@ public final class RotationHint {
             sLastHintedRotation = -1;
             // ⚡ 同时注销传感器：功能关掉后没有任何理由让它继续 60Hz 上报
             unregisterSensor();
+            hideButtonNow();
             return;
         }
+        // 开关刚打开时补一次判定：可能此时方向早就和屏幕不一致了
+        sMain.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                reconcileRotationHint("开关刚打开");
+            }
+        }, 300L);
         if (sSensorRegistered) {
             return;
         }

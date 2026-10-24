@@ -260,6 +260,7 @@ public class MainHook extends XposedModule {
                                                     // 同步回写设置，保持 WMS 锁定态与 accelerometer_rotation_inner 一致
                                                     setInnerAutoRotate(context.getContentResolver(), false);
                                                     LogUtil.logAlways("[内屏联动] 熄屏取消计时，已打开旋转锁");
+                                                    RotationHint.reconcileRotationHint("内屏联动：熄屏恢复锁定");
                                                 }
                                             } catch (Throwable unused) {
                                             }
@@ -1629,6 +1630,8 @@ public class MainHook extends XposedModule {
                     // 同步回写设置，保持 WMS 锁定态与 accelerometer_rotation_inner 一致
                     setInnerAutoRotate(cr, false);
                     LogUtil.logAlways("[内屏联动] 合上时仍在计时，已取消并打开旋转锁");
+                    // 锁回来了 → 让旋转提示按「已锁定」重新算一次
+                    RotationHint.reconcileRotationHint("内屏联动：合上恢复锁定");
                 }
                 return;
             }
@@ -1676,6 +1679,8 @@ public class MainHook extends XposedModule {
             sLockSnapshot = 1;
             LogUtil.logAlways("[内屏联动] 展开：已放开旋转锁，"
                     + Constants.INNER_FOLLOW_DURATION_MS + "ms 后恢复锁定");
+            // 锁暂时打开 → 让旋转提示收起（屏幕会自己转，不需要旋钮）
+            RotationHint.reconcileRotationHint("内屏联动：临时放开锁定");
 
             sInnerHandler.postDelayed(new Runnable() {
                 @Override
@@ -1696,6 +1701,10 @@ public class MainHook extends XposedModule {
                         // 两个键一起关回去，保证「开关显示」与「真实锁定」一致
                         setInnerAutoRotate(cr, false);
                         LogUtil.logAlways("[内屏联动] 计时结束，已恢复锁定");
+                        // 🔑 锁恢复后必须重算一次旋转提示：
+                        //   计时那 5 秒里锁是开的，方向不一致也不会弹旋钮；
+                        //   锁回来后如果方向仍不一致，这时就该把旋钮叫出来。
+                        RotationHint.reconcileRotationHint("内屏联动：5 秒到点恢复锁定");
                     } catch (Throwable th) {
                         LogUtil.logAlways("[内屏联动] 打开锁定失败: " + th);
                     } finally {
