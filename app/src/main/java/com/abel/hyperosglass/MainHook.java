@@ -234,11 +234,15 @@ public class MainHook extends XposedModule {
                                             // 重复触发检查直接挡回去。
                                             sIsInnerNow = false;
                                             applyInnerFixedLandscape();
+                                            // 补一次延迟判定：亮屏广播可能早于设备状态刷新
+                                            applyInnerFixedLandscapeDeferred();
                                         } else if (Intent.ACTION_USER_PRESENT.equals(a)) {
                                             // 解锁：同样按「刚刚打开内屏」处理
                                             LogUtil.logAlways("[内屏联动] 检测到解锁");
                                             sIsInnerNow = false;
                                             applyInnerFixedLandscape();
+                                            // 补一次延迟判定：解锁可能早于设备状态刷新
+                                            applyInnerFixedLandscapeDeferred();
                                         } else if (Intent.ACTION_SCREEN_OFF.equals(a)) {
                                             RotationHint.onScreenStateChanged(false);
                                             // 熄屏后重置内屏状态：用户下次唤醒若仍是
@@ -251,6 +255,8 @@ public class MainHook extends XposedModule {
                                                 if (sFollowing) {
                                                     cancelFollowTimer();
                                                     callWindowManagerRotation(true);
+                                                    // 同步回写设置，保持 WMS 锁定态与 accelerometer_rotation_inner 一致
+                                                    setInnerAutoRotate(context.getContentResolver(), false);
                                                     LogUtil.logAlways("[内屏联动] 熄屏取消计时，已打开旋转锁");
                                                 }
                                             } catch (Throwable unused) {
@@ -1369,6 +1375,42 @@ public class MainHook extends XposedModule {
         return false;
     }
 
+    /**
+     * 把「内屏自动旋转」开关（{@code accelerometer_rotation_inner}）同步写回 Settings。
+     *
+     * <p>⚠️ 为什么必须写这一笔（2026-10-24 修复「展开/唤醒自动旋转解锁」失效）：
+     * 真实锁定态是用 {@link #callWindowManagerRotation} 直接调 WMS 的
+     * {@code setRotationLockForFold} 改的，但这条反射路径**不会**回写 Settings 里的
+     * {@code accelerometer_rotation_inner}。而内屏联动的两处判定都靠读这个 key：
+     * <ul>
+     *   <li>展开时判断「旋转锁是不是开着」——不写回就一直读到 0（锁定），
+     *       于是每次展开都以为要解锁；</li>
+     *   <li>5 秒计时器判断「用户有没有手动改过」——快照写的是 1（未锁定），
+     *       而 key 实际仍是 0 → 判定为「被改动过」→ **放弃重新锁定**，
+     *       表现为解锁后一直不再锁。</li>
+     * </ul>
+     * 另外 Settings 观察者若按旧值(0)回推，还会把 WMS 刚解开的锁定改回去，
+     * 表现为「展开时解锁根本没生效」。
+     *
+     * <p>✅ 这里**只写 0/1 开关**，绝不碰 {@code user_rotation_inner} 角度，
+     * 因此不会触发注释里提到的「锁定后翻到 180°（摄像头朝下）」。
+     *
+     * @param unlocked true → 写 1（解除锁定，可自由旋转）；false → 写 0（锁定）
+     */
+    private static void setInnerAutoRotate(android.content.ContentResolver cr, boolean unlocked) {
+        if (cr == null) {
+            return;
+        }
+        try {
+            android.provider.Settings.System.putInt(
+                    cr, "accelerometer_rotation_inner", unlocked ? 1 : 0);
+            LogUtil.logAlways("[内屏联动] 已回写 accelerometer_rotation_inner="
+                    + (unlocked ? 1 : 0));
+        } catch (Throwable th) {
+            LogUtil.logAlways("[内屏联动] 回写 accelerometer_rotation_inner 失败: " + th);
+        }
+    }
+
     /** 只允许 SystemUI 进程执行内屏固定逻辑，避免多进程互相覆盖设置。 */
     private static boolean isSystemUiProc() {
         int cached = sIsSystemUiProc;
@@ -1502,6 +1544,8 @@ public class MainHook extends XposedModule {
                 if (sFollowing) {
                     cancelFollowTimer();
                     callWindowManagerRotation(true);
+                    // 同步回写设置，保持 WMS 锁定态与 accelerometer_rotation_inner 一致
+                    setInnerAutoRotate(cr, false);
                     LogUtil.logAlways("[内屏联动] 合上时仍在计时，已取消并打开旋转锁");
                 }
                 return;
@@ -1539,10 +1583,18 @@ public class MainHook extends XposedModule {
 
             // 规则 1：锁定中 → 关掉锁定，5 秒后恢复
             sFollowing = true;
-            sLockSnapshot = 1;          // 我们期望的值：1 = 未锁定
             callWindowManagerRotation(false);
-            LogUtil.logAlways("[内屏联动] 展开：已关闭旋转锁，"
-                    + Constants.INNER_FOLLOW_DURATION_MS + "ms 后恢复锁定");
+            // ★ 2026-10-24 修复「展开/唤醒自动旋转解锁」不生效：
+            //   setRotationLockForFold 只改 WMS 内部锁定态，**不回写** Settings，
+            //   而两处判定都读 accelerometer_rotation_inner。不补写就会出现：
+            //     • 系统按旧值(0=锁定)把刚解开的锁定改回去 → 看起来「解锁没生效」；
+            //     • 5 秒后快照(1)与真实值(0)不符 → 误判为「用户改过」→ 放弃重新锁定。
+            //   这里补写 1，并**以写完后的真实值**作为快照，两种回推行为都能自洽。
+            setInnerAutoRotate(cr, true);
+            sLockSnapshot = android.provider.Settings.System.getInt(
+                    cr, "accelerometer_rotation_inner", 1);
+            LogUtil.logAlways("[内屏联动] 展开：已关闭旋转锁，快照=" + sLockSnapshot
+                    + "，" + Constants.INNER_FOLLOW_DURATION_MS + "ms 后恢复锁定");
 
             sInnerHandler.postDelayed(new Runnable() {
                 @Override
@@ -1560,6 +1612,8 @@ public class MainHook extends XposedModule {
                             return;
                         }
                         callWindowManagerRotation(true);
+                        // 同步回写设置，保持 WMS 锁定态与 accelerometer_rotation_inner 一致
+                        setInnerAutoRotate(cr, false);
                         LogUtil.logAlways("[内屏联动] 计时结束，已打开旋转锁");
                     } catch (Throwable th) {
                         LogUtil.logAlways("[内屏联动] 打开锁定失败: " + th);
@@ -1570,6 +1624,30 @@ public class MainHook extends XposedModule {
             }, Constants.INNER_FOLLOW_DURATION_MS);
         } catch (Throwable th) {
             LogUtil.logAlways("[内屏联动] 异常: " + th);
+        }
+    }
+
+    /**
+     * 延迟 400ms 再判一次内屏联动。
+     *
+     * <p>亮屏（{@code ACTION_SCREEN_ON}）/ 解锁（{@code ACTION_USER_PRESENT}）广播
+     * 可能早于系统刷新 {@code current_device_state}，此时立即判定会读到「还没展开」，
+     * 表现为「唤醒内屏时自动旋转解锁不生效」。补一次延迟判定即可覆盖这个时间差：
+     * 若第一次已经解锁（sFollowing=true），这次会命中「计时中，忽略重复触发」，
+     * 不会重置 5 秒计时器，因此重复触发无副作用。
+     */
+    private static void applyInnerFixedLandscapeDeferred() {
+        try {
+            sInnerHandler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        applyInnerFixedLandscape();
+                    } catch (Throwable unused) {
+                    }
+                }
+            }, 400L);
+        } catch (Throwable unused) {
         }
     }
 
