@@ -1376,23 +1376,33 @@ public class MainHook extends XposedModule {
     }
 
     /**
-     * 把「内屏自动旋转」开关（{@code accelerometer_rotation_inner}）同步写回 Settings。
+     * 同步写回「自动旋转」开关到 Settings。
      *
      * <p>⚠️ 为什么必须写这一笔（2026-10-24 修复「展开/唤醒自动旋转解锁」失效）：
      * 真实锁定态是用 {@link #callWindowManagerRotation} 直接调 WMS 的
-     * {@code setRotationLockForFold} 改的，但这条反射路径**不会**回写 Settings 里的
-     * {@code accelerometer_rotation_inner}。而内屏联动的两处判定都靠读这个 key：
-     * <ul>
-     *   <li>展开时判断「旋转锁是不是开着」——不写回就一直读到 0（锁定），
-     *       于是每次展开都以为要解锁；</li>
-     *   <li>5 秒计时器判断「用户有没有手动改过」——快照写的是 1（未锁定），
-     *       而 key 实际仍是 0 → 判定为「被改动过」→ **放弃重新锁定**，
-     *       表现为解锁后一直不再锁。</li>
-     * </ul>
-     * 另外 Settings 观察者若按旧值(0)回推，还会把 WMS 刚解开的锁定改回去，
-     * 表现为「展开时解锁根本没生效」。
+     * {@code setRotationLockForFold} 改的，但这条反射路径**不会**回写 Settings，
+     * 而联动的判定全靠读 Settings，于是出现「解开了又自己锁回去」。
      *
-     * <p>✅ 这里**只写 0/1 开关**，绝不碰 {@code user_rotation_inner} 角度，
+     * <p>⚠️⚠️ 2026-10-24 第二次修复「屏幕旋转开关没有跟着开合变化」：
+     * 光写 {@code accelerometer_rotation_inner} **看不见**任何变化。本机实测
+     * （`settings get/list` + 逐包 grep 字符串）确认存在三个**互不同步**的键：
+     * <pre>
+     *   accelerometer_rotation        ← 通用键。SystemUI / framework 引用它，
+     *                                    控制中心那个「自动旋转」开关读写的正是它
+     *   accelerometer_rotation_inner  ← 只有 miui-framework.jar / miui-services.jar 引用
+     *   accelerometer_rotation_outer  ← 同上
+     * </pre>
+     * 实测 {@code put accelerometer_rotation 1} 之后 {@code _inner} 仍是 0，
+     * 三者完全没有镜像关系。只写 {@code _inner} 的结果就是：
+     * WMS 的内屏锁定确实解开了，但用户看到的开关纹丝不动 —— 也就是
+     * 「屏幕旋转开关并没有因为开合屏幕变化」。
+     *
+     * <p>所以这里**两个键一起写**：{@code _inner} 让 WMS/MIUI 的内屏旋转策略跟着走，
+     * {@code accelerometer_rotation} 让系统开关（控制中心磁贴、设置页）在 5 秒内
+     * 真实显示为「打开」，5 秒后再一起关掉。这样「看得见的开关」和
+     * 「真实的旋转行为」始终一致。
+     *
+     * <p>✅ 只写 0/1 开关，绝不碰 {@code user_rotation_inner} 角度，
      * 因此不会触发注释里提到的「锁定后翻到 180°（摄像头朝下）」。
      *
      * @param unlocked true → 写 1（解除锁定，可自由旋转）；false → 写 0（锁定）
@@ -1401,13 +1411,39 @@ public class MainHook extends XposedModule {
         if (cr == null) {
             return;
         }
+        int v = unlocked ? 1 : 0;
+        // 通用键：控制中心 / 设置页那个「自动旋转」开关读的就是它
         try {
-            android.provider.Settings.System.putInt(
-                    cr, "accelerometer_rotation_inner", unlocked ? 1 : 0);
-            LogUtil.logAlways("[内屏联动] 已回写 accelerometer_rotation_inner="
-                    + (unlocked ? 1 : 0));
+            android.provider.Settings.System.putInt(cr, "accelerometer_rotation", v);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[内屏联动] 回写 accelerometer_rotation 失败: " + th);
+        }
+        // 内屏专用键：MIUI 的 WMS 内屏旋转策略读它
+        try {
+            android.provider.Settings.System.putInt(cr, "accelerometer_rotation_inner", v);
         } catch (Throwable th) {
             LogUtil.logAlways("[内屏联动] 回写 accelerometer_rotation_inner 失败: " + th);
+        }
+        LogUtil.logAlways("[内屏联动] 已回写 accelerometer_rotation=" + v
+                + "，accelerometer_rotation_inner=" + v);
+    }
+
+    /** 读「自动旋转」当前是否处于打开状态（任一键为 1 即视为打开）。 */
+    private static boolean isAutoRotateOn(android.content.ContentResolver cr) {
+        if (cr == null) {
+            return false;
+        }
+        try {
+            if (android.provider.Settings.System.getInt(cr, "accelerometer_rotation", 0) != 0) {
+                return true;
+            }
+        } catch (Throwable unused) {
+        }
+        try {
+            return android.provider.Settings.System.getInt(
+                    cr, "accelerometer_rotation_inner", 0) != 0;
+        } catch (Throwable unused) {
+            return false;
         }
     }
 
@@ -1571,13 +1607,13 @@ public class MainHook extends XposedModule {
                 return;
             }
 
-            // 读当前旋转锁状态：0 = 锁定；1 = 未锁定（可自由旋转）
-            int autoNow = android.provider.Settings.System.getInt(
-                    cr, "accelerometer_rotation_inner", -1);
-            if (autoNow != 0) {
+            // 读当前旋转锁状态：两个键任一为 1 即视为「用户本来就要自由旋转」
+            // （accelerometer_rotation 是控制中心开关那个通用键，
+            //   accelerometer_rotation_inner 是 MIUI 内屏专用键，二者不同步，
+            //   所以必须一起看，否则会跟用户在开关上的选择打架）
+            if (isAutoRotateOn(cr)) {
                 // 规则 2：本来就是未锁定 → 完全无视
-                LogUtil.logAlways("[内屏联动] 展开时旋转锁已是关闭状态（auto="
-                        + autoNow + "），不干预");
+                LogUtil.logAlways("[内屏联动] 展开时旋转锁已是打开状态，不干预");
                 return;
             }
 
@@ -1591,10 +1627,9 @@ public class MainHook extends XposedModule {
             //     • 5 秒后快照(1)与真实值(0)不符 → 误判为「用户改过」→ 放弃重新锁定。
             //   这里补写 1，并**以写完后的真实值**作为快照，两种回推行为都能自洽。
             setInnerAutoRotate(cr, true);
-            sLockSnapshot = android.provider.Settings.System.getInt(
-                    cr, "accelerometer_rotation_inner", 1);
-            LogUtil.logAlways("[内屏联动] 展开：已关闭旋转锁，快照=" + sLockSnapshot
-                    + "，" + Constants.INNER_FOLLOW_DURATION_MS + "ms 后恢复锁定");
+            sLockSnapshot = 1;
+            LogUtil.logAlways("[内屏联动] 展开：已放开旋转锁，"
+                    + Constants.INNER_FOLLOW_DURATION_MS + "ms 后恢复锁定");
 
             sInnerHandler.postDelayed(new Runnable() {
                 @Override
@@ -1603,18 +1638,18 @@ public class MainHook extends XposedModule {
                         if (!sFollowing) {
                             return;   // 已被合上/取消
                         }
-                        // 规则 4：计时期间用户手动改过 → 尊重用户，不覆盖
-                        int now = android.provider.Settings.System.getInt(
-                                cr, "accelerometer_rotation_inner", -1);
-                        if (now != sLockSnapshot) {
-                            LogUtil.logAlways("[内屏联动] 计时期间开关被改动（期望="
-                                    + sLockSnapshot + " 实际=" + now + "），放弃锁定");
+                        // 规则 4：计时期间用户手动关掉了开关 → 尊重用户的选择
+                        // （两个键都要看：控制中心那个开关写的是 accelerometer_rotation）
+                        if (!isAutoRotateOn(cr)) {
+                            callWindowManagerRotation(true);
+                            LogUtil.logAlways("[内屏联动] 计时结束（开关已被手动关闭）"
+                                    + "，已对齐旋转锁，不改写设置");
                             return;
                         }
                         callWindowManagerRotation(true);
-                        // 同步回写设置，保持 WMS 锁定态与 accelerometer_rotation_inner 一致
+                        // 两个键一起关回去，保证「开关显示」与「真实锁定」一致
                         setInnerAutoRotate(cr, false);
-                        LogUtil.logAlways("[内屏联动] 计时结束，已打开旋转锁");
+                        LogUtil.logAlways("[内屏联动] 计时结束，已恢复锁定");
                     } catch (Throwable th) {
                         LogUtil.logAlways("[内屏联动] 打开锁定失败: " + th);
                     } finally {

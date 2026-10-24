@@ -163,7 +163,8 @@ public final class Constants {
     /** Model 侧 Bundle 里回传**横屏**比例用的 key。 */
     public static final String KEY_NOTIF_WIDTH_RATIO_LAND = "notif_width_ratio_land";
 
-    public static final boolean DEFAULT_NOTIF_WIDTH_ENABLE = false;
+    /** ★ v3.283.0：默认改为**开启**，与当前在用的设备配置保持一致。 */
+    public static final boolean DEFAULT_NOTIF_WIDTH_ENABLE = true;
     /**
      * 默认 66%。
      *
@@ -203,7 +204,8 @@ public final class Constants {
      * </ul>
      */
     public static final String PREFS_INNER_FOLLOW_ROTATION = "inner_follow_rotation";
-    public static final boolean DEFAULT_INNER_FOLLOW_ROTATION = false;
+    /** ★ v3.283.0：默认改为**开启**，与当前在用的设备配置保持一致。 */
+    public static final boolean DEFAULT_INNER_FOLLOW_ROTATION = true;
 
     /** 开启联动时，跟随传感器的时长（毫秒）。 */
     public static final long INNER_FOLLOW_DURATION_MS = 5000L;
@@ -371,5 +373,9 @@ public final class Constants {
     // ⚠️ 这两个数组必须**同序同长**：reloadPrefs 与 StatusProvider 都按下标一一对应取值。
     //    新增开关只能往**末尾追加**，不可插队（v3.41.2 追加了通知宽度总开关）。
     public static final String[] ALL_PREF_KEYS = {PREFS_GLASS_ENABLED, PREFS_FOCUS_GLASS, PREFS_AOD_BATTERY_SYNC, PREFS_PIN_GLASS, PREFS_NO_FOLD_HISTORY, PREFS_SINK_ENABLED, PREFS_NO_NOTIF_LIMIT, PREFS_KEEP_NOTIF, PREFS_HIDE_BT_UNLOCK, PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_ALLOW_MANAGE_ALL, PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE, PREFS_ENABLE_LOG, PREFS_NOTIF_IMPORTANCE, PREFS_NOTIF_WIDTH_ENABLE, PREFS_ROTATION_HINT, PREFS_INNER_FOLLOW_ROTATION};
-    public static final boolean[] ALL_PREF_DEFAULTS = {true, true, true, true, true, false, true, true, true, true, true, true, false, true, true, false, true, false, false, false, false};
+    // ★ 2026-10-24：默认值按「当前在用的那台设备」的实际配置对齐（v3.283.0）。
+    //   对齐项：notif_width_enable=true、rotation_hint_enable=true、inner_follow_rotation=true；
+    //   同时修掉这里多出来的第 21 个元素——数组曾比 ALL_PREF_KEYS 长 1，
+    //   虽然按下标取值不受影响，但违反了上面「同序同长」的约束，容易埋坑。
+    public static final boolean[] ALL_PREF_DEFAULTS = {true, true, true, true, true, false, true, true, true, true, true, true, false, true, true, false, true, true, true, true};
 }
