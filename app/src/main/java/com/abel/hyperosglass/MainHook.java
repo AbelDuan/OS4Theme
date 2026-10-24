@@ -149,6 +149,8 @@ public class MainHook extends XposedModule {
             String packageName = packageLoadedParam.getPackageName();
             ClassLoader defaultClassLoader = packageLoadedParam.getDefaultClassLoader();
             LogUtil.logAlways("onPackageLoaded: " + packageName);
+            // 进程身份可能在上一次（onModuleLoaded 早期）被误判，这里重新判定一次
+            sIsSystemUiProc = -1;
             reloadPrefs();
             syncRealPrefsAsync();
             registerPrefsReloadReceiver();
@@ -1447,24 +1449,63 @@ public class MainHook extends XposedModule {
         }
     }
 
-    /** 只允许 SystemUI 进程执行内屏固定逻辑，避免多进程互相覆盖设置。 */
+    /**
+     * 只允许 SystemUI 进程执行内屏联动逻辑，避免多进程互相覆盖设置。
+     *
+     * <p>⚠️ 2026-10-24 修复「内屏联动在 SystemUI 里完全没反应、日志只有一行
+     * {@code 跳过：当前不是 SystemUI 进程}」：
+     * 原来只读 {@code /proc/self/cmdline} 判断进程。但 LSPosed 注入模块的时机
+     * 可能**早于** {@code ActivityThread.setArgV0()}——此时 cmdline 还是
+     * {@code zygote64} / {@code zygote}，判定为 false 后又被 {@code sIsSystemUiProc}
+     * **永久缓存**，于是该进程从此再也不执行联动，界面毫无反应、也没有后续日志。
+     *
+     * <p>现在改为：
+     * <ol>
+     *   <li>首选 {@link #currentApplication()} 的**包名**——SystemUI 的 Application
+     *       包名恒为 {@code com.android.systemui}，system_server 里是 {@code android}，
+     *       与进程名无关，也不受 setArgV0 时机影响；</li>
+     *   <li>Application 还没创建好（早期调用）时，退回读 {@code /proc/self/cmdline}，
+     *       但**只有在读到的确实是 SystemUI 时才缓存**；读到 zygote 之类的中间态
+     *       一律不缓存，等下一次调用重新判断。</li>
+     * </ol>
+     */
     private static boolean isSystemUiProc() {
         int cached = sIsSystemUiProc;
         if (cached >= 0) {
             return cached == 1;
         }
         boolean r = false;
-        try (java.io.BufferedReader br = new java.io.BufferedReader(
-                new java.io.FileReader("/proc/self/cmdline"))) {
-            StringBuilder sb = new StringBuilder();
-            int ch;
-            while ((ch = br.read()) > 0) {
-                sb.append((char) ch);
+        boolean decided = false;
+        // ① 首选：Application 的包名
+        try {
+            Object app = currentApplication();
+            if (app instanceof Context) {
+                r = "com.android.systemui".equals(((Context) app).getPackageName());
+                decided = true;
             }
-            r = "com.android.systemui".equals(sb.toString());
         } catch (Throwable unused) {
         }
-        sIsSystemUiProc = r ? 1 : 0;
+        // ② 兜底：/proc/self/cmdline（此时只信「是」的结果，不信「否」）
+        if (!decided) {
+            try (java.io.BufferedReader br = new java.io.BufferedReader(
+                    new java.io.FileReader("/proc/self/cmdline"))) {
+                StringBuilder sb = new StringBuilder();
+                int ch;
+                while ((ch = br.read()) > 0) {
+                    sb.append((char) ch);
+                }
+                String name = sb.toString();
+                if ("com.android.systemui".equals(name)) {
+                    r = true;
+                    decided = true;
+                }
+                // name 是 zygote64 / zygote 之类 → 进程还没 setArgV0，不做结论
+            } catch (Throwable unused) {
+            }
+        }
+        if (decided) {
+            sIsSystemUiProc = r ? 1 : 0;
+        }
         return r;
     }
 
@@ -1546,16 +1587,20 @@ public class MainHook extends XposedModule {
      */
     static void applyInnerFixedLandscape() {
         if (!sInnerFollowRotation.get()) {
+            // 诊断用：开关没生效时也能在日志里看到，不再"静默无反应"
+            LogUtil.logAlwaysOnce("inner-off", "[内屏联动] 跳过：联动开关未开启");
             return;
         }
         // 模块作用域含 systemui / settings / miui 插件三个进程，
         // 只允许 SystemUI 执行，避免多进程互相覆盖设置。
         if (!isSystemUiProc()) {
+            LogUtil.logAlwaysOnce("inner-proc", "[内屏联动] 跳过：当前不是 SystemUI 进程");
             return;
         }
         try {
             Object app = currentApplication();
             if (!(app instanceof Context)) {
+                LogUtil.logAlways("[内屏联动] 跳过：currentApplication 不可用（" + app + "）");
                 return;
             }
             Context ctx = (Context) app;
@@ -1565,6 +1610,7 @@ public class MainHook extends XposedModule {
                     (android.hardware.display.DisplayManager)
                             ctx.getSystemService(Context.DISPLAY_SERVICE);
             if (dm == null) {
+                LogUtil.logAlways("[内屏联动] 跳过：DisplayManager 不可用");
                 return;
             }
 
@@ -1861,7 +1907,7 @@ public class MainHook extends XposedModule {
             sCancelVibrateScreenOnFlag.set(z14);
             sAllowManageAllFlag.set(z15);
             LogUtil.setEnabled(z16);
-            LogUtil.logAlways("设置(真实值同步)：sink=" + z + "，glass=" + z2 + "，hideLockFod=" + z3 + "，hideDismiss=" + z4 + "，focusGlass=" + z5 + "，aodBattery=" + z6 + "，qsEditHide=" + z8 + "，noFoldHistory=" + z9 + "，noNotifLimit=" + z10 + "，keepNotif=" + z11 + "，hideBtUnlock=" + z12 + "，muteScreenOn=" + z13 + "，allowManageAll=" + z15 + "，日志=" + z16);
+            LogUtil.logAlways("设置(真实值同步)：sink=" + z + "，glass=" + z2 + "，hideLockFod=" + z3 + "，hideDismiss=" + z4 + "，focusGlass=" + z5 + "，aodBattery=" + z6 + "，qsEditHide=" + z8 + "，noFoldHistory=" + z9 + "，noNotifLimit=" + z10 + "，keepNotif=" + z11 + "，hideBtUnlock=" + z12 + "，muteScreenOn=" + z13 + "，allowManageAll=" + z15 + "，日志=" + z16 + "，内屏联动=" + sInnerFollowRotation.get() + "，旋转提示=" + sRotationHintEnable.get() + "，通知宽度=" + widthOn);
         } catch (Throwable th) {
             LogUtil.logAlways("设置(真实值同步) 应用失败: " + th);
         }
