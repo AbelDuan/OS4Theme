@@ -1287,6 +1287,17 @@ public class MainHook extends XposedModule {
     /** 缓存 SystemUI 的 Context（写 SharedPreferences 用）。 */
     private static volatile Context sInnerCtx = null;
     private static volatile boolean sInnerObserverInstalled = false;
+    /**
+     * 上一次跟随窗口结束的时刻（uptimeMillis）。
+     *
+     * <p>一次亮屏会连发 {@code ACTION_SCREEN_ON} 与 {@code ACTION_USER_PRESENT}，
+     * 两者都会把 {@code sIsInnerNow} 清掉重新判定，于是同一次亮屏会开两个解锁窗口 ——
+     * 用户感受就是「锁动不动就被关掉」。这里做冷却：**折叠状态没变化**的重复触发
+     * 在冷却期内不再开新窗口；真正合上/展开会把冷却清零，不受影响。
+     */
+    private static volatile long sLastWindowEndAt = 0L;
+    /** 窗口冷却时长。 */
+    private static final long INNER_WINDOW_COOLDOWN_MS = 10000L;
 
     /**
      * 检查用户是否在这期间**手动改过**设置。
@@ -1449,6 +1460,17 @@ public class MainHook extends XposedModule {
         // ② 这是模块刚刚自己写出来的值 → 回声，忽略
         if (dt >= 0 && dt < 1500L && sSelfWrittenCr >= 0 && crV == sSelfWrittenCr) {
             sLastSeenCr = crV;
+            return;
+        }
+        // ②' 模块正占用着旋转锁（跟随窗口内）→ 此刻的写入大概率是 MIUI 旋转服务
+        //     对刚才解锁动作的同步回推，不是用户在操作。宁可放过，不能误判：
+        //     一旦误判成「用户要锁定」，用户自己打开的自动旋转就被永久记住了。
+        boolean occupying = sFollowing
+                || (sOccupyUntil > 0L && System.currentTimeMillis() < sOccupyUntil);
+        if (occupying) {
+            sLastSeenCr = crV;
+            LogUtil.logAlways("[用户意志] 跟随窗口内的设置变化（" + crV
+                    + "）视为系统回推，不记为用户选择");
             return;
         }
         sLastSeenCr = crV;
@@ -1879,6 +1901,9 @@ public class MainHook extends XposedModule {
                     LogUtil.logAlways("[内屏联动] 打开锁定失败: " + th);
                 } finally {
                     sFollowing = false;
+                    // 只有「计时器真的跑到点」才记冷却起点：
+                    // 合上/熄屏是取消（回调被移除，不会进这里），不影响下次展开
+                    sLastWindowEndAt = android.os.SystemClock.uptimeMillis();
                 }
             }
         }, delayMs);
@@ -1927,6 +1952,8 @@ public class MainHook extends XposedModule {
                     LogUtil.logAlways("[内屏联动] 已合上");
                 }
                 sIsInnerNow = false;
+                // 折叠状态真的变了 → 清掉窗口冷却，下次展开照常解锁
+                sLastWindowEndAt = 0L;
                 // 规则 3：5 秒内合上 → 立即停止计时，并把旋转锁打开
                 if (sFollowing) {
                     cancelFollowTimer();
@@ -1975,7 +2002,13 @@ public class MainHook extends XposedModule {
             //     ② 没有占用标记 → 那是用户自己开的，**一律不碰**。
             //   占用标记让「自愈」和「尊重用户」可以同时成立，这是 v3.283.4
             //   粗暴做法的正确替代。
-            if (isAutoRotateOn(cr)) {
+            // ⚠️ 判据用「用户面开关」accelerometer_rotation，而不是两键取或：
+            //   实测 _inner 会被 MIUI 自己同步成 1（用户关了开关它也可能还是 1），
+            //   取或会把「用户要锁定」误读成「用户要自由旋转」。用户能看见、
+            //   能操作的就是 accelerometer_rotation，以它为准。
+            int userSwitch = readSysInt(cr, "accelerometer_rotation", -1);
+            boolean switchOn = userSwitch >= 0 ? userSwitch != 0 : isAutoRotateOn(cr);
+            if (switchOn) {
                 if (sOccupyUntil > 0L) {
                     relockInner(cr, "检测到上次跟随的遗留占用，已恢复锁定（自愈）");
                     return;
@@ -1992,6 +2025,15 @@ public class MainHook extends XposedModule {
             }
 
             // 规则 1：锁定中 → 关掉锁定，5 秒后恢复
+            // 窗口冷却：同一次亮屏里 SCREEN_ON / USER_PRESENT 会连续进来两次，
+            // 冷却期内不再开第二个窗口（折叠状态没变时才生效）
+            long sinceEnd = android.os.SystemClock.uptimeMillis() - sLastWindowEndAt;
+            if (sLastWindowEndAt > 0L && sinceEnd >= 0
+                    && sinceEnd < INNER_WINDOW_COOLDOWN_MS) {
+                LogUtil.logAlways("[内屏联动] 距上次跟随仅 " + sinceEnd
+                        + "ms，冷却中，本次不重复解锁");
+                return;
+            }
             sFollowing = true;
             callWindowManagerRotation(false);
             // ★ 2026-10-24 修复「展开/唤醒自动旋转解锁」不生效：
