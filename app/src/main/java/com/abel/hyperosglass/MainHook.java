@@ -2451,19 +2451,81 @@ public class MainHook extends XposedModule {
         }
 
         // 4) MiBlurCompat.getBackgroundMaterialOpenedInDefaultTheme(Context) → true
+        //
+        // ⚠️ 2026-10-26（OS4.0.26）实测：这是**控制中心液态材质的总闸门**。
+        //    4.0.26 起控制中心背景统一由 miui.systemui.ui.material.MaterialBackgroundExt 绘制：
+        //      setMaterialBackground(...) {
+        //          if (!MiBlurCompat.getBackgroundMaterialOpenedInDefaultTheme(ctx)) {
+        //              token.applySolidBackground(view);   ← 三方主题自带实心背景，液态全丢
+        //              return;
+        //          }
+        //          switch (MiBackgroundStyle.getMaterialMode()) {  ← 本机=Bionics
+        //              Bionics -> applyBionicsBackground();  ← 液态玻璃
+        //              Classic -> applyBlendBackground();
+        //              Disabled-> applySolidBackground();
+        //          }
+        //      }
+        // v3.37 曾把它改成「完全透传」以修复磁贴变方，但那时还没有 MaterialMode 这套档位；
+        // 4.0.26 上透传 = 控制中心永远走实心分支，表现为「下拉通知有液态、控制中心没有」。
+        // 现在改为：开关打开时强制 true（并顺手把 ThemeUtils 两个标志再按回去 —— 实测
+        // 它们会被 updateDefault*Theme() 在配置变化时改回 false，而 getter 有可能被内联，
+        // 内联读的就是字段本身）。
         try {
             Class<?> blurCompat = Class.forName(Constants.TPG_BLUR_COMPAT_CLASS, false, classLoader);
             hook(blurCompat.getMethod("getBackgroundMaterialOpenedInDefaultTheme", android.content.Context.class))
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                     .setId("tpg-getBgMaterialOpenedInDefaultTheme").intercept(new XposedInterface.Hooker() {
                         public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                            // v3.37：不再强制 true（见下）；三方主题自己的材质原样透传
+                            if (MainHook.this.sGlassEnabled) {
+                                forceThemeUtilsFlagsIn(classLoader);
+                                return true;
+                            }
                             return chain.proceed();
                         }
                     });
-            LogUtil.logAlways("[三方主题玻璃] 已挂钩 MiBlurCompat.getBackgroundMaterialOpenedInDefaultTheme");
+            LogUtil.logAlways("[三方主题玻璃] 已挂钩 MiBlurCompat.getBackgroundMaterialOpenedInDefaultTheme（强制 true）");
         } catch (Throwable th) {
             LogUtil.log("[三方主题玻璃] MiBlurCompat 挂钩失败(本 loader 无此类): " + th);
+        }
+
+        // 7) ThemeUtils.dispatchConfigurationChanged / 两个私有 setter → 执行后把标志按回 true。
+        //    实测：注入时强制的 true 会在几秒内被系统按回 false（配置变化 / 自动密度都会触发
+        //    updateDefaultPluginTheme/updateDefaultSysUiTheme，它们按 /data/system/theme/ 下
+        //    有没有对应目录来赋值）。只靠「注入时强制一次」撑不过第一次配置刷新。
+        try {
+            Class<?> themeUtils = Class.forName(Constants.TPG_THEME_UTILS_CLASS, false, classLoader);
+            hook(themeUtils.getMethod("dispatchConfigurationChanged", android.content.Context.class, android.content.res.Configuration.class))
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("tpg-dispatchConfigChanged").intercept(new XposedInterface.Hooker() {
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            Object r = chain.proceed();
+                            if (MainHook.this.sGlassEnabled) {
+                                forceThemeUtilsFlagsIn(classLoader);
+                            }
+                            return r;
+                        }
+                    });
+            String[] setters = {"setDefaultPluginTheme", "setDefaultSysUiTheme"};
+            for (String s : setters) {
+                try {
+                    Method m = themeUtils.getDeclaredMethod(s, Boolean.TYPE);
+                    m.setAccessible(true);
+                    hook(m).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .setId("tpg-setter-" + s).intercept(new XposedInterface.Hooker() {
+                                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                                    Object r = chain.proceed();
+                                    if (MainHook.this.sGlassEnabled) {
+                                        forceThemeUtilsFlagsIn(classLoader);
+                                    }
+                                    return r;
+                                }
+                            });
+                } catch (Throwable ignored) {
+                }
+            }
+            LogUtil.logAlways("[三方主题玻璃] 已挂钩 ThemeUtils.dispatchConfigurationChanged + 私有 setter（改完按回 true）");
+        } catch (Throwable th) {
+            LogUtil.log("[三方主题玻璃] ThemeUtils 配置/ setter 挂钩失败(本 loader 无此类): " + th);
         }
 
         // 5) MiuiDefaultThemeControllerImpl.isDefaultTheme() → true
@@ -2511,6 +2573,9 @@ public class MainHook extends XposedModule {
         } catch (Throwable th) {
             LogUtil.log("[三方主题玻璃] ConfigurationControllerImpl 挂钩失败(本 loader 无此类): " + th);
         }
+
+        // v3.283.7：控制中心材质链路只读探测（排查 4.0.26 液态丢失用，不改变行为）
+        installMaterialDiagnostics(classLoader);
     }
 
     /**
@@ -2558,6 +2623,177 @@ public class MainHook extends XposedModule {
             f2.setAccessible(true);
             f2.setBoolean(null, true);
         } catch (Throwable ignored) {
+        }
+    }
+
+    // ── 控制中心材质诊断（v3.283.7，只读探测，不改任何行为）──
+    //
+    // 背景：OS4.0.26 起控制中心背景统一走 miui.systemui.ui.material.MaterialBackgroundExt，
+    // 是否使用「液态/仿生材质」由第一道闸门
+    //   MiBlurCompat.getBackgroundMaterialOpenedInDefaultTheme(Context)
+    // 决定（false → 直接退化为三方主题自带的实心背景）。而这道闸门内部又依赖
+    //   MATERIAL_SUPPORTED && getBlurCompat(configuration)==1 && ThemeUtils.plugin && ThemeUtils.sysui
+    // 四环，任何一环断了都会静默丢掉液态。这里把每一环的真实值都打出来，
+    // 用于定位 4.0.26 上「下拉通知有液态、控制中心没有」到底断在哪一环。
+    private static final Map<String, Long> sDiagLast = Collections.synchronizedMap(new java.util.HashMap<String, Long>());
+    private static final Map<String, Integer> sDiagHits = Collections.synchronizedMap(new java.util.HashMap<String, Integer>());
+    private static final Set<ClassLoader> sDiagLoaders = Collections.newSetFromMap(new WeakHashMap<ClassLoader, Boolean>());
+
+    private static void diagCount(String key) {
+        Integer n = sDiagHits.get(key);
+        sDiagHits.put(key, Integer.valueOf(n == null ? 1 : n.intValue() + 1));
+    }
+
+    private static void diag(String key, String msg) {
+        // 仅在模块「日志」开关打开时输出，日常使用不会污染日志文件
+        if (!LogUtil.isEnabled()) {
+            return;
+        }
+        long now = android.os.SystemClock.elapsedRealtime();
+        Long last = sDiagLast.get(key);
+        if (last != null && now - last.longValue() < 3000L) {
+            return;
+        }
+        sDiagLast.put(key, Long.valueOf(now));
+        Integer n = sDiagHits.get(key);
+        LogUtil.logAlways("[CC材质诊断] " + msg + "（累计命中 " + n + " 次）");
+    }
+
+    /** 把**当前 loader 里**那份 ThemeUtils 的两个静态标志强制为 true。 */
+    private static void forceThemeUtilsFlagsIn(ClassLoader classLoader) {
+        try {
+            forceThemeUtilsFlags(Class.forName(Constants.TPG_THEME_UTILS_CLASS, false, classLoader));
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 读 ThemeUtils 静态字段的**原始值**（不经过我们 hook 的 getter），用来判断强制是否真的生效。 */
+    private static String rawThemeFlag(String name) {
+        try {
+            Class<?> cls = sPluginThemeUtilsClass;
+            if (cls == null) {
+                return "no-class";
+            }
+            Field f = cls.getDeclaredField(name);
+            f.setAccessible(true);
+            return String.valueOf(f.get(null));
+        } catch (Throwable th) {
+            return "err:" + th;
+        }
+    }
+
+    private void installMaterialDiagnostics(final ClassLoader classLoader) {
+        if (classLoader == null || !sDiagLoaders.add(classLoader)) {
+            return;
+        }
+        // 当前 loader 里那份 ThemeUtils（必须与 MiBlurCompat 同一份，否则读数会骗人）
+        Class<?> tuLocal = null;
+        Field fPlugin = null;
+        Field fSysui = null;
+        Method mGetPlugin = null;
+        Method mGetSysui = null;
+        Object tuInstance = null;
+        try {
+            tuLocal = Class.forName(Constants.TPG_THEME_UTILS_CLASS, false, classLoader);
+            fPlugin = tuLocal.getDeclaredField("defaultPluginTheme");
+            fPlugin.setAccessible(true);
+            fSysui = tuLocal.getDeclaredField("defaultSysUiTheme");
+            fSysui.setAccessible(true);
+            mGetPlugin = tuLocal.getMethod("getDefaultPluginTheme");
+            mGetSysui = tuLocal.getMethod("getDefaultSysUiTheme");
+            tuInstance = tuLocal.getField("INSTANCE").get(null);
+        } catch (Throwable ignored) {
+        }
+        final Field ffPlugin = fPlugin;
+        final Field ffSysui = fSysui;
+        final Method mmGetPlugin = mGetPlugin;
+        final Method mmGetSysui = mGetSysui;
+        final Object ttInstance = tuInstance;
+        // 1) 第一道闸门：是否启用背景材质（控制中心液态的总开关）
+        try {
+            final Class<?> blurCompat = Class.forName(Constants.TPG_BLUR_COMPAT_CLASS, false, classLoader);
+            final Field materialSupported = blurCompat.getDeclaredField("MATERIAL_SUPPORTED");
+            materialSupported.setAccessible(true);
+            final Method getBlurCompat = blurCompat.getMethod("getBlurCompat", android.content.res.Configuration.class);
+            hook(blurCompat.getMethod("getBackgroundMaterialOpenedInDefaultTheme", android.content.Context.class))
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("diag-bgmaterial").intercept(new XposedInterface.Hooker() {
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            Object r = chain.proceed();
+                            diagCount("bgmaterial");
+                            int bc = -99;
+                            try {
+                                Object arg = chain.getArg(0);
+                                if (arg instanceof android.content.Context) {
+                                    Object v = getBlurCompat.invoke(null,
+                                            ((android.content.Context) arg).getResources().getConfiguration());
+                                    if (v instanceof Integer) {
+                                        bc = ((Integer) v).intValue();
+                                    }
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                            String raw = "?";
+                            String viaReflect = "?";
+                            try {
+                                raw = "plugin=" + ffPlugin.get(null) + " sysui=" + ffSysui.get(null);
+                            } catch (Throwable ignored) {
+                            }
+                            try {
+                                viaReflect = "getter(反射调用) plugin=" + mmGetPlugin.invoke(ttInstance)
+                                        + " sysui=" + mmGetSysui.invoke(ttInstance);
+                            } catch (Throwable ignored) {
+                            }
+                            diag("bgmaterial", "getBackgroundMaterialOpenedInDefaultTheme=" + r
+                                    + " ┃ MATERIAL_SUPPORTED=" + materialSupported.get(null)
+                                    + " ┃ getBlurCompat(configuration)=" + bc
+                                    + " ┃ ThemeUtils同loader原始字段 " + raw
+                                    + " ┃ " + viaReflect
+                                    + " ┃ （sPluginThemeUtilsClass 那份: " + rawThemeFlag("defaultPluginTheme")
+                                    + "/" + rawThemeFlag("defaultSysUiTheme") + "）"
+                                    + " ┃ glass开关=" + MainHook.this.sGlassEnabled);
+                            return r;
+                        }
+                    });
+            LogUtil.logAlways("[CC材质诊断] 已挂：MiBlurCompat.getBackgroundMaterialOpenedInDefaultTheme（只读）");
+        } catch (Throwable th) {
+            LogUtil.log("[CC材质诊断] MiBlurCompat 探测未挂: " + th);
+        }
+        // 2) 材质档位：Bionics(液态) / Classic(经典柔光) / Disabled(实心)
+        try {
+            Class<?> bgStyle = Class.forName("miui.systemui.util.MiBackgroundStyle", false, classLoader);
+            hook(bgStyle.getMethod("getMaterialMode"))
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("diag-materialmode").intercept(new XposedInterface.Hooker() {
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            Object r = chain.proceed();
+                            diagCount("materialmode");
+                            diag("materialmode", "MiBackgroundStyle.getMaterialMode()=" + r);
+                            return r;
+                        }
+                    });
+            LogUtil.logAlways("[CC材质诊断] 已挂：MiBackgroundStyle.getMaterialMode（只读）");
+        } catch (Throwable th) {
+            LogUtil.log("[CC材质诊断] MiBackgroundStyle 探测未挂: " + th);
+        }
+        // 3) 真正画控制中心背景的出口（确认这条链路是不是活的）
+        try {
+            Class<?> ext = Class.forName("miui.systemui.ui.material.MaterialBackgroundExt", false, classLoader);
+            Class<?> token = Class.forName("miui.systemui.ui.material.MaterialToken", false, classLoader);
+            Method smb = ext.getDeclaredMethod("setMaterialBackground", android.view.View.class, token, Boolean.TYPE);
+            smb.setAccessible(true);
+            hook(smb).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("diag-setmaterialbg").intercept(new XposedInterface.Hooker() {
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            Object r = chain.proceed();
+                            diagCount("setmaterialbg");
+                            diag("setmaterialbg", "MaterialBackgroundExt.setMaterialBackground 命中（控制中心背景绘制出口）");
+                            return r;
+                        }
+                    });
+            LogUtil.logAlways("[CC材质诊断] 已挂：MaterialBackgroundExt.setMaterialBackground（只读）");
+        } catch (Throwable th) {
+            LogUtil.log("[CC材质诊断] MaterialBackgroundExt 探测未挂: " + th);
         }
     }
 
