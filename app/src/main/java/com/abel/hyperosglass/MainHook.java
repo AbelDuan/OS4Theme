@@ -256,11 +256,8 @@ public class MainHook extends XposedModule {
                                             try {
                                                 if (sFollowing) {
                                                     cancelFollowTimer();
-                                                    callWindowManagerRotation(true);
-                                                    // 同步回写设置，保持 WMS 锁定态与 accelerometer_rotation_inner 一致
-                                                    setInnerAutoRotate(context.getContentResolver(), false);
-                                                    LogUtil.logAlways("[内屏联动] 熄屏取消计时，已打开旋转锁");
-                                                    RotationHint.reconcileRotationHint("内屏联动：熄屏恢复锁定");
+                                                    relockInner(context.getContentResolver(),
+                                                            "熄屏取消计时，已恢复锁定");
                                                 }
                                             } catch (Throwable unused) {
                                             }
@@ -1586,6 +1583,59 @@ public class MainHook extends XposedModule {
      * 只切换系统的旋转锁定开关（accelerometer_rotation_inner）。
      * 锁定后锁在哪个方向完全由系统当前值决定。
      */
+    /**
+     * 恢复锁定 —— **唯一出口**。
+     *
+     * <p>2026-10-25 统一出口的原因见 {@link #applyInnerFixedLandscape} 里
+     * 「旋转锁本来就是打开状态」那段：原来五个写锁点各自拼一遍代码，
+     * 漏掉任何一处就会留下「锁一直开着」的残留态，而且没有任何自愈机会。
+     *
+     * @param reason 写进日志的原因（同时用作旋钮重算的触发说明）
+     */
+    private static void relockInner(android.content.ContentResolver cr, String reason) {
+        callWindowManagerRotation(true);
+        setInnerAutoRotate(cr, false);
+        sLockSnapshot = 0;
+        LogUtil.logAlways("[内屏联动] " + reason);
+        RotationHint.reconcileRotationHint("内屏联动：" + reason);
+    }
+
+    /**
+     * 排队在 {@code delayMs} 后恢复锁定。
+     *
+     * <p>重复调用以最后一次为准（先清掉旧回调），避免多个计时器叠加。
+     */
+    private static void scheduleRelock(
+            final android.content.ContentResolver cr, long delayMs) {
+        try {
+            sInnerHandler.removeCallbacksAndMessages(null);
+        } catch (Throwable unused) {
+        }
+        sInnerHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (!sFollowing) {
+                        return;   // 已被合上 / 熄屏取消
+                    }
+                    // 规则 4：计时期间用户手动关掉了开关 → 尊重用户的选择
+                    // （两个键都要看：控制中心那个开关写的是 accelerometer_rotation）
+                    if (!isAutoRotateOn(cr)) {
+                        callWindowManagerRotation(true);
+                        LogUtil.logAlways("[内屏联动] 计时结束（开关已被手动关闭）"
+                                + "，已对齐旋转锁，不改写设置");
+                        return;
+                    }
+                    relockInner(cr, "计时结束，已恢复锁定");
+                } catch (Throwable th) {
+                    LogUtil.logAlways("[内屏联动] 打开锁定失败: " + th);
+                } finally {
+                    sFollowing = false;
+                }
+            }
+        }, delayMs);
+    }
+
     static void applyInnerFixedLandscape() {
         if (!sInnerFollowRotation.get()) {
             // 诊断用：开关没生效时也能在日志里看到，不再"静默无反应"
@@ -1626,12 +1676,7 @@ public class MainHook extends XposedModule {
                 // 规则 3：5 秒内合上 → 立即停止计时，并把旋转锁打开
                 if (sFollowing) {
                     cancelFollowTimer();
-                    callWindowManagerRotation(true);
-                    // 同步回写设置，保持 WMS 锁定态与 accelerometer_rotation_inner 一致
-                    setInnerAutoRotate(cr, false);
-                    LogUtil.logAlways("[内屏联动] 合上时仍在计时，已取消并打开旋转锁");
-                    // 锁回来了 → 让旋转提示按「已锁定」重新算一次
-                    RotationHint.reconcileRotationHint("内屏联动：合上恢复锁定");
+                    relockInner(cr, "合上时仍在计时，已取消并恢复锁定");
                 }
                 return;
             }
@@ -1656,13 +1701,30 @@ public class MainHook extends XposedModule {
                 return;
             }
 
-            // 读当前旋转锁状态：两个键任一为 1 即视为「用户本来就要自由旋转」
+            // 读当前旋转锁状态：两个键任一为 1 即视为「锁是打开的」
             // （accelerometer_rotation 是控制中心开关那个通用键，
             //   accelerometer_rotation_inner 是 MIUI 内屏专用键，二者不同步，
-            //   所以必须一起看，否则会跟用户在开关上的选择打架）
+            //   所以必须一起看）
+            //
+            // ⚠️ 2026-10-25 修复「用着用着内屏自动旋转锁就再也不锁回去了」：
+            //   这里原来是「规则 2：本来就是未锁定 → 完全无视」。
+            //   但「打开」有两种来源，代码当时分不出来：
+            //     a) 上一次跟随窗口被 SystemUI 重启 / 进程被杀打断，计时器随之丢失，
+            //        键就停在 1 —— 本机实测一天里 SystemUI 重启十几次到几十次；
+            //     b) 用户自己在控制中心把自动旋转打开了。
+            //   两种都被「无视」的后果是**永久放养**：之后每次展开都在这里 return，
+            //   再没有任何路径把锁关回去。现场日志是铁证 ——
+            //   93 次「检测到展开」全部命中这一行、0 次「已恢复锁定」。
+            //
+            //   现在统一补一个跟随窗口：不管是谁打开的，DURATION 后都恢复锁定。
+            //   这样既不会当场覆盖用户正在进行的旋转，又保证稳态一定是「已锁定」，
+            //   而且被进程重启打断的计时也能在下次展开/亮屏时自愈。
             if (isAutoRotateOn(cr)) {
-                // 规则 2：本来就是未锁定 → 完全无视
-                LogUtil.logAlways("[内屏联动] 展开时旋转锁已是打开状态，不干预");
+                sFollowing = true;
+                LogUtil.logAlways("[内屏联动] 旋转锁已是打开状态（上次跟随遗留或用户手动），"
+                        + "补一个跟随窗口，" + Constants.INNER_FOLLOW_DURATION_MS + "ms 后恢复锁定");
+                RotationHint.reconcileRotationHint("内屏联动：临时放开锁定");
+                scheduleRelock(cr, Constants.INNER_FOLLOW_DURATION_MS);
                 return;
             }
 
@@ -1682,36 +1744,7 @@ public class MainHook extends XposedModule {
             // 锁暂时打开 → 让旋转提示收起（屏幕会自己转，不需要旋钮）
             RotationHint.reconcileRotationHint("内屏联动：临时放开锁定");
 
-            sInnerHandler.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        if (!sFollowing) {
-                            return;   // 已被合上/取消
-                        }
-                        // 规则 4：计时期间用户手动关掉了开关 → 尊重用户的选择
-                        // （两个键都要看：控制中心那个开关写的是 accelerometer_rotation）
-                        if (!isAutoRotateOn(cr)) {
-                            callWindowManagerRotation(true);
-                            LogUtil.logAlways("[内屏联动] 计时结束（开关已被手动关闭）"
-                                    + "，已对齐旋转锁，不改写设置");
-                            return;
-                        }
-                        callWindowManagerRotation(true);
-                        // 两个键一起关回去，保证「开关显示」与「真实锁定」一致
-                        setInnerAutoRotate(cr, false);
-                        LogUtil.logAlways("[内屏联动] 计时结束，已恢复锁定");
-                        // 🔑 锁恢复后必须重算一次旋转提示：
-                        //   计时那 5 秒里锁是开的，方向不一致也不会弹旋钮；
-                        //   锁回来后如果方向仍不一致，这时就该把旋钮叫出来。
-                        RotationHint.reconcileRotationHint("内屏联动：5 秒到点恢复锁定");
-                    } catch (Throwable th) {
-                        LogUtil.logAlways("[内屏联动] 打开锁定失败: " + th);
-                    } finally {
-                        sFollowing = false;
-                    }
-                }
-            }, Constants.INNER_FOLLOW_DURATION_MS);
+            scheduleRelock(cr, Constants.INNER_FOLLOW_DURATION_MS);
         } catch (Throwable th) {
             LogUtil.logAlways("[内屏联动] 异常: " + th);
         }

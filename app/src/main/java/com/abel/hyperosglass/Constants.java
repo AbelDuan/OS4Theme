@@ -114,7 +114,9 @@ public final class Constants {
     // MiBlurCompat / MiuiDefaultThemeControllerImpl）在插件 APK 里各有一份、跑在这个进程，
     // 只在 SystemUI 进程里强制"默认主题"会造成两侧状态不一致（磁贴变方），必须一并注入。
     public static final String TARGET_PLUGIN_PKG = "miui.systemui.plugin";
-    public static final String VERSION = "3.41.2";
+    // 日志里打印的模块版本号。⚠️ 必须和 app/build.gradle 的 versionName 一致，
+    // 否则排查时会被日志骗（2026-10-25 就发生过：跑的是 3.283.3，日志写 3.41.2）。
+    public static final String VERSION = "3.283.4";
 
     // ============================================================
     // 通知宽度调节（v3.41.2 新增）
