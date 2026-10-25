@@ -98,6 +98,12 @@ public class MainHook extends XposedModule {
     /** 内屏联动的延时任务调度器（独立线程，不打扰主线程）。 */
     private static final android.os.Handler sInnerHandler =
             new android.os.Handler(android.os.Looper.getMainLooper());
+    /** 屏幕开关 / 屏幕变化监听是否已装（惰性注册，幂等）。 */
+    private static volatile boolean sScreenWatchersInstalled = false;
+    /** 启动兜底重试是否已排队。 */
+    private static volatile boolean sBootstrapPosted = false;
+    /** 启动兜底重试次数。 */
+    private static volatile int sBootstrapAttempts = 0;
     /** 是否是「刚刚展开」的边沿，用于内屏固定只设一次。 */
     /** 上一次看到的活跃屏是否为内屏，用于识别展开边沿。 */
     private static volatile boolean sIsInnerNow = false;
@@ -139,6 +145,9 @@ public class MainHook extends XposedModule {
             reloadPrefs();
             syncRealPrefsAsync();
             LogUtil.logAlways("==== 模块已加载 v" + Constants.VERSION + "（LibXposed API " + getApiVersion() + "，进程=" + moduleLoadedParam.getProcessName() + "）====");
+            // 启动兜底：此刻 currentApplication 可能还是 null，
+            // 延时重试直到把屏幕监听装上（SystemUI 被重生时的保命机制）
+            ensureInnerBootstrap();
         } catch (Throwable th) {
             LogUtil.logAlways("onModuleLoaded 异常: " + th);
         }
@@ -154,6 +163,7 @@ public class MainHook extends XposedModule {
             reloadPrefs();
             syncRealPrefsAsync();
             registerPrefsReloadReceiver();
+            ensureInnerBootstrap();
             if (Constants.TARGET_PKG.equals(packageName)) {
                 installNotificationSinkHooks(defaultClassLoader);
                 installPluginClassLoaderHooks(defaultClassLoader);
@@ -218,111 +228,167 @@ public class MainHook extends XposedModule {
                 sReloadReceiverRegistered = true;
                 LogUtil.logAlways("[重载] 已注册实时重载广播接收器");
 
-                // ⚡ 屏幕开关联动：熄屏时注销方向传感器（省电）。
-                //   旋转按钮只在亮屏时有意义，而加速度计按 60Hz 上报会持续
-                //   唤醒 CPU —— 一天里大半时间屏幕是灭的，这处优化收益最大。
-                try {
-                    ((Context) objCurrentApplication).registerReceiver(
-                            new BroadcastReceiver() {
-                                @Override
-                                public void onReceive(Context context, Intent intent) {
-                                    try {
-                                        String a = intent.getAction();
-                                        if (Intent.ACTION_SCREEN_ON.equals(a)) {
-                                            RotationHint.onScreenStateChanged(true);
-                                            // 2026-10-22 用户要求：唤醒屏幕也当作
-                                            // 「刚刚打开内屏」判定一次。
-                                            // 先清状态，否则会被「已经是内屏」的
-                                            // 重复触发检查直接挡回去。
-                                            sIsInnerNow = false;
-                                            applyInnerFixedLandscape();
-                                            // 补一次延迟判定：亮屏广播可能早于设备状态刷新
-                                            applyInnerFixedLandscapeDeferred();
-                                        } else if (Intent.ACTION_USER_PRESENT.equals(a)) {
-                                            // 解锁：同样按「刚刚打开内屏」处理
-                                            LogUtil.logAlways("[内屏联动] 检测到解锁");
-                                            sIsInnerNow = false;
-                                            applyInnerFixedLandscape();
-                                            // 补一次延迟判定：解锁可能早于设备状态刷新
-                                            applyInnerFixedLandscapeDeferred();
-                                        } else if (Intent.ACTION_SCREEN_OFF.equals(a)) {
-                                            RotationHint.onScreenStateChanged(false);
-                                            // 熄屏后重置内屏状态：用户下次唤醒若仍是
-                                            // 展开态，屏幕变化会重新走到展开逻辑，
-                                            // 不会因为状态残留而被当成「重复触发」。
-                                            sIsInnerNow = false;
-                                            // 熄屏等同「合上」：取消计时并打开旋转锁，
-                                            // 避免计时器在息屏期间到点乱改设置。
-                                            try {
-                                                if (sFollowing) {
-                                                    cancelFollowTimer();
-                                                    relockInner(context.getContentResolver(),
-                                                            "熄屏取消计时，已恢复锁定");
-                                                }
-                                            } catch (Throwable unused) {
-                                            }
-                                        }
-                                    } catch (Throwable unused) {
-                                    }
-                                }
-                            },
-                            new IntentFilter(Intent.ACTION_SCREEN_ON) {{
-                                addAction(Intent.ACTION_SCREEN_OFF);
-                                // 解锁广播：和「刚刚打开内屏」走同一套判定
-                                addAction(Intent.ACTION_USER_PRESENT);
-                            }});
-                    LogUtil.logAlways("[旋转提示] 已注册屏幕开关监听（熄屏注销传感器）");
-
-                    // 📌 内屏固定还需要跟随「展开/折叠」事件。
-                    //   DisplayManager.DisplayListener 在屏幕增删、状态变化时回调，
-                    //   展开内屏（Display 1 关闭 / Display 0 变为活跃）会走到这里。
-                    try {
-                        android.hardware.display.DisplayManager dmg =
-                                (android.hardware.display.DisplayManager)
-                                        ((Context) objCurrentApplication)
-                                                .getSystemService(Context.DISPLAY_SERVICE);
-                        if (dmg != null) {
-                            dmg.registerDisplayListener(
-                                    new android.hardware.display.DisplayManager.DisplayListener() {
-                                        @Override
-                                        public void onDisplayAdded(int displayId) {
-                                            try {
-                                                applyInnerFixedLandscape();
-                                            } catch (Throwable unused) {
-                                            }
-                                        }
-
-                                        @Override
-                                        public void onDisplayRemoved(int displayId) {
-                                        }
-
-                                        @Override
-                                        public void onDisplayChanged(int displayId) {
-                                            try {
-                                                // 屏幕尺寸/状态变了 → 丢弃悬浮窗，
-                                                // 下次显示时按当前屏幕重建
-                                                RotationButtonOverlay.get().reset();
-                                            } catch (Throwable unused) {
-                                            }
-                                            try {
-                                                applyInnerFixedLandscape();
-                                            } catch (Throwable unused) {
-                                            }
-                                        }
-                                    }, null);
-                            LogUtil.logAlways("[内屏固定] 已注册屏幕变化监听");
-                        }
-                    } catch (Throwable td) {
-                        LogUtil.logAlways("[内屏固定] 屏幕变化监听注册失败: " + td);
-                    }
-                } catch (Throwable t2) {
-                    LogUtil.logAlways("[旋转提示] 屏幕监听注册失败: " + t2);
-                }
+                // 屏幕开关 / 屏幕变化监听统一由惰性方法装（幂等，可重入）
+                ensureScreenWatchers((Context) objCurrentApplication);
             }
         } catch (Throwable th) {
             LogUtil.logAlways("[重载] 注册失败: " + th);
         }
     }
+
+
+    /**
+     * 装「屏幕开关 / 屏幕变化」监听 —— 内屏联动的**唯一触发源**。
+     *
+     * <p>2026-10-25 22:00 用户反馈「开内屏的自动旋转、点亮屏幕的自动旋转都没了」。
+     * 查日志 {@code /data/data/com.abel.hyperosglass/files/hyperos_glass.log}：
+     * SystemUI 被系统重生后（21:48:11 那次），这三行**完全没出现**：
+     * <pre>
+     *   [重载] 已注册实时重载广播接收器      ← 21:11 进程有
+     *   [旋转提示] 已注册屏幕开关监听        ← 21:11 进程有
+     *   [内屏固定] 已注册屏幕变化监听        ← 21:11 进程有
+     * </pre>
+     * 说明 onPackageLoaded 那条路径当时没走到，SCREEN_ON 与 DisplayListener
+     * 全都没装上 —— 展开和亮屏根本触发不到联动，两个功能一起"消失"，
+     * 而且因为没有任何异常日志，看起来就像代码坏了。
+     *
+     * <p>现在改为**惰性 + 幂等**：任何一次联动入口都会补装一遍，装过就不再重复。
+     *
+     * <p>⚠️ 2026-10-25 用户要求：**取消「解锁屏幕」这个触发点**，
+     * 只保留「开内屏」与「点亮屏幕」两种判定（ACTION_USER_PRESENT 已移除）。
+     */
+    private static void ensureScreenWatchers(final Context ctx) {
+        if (sScreenWatchersInstalled || ctx == null) {
+            return;
+        }
+        // ⚡ 屏幕开关联动：熄屏时注销方向传感器（省电）。
+        //   旋转按钮只在亮屏时有意义，而加速度计按 60Hz 上报会持续
+        //   唤醒 CPU —— 一天里大半时间屏幕是灭的，这处优化收益最大。
+        try {
+            ctx.registerReceiver(
+                    new BroadcastReceiver() {
+                        @Override
+                        public void onReceive(Context context, Intent intent) {
+                            try {
+                                String a = intent.getAction();
+                                if (Intent.ACTION_SCREEN_ON.equals(a)) {
+                                    RotationHint.onScreenStateChanged(true);
+                                    // 点亮屏幕也当作「刚刚打开内屏」判定一次。
+                                    // 先清状态，否则会被「已经是内屏」的重复触发挡回去。
+                                    sIsInnerNow = false;
+                                    applyInnerFixedLandscape();
+                                    // 补一次延迟判定：亮屏广播可能早于设备状态刷新
+                                    applyInnerFixedLandscapeDeferred();
+                                } else if (Intent.ACTION_SCREEN_OFF.equals(a)) {
+                                    RotationHint.onScreenStateChanged(false);
+                                    // 熄屏后重置内屏状态：下次唤醒若仍是展开态，
+                                    // 会重新走一遍判定，不会因为状态残留被当成重复触发。
+                                    sIsInnerNow = false;
+                                    // 熄屏等同「合上」：取消计时并恢复锁定，
+                                    // 避免计时器在息屏期间到点乱改设置。
+                                    try {
+                                        if (sFollowing) {
+                                            cancelFollowTimer();
+                                            relockInner(context.getContentResolver(),
+                                                    "熄屏取消计时，已恢复锁定");
+                                        }
+                                    } catch (Throwable unused) {
+                                    }
+                                }
+                            } catch (Throwable unused) {
+                            }
+                        }
+                    },
+                    new IntentFilter(Intent.ACTION_SCREEN_ON) {{
+                        addAction(Intent.ACTION_SCREEN_OFF);
+                    }});
+            LogUtil.logAlways("[旋转提示] 已注册屏幕开关监听（熄屏注销传感器）");
+        } catch (Throwable t2) {
+            LogUtil.logAlways("[旋转提示] 屏幕监听注册失败: " + t2);
+        }
+
+        // 📌 内屏固定还需要跟随「展开/折叠」事件。
+        //   DisplayManager.DisplayListener 在屏幕增删、状态变化时回调，
+        //   展开内屏（Display 1 关闭 / Display 0 变为活跃）会走到这里。
+        try {
+            android.hardware.display.DisplayManager dmg =
+                    (android.hardware.display.DisplayManager)
+                            ctx.getSystemService(Context.DISPLAY_SERVICE);
+            if (dmg != null) {
+                dmg.registerDisplayListener(
+                        new android.hardware.display.DisplayManager.DisplayListener() {
+                            @Override
+                            public void onDisplayAdded(int displayId) {
+                                try {
+                                    applyInnerFixedLandscape();
+                                } catch (Throwable unused) {
+                                }
+                            }
+
+                            @Override
+                            public void onDisplayRemoved(int displayId) {
+                            }
+
+                            @Override
+                            public void onDisplayChanged(int displayId) {
+                                try {
+                                    // 屏幕尺寸/状态变了 → 丢弃悬浮窗，下次显示时重建
+                                    RotationButtonOverlay.get().reset();
+                                } catch (Throwable unused) {
+                                }
+                                try {
+                                    applyInnerFixedLandscape();
+                                } catch (Throwable unused) {
+                                }
+                            }
+                        }, null);
+                LogUtil.logAlways("[内屏固定] 已注册屏幕变化监听");
+            }
+        } catch (Throwable td) {
+            LogUtil.logAlways("[内屏固定] 屏幕变化监听注册失败: " + td);
+        }
+        sScreenWatchersInstalled = true;
+    }
+
+    /**
+     * 启动兜底：{@code onModuleLoaded} 时 {@code currentApplication()} 可能还是
+     * null，那时装不了任何监听。这里延时重试，直到装成为止（最多 6 次）。
+     */
+    private static void ensureInnerBootstrap() {
+        if (sBootstrapPosted || sScreenWatchersInstalled) {
+            return;
+        }
+        sBootstrapPosted = true;
+        sBootstrapAttempts = 0;
+        postBootstrapRetry(1200L);
+    }
+
+    private static void postBootstrapRetry(final long delay) {
+        try {
+            sInnerHandler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if (sScreenWatchersInstalled || sBootstrapAttempts >= 6) {
+                        sBootstrapPosted = false;
+                        return;
+                    }
+                    sBootstrapAttempts++;
+                    try {
+                        applyInnerFixedLandscape();
+                    } catch (Throwable unused) {
+                    }
+                    if (!sScreenWatchersInstalled) {
+                        postBootstrapRetry(1500L);
+                    } else {
+                        sBootstrapPosted = false;
+                    }
+                }
+            }, delay);
+        } catch (Throwable th) {
+            sBootstrapPosted = false;
+        }
+    }
+
 
     private void installPinGlassHook(final ClassLoader classLoader) {
         try {
@@ -1290,14 +1356,15 @@ public class MainHook extends XposedModule {
     /**
      * 上一次跟随窗口结束的时刻（uptimeMillis）。
      *
-     * <p>一次亮屏会连发 {@code ACTION_SCREEN_ON} 与 {@code ACTION_USER_PRESENT}，
-     * 两者都会把 {@code sIsInnerNow} 清掉重新判定，于是同一次亮屏会开两个解锁窗口 ——
-     * 用户感受就是「锁动不动就被关掉」。这里做冷却：**折叠状态没变化**的重复触发
-     * 在冷却期内不再开新窗口；真正合上/展开会把冷却清零，不受影响。
+     * <p>一次亮屏会连发多次显示状态变化（DisplayListener）+ {@code ACTION_SCREEN_ON}，
+     * 每个入口都会把 {@code sIsInnerNow} 清掉重新判定，于是同一次亮屏可能开出
+     * 多个解锁窗口 —— 用户感受就是「锁动不动就被关掉」。这里做冷却：
+     * **折叠状态没变化**的重复触发在冷却期内不再开新窗口；
+     * 真正合上/展开会把冷却清零，不受影响。
      */
     private static volatile long sLastWindowEndAt = 0L;
     /** 窗口冷却时长。 */
-    private static final long INNER_WINDOW_COOLDOWN_MS = 10000L;
+    private static final long INNER_WINDOW_COOLDOWN_MS = 4000L;
 
     /**
      * 检查用户是否在这期间**手动改过**设置。
@@ -1930,6 +1997,10 @@ public class MainHook extends XposedModule {
             Context ctx = (Context) app;
             final android.content.ContentResolver cr = ctx.getContentResolver();
 
+            // 触发源兜底：SystemUI 被重生后 onPackageLoaded 可能没走到，
+            // 这里补装屏幕开关 / 屏幕变化监听（幂等）
+            ensureScreenWatchers(ctx);
+
             // 装上「用户意志」监听（幂等），并确保本地状态已加载
             ensureInnerStateObserver(ctx);
 
@@ -2025,7 +2096,7 @@ public class MainHook extends XposedModule {
             }
 
             // 规则 1：锁定中 → 关掉锁定，5 秒后恢复
-            // 窗口冷却：同一次亮屏里 SCREEN_ON / USER_PRESENT 会连续进来两次，
+            // 窗口冷却：同一次亮屏里 DisplayListener / SCREEN_ON 会连续进来，
             // 冷却期内不再开第二个窗口（折叠状态没变时才生效）
             long sinceEnd = android.os.SystemClock.uptimeMillis() - sLastWindowEndAt;
             if (sLastWindowEndAt > 0L && sinceEnd >= 0
@@ -2063,7 +2134,7 @@ public class MainHook extends XposedModule {
     /**
      * 延迟 400ms 再判一次内屏联动。
      *
-     * <p>亮屏（{@code ACTION_SCREEN_ON}）/ 解锁（{@code ACTION_USER_PRESENT}）广播
+     * <p>亮屏（{@code ACTION_SCREEN_ON}）广播
      * 可能早于系统刷新 {@code current_device_state}，此时立即判定会读到「还没展开」，
      * 表现为「唤醒内屏时自动旋转解锁不生效」。补一次延迟判定即可覆盖这个时间差：
      * 若第一次已经解锁（sFollowing=true），这次会命中「计时中，忽略重复触发」，
