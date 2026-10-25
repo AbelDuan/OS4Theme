@@ -1254,6 +1254,40 @@ public class MainHook extends XposedModule {
     /** 进程判断缓存：-1 未判定，0 否，1 是。 */
     private static volatile int sIsSystemUiProc = -1;
 
+    // ============================================================
+    //  「用户意志优先」状态（v3.283.5）
+    //  ------------------------------------------------------------
+    //  背景（2026-10-25 用户明确要求）：
+    //    v3.283.4 为了修「用久了锁再也不锁回去」，对每次展开都无差别补一个
+    //    跟随窗口 —— 于是用户自己在控制中心打开的自动旋转也会被 5 秒后关掉，
+    //    等于模块压过了用户的选择。用户要求：**用户意志最高优先级**。
+    //
+    //  正确做法（不再靠猜）：
+    //    ① 用户面开关（accelerometer_rotation）真的变了 → 记为用户意志，落盘；
+    //    ② 模块自己写的 1 会落一个「占用到期时刻」标记，进程被杀也能自愈；
+    //    ③ 展开时先看标记：是我们的遗留 → 收回去；不是我们的 → 那是用户开的，
+    //       一律不碰。
+    // ============================================================
+
+    private static final String INNER_STATE_PREFS = "os4themer_inner_state";
+    private static final String KEY_USER_INTENT = "user_intent";
+    private static final String KEY_OCCUPY_UNTIL = "module_unlock_until";
+
+    /** 用户意志：-2 尚未从磁盘加载；-1 没表过态；0 要锁定旋转；1 要自由旋转。 */
+    private static volatile int sUserIntent = -2;
+    /** 模块占用旋转锁的到期时刻（wall clock ms）。&gt;0 表示「现在这个 1 是模块写的」。 */
+    private static volatile long sOccupyUntil = 0L;
+    /** 模块最近一次写设置的时刻（uptimeMillis），用来识别「设置回调是不是自己造成的」。 */
+    private static volatile long sSelfWriteAt = 0L;
+    /** 模块自己写进去的用户面开关值 / 内屏键值。 */
+    private static volatile int sSelfWrittenCr = -1;
+    private static volatile int sSelfWrittenInner = -1;
+    /** 观察者上次看到的「用户面开关」值，用来判断这次回调里开关是否真的变了。 */
+    private static volatile int sLastSeenCr = -1;
+    /** 缓存 SystemUI 的 Context（写 SharedPreferences 用）。 */
+    private static volatile Context sInnerCtx = null;
+    private static volatile boolean sInnerObserverInstalled = false;
+
     /**
      * 检查用户是否在这期间**手动改过**设置。
      *
@@ -1278,6 +1312,204 @@ public class MainHook extends XposedModule {
         } catch (Throwable unused) {
         }
         sFollowing = false;
+    }
+
+    // ------------------------------------------------------------
+    //  用户意志：读写 / 落盘 / 判定
+    // ------------------------------------------------------------
+
+    /** 读一个 Settings.System 整型键，失败给默认值。 */
+    private static int readSysInt(android.content.ContentResolver cr, String key, int def) {
+        if (cr == null) {
+            return def;
+        }
+        try {
+            return android.provider.Settings.System.getInt(cr, key, def);
+        } catch (Throwable unused) {
+            return def;
+        }
+    }
+
+    /** 首次使用时从 SystemUI 自己的私有目录读出用户意志与占用标记（跨进程重启有效）。 */
+    private static void loadInnerState(Context ctx) {
+        if (sUserIntent != -2) {
+            return;
+        }
+        int intent = -1;
+        long until = 0L;
+        try {
+            SharedPreferences sp = ctx.getSharedPreferences(INNER_STATE_PREFS, Context.MODE_PRIVATE);
+            intent = sp.getInt(KEY_USER_INTENT, -1);
+            until = sp.getLong(KEY_OCCUPY_UNTIL, 0L);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[用户意志] 读取本地状态失败: " + th);
+        }
+        sUserIntent = intent;
+        sOccupyUntil = until;
+        LogUtil.logAlways("[用户意志] 已加载：userIntent=" + intent + " occupyUntil=" + until);
+    }
+
+    /** 把用户意志与占用标记落盘（SystemUI 私有 prefs，进程重启后仍在）。 */
+    private static void persistInnerState() {
+        Context c = sInnerCtx;
+        if (c == null) {
+            return;
+        }
+        try {
+            c.getSharedPreferences(INNER_STATE_PREFS, Context.MODE_PRIVATE).edit()
+                    .putInt(KEY_USER_INTENT, sUserIntent)
+                    .putLong(KEY_OCCUPY_UNTIL, sOccupyUntil)
+                    .apply();
+        } catch (Throwable th) {
+            LogUtil.logAlways("[用户意志] 保存本地状态失败: " + th);
+        }
+    }
+
+    /** 记下「这次写入是我们自己干的」，供设置观察者过滤回声。 */
+    private static void markSelfWrite(int crValue, int innerValue) {
+        sSelfWrittenCr = crValue;
+        sSelfWrittenInner = innerValue;
+        sSelfWriteAt = android.os.SystemClock.uptimeMillis();
+    }
+
+    /**
+     * 安装「用户意志」监听 —— 盯用户面开关 {@code accelerometer_rotation}。
+     *
+     * <p>只要这个开关被**用户**（控制中心 / 设置页）改过，就把结果记成用户的
+     * 明确选择并落盘；此后联动一律让位。这是「用户意志最高优先级」的判据来源。
+     */
+    private static void ensureInnerStateObserver(Context ctx) {
+        if (ctx == null) {
+            return;
+        }
+        sInnerCtx = ctx;
+        // 用 ApplicationContext 写 prefs，避免持有 Activity 之类短命 Context
+        loadInnerState(ctx.getApplicationContext() != null
+                ? ctx.getApplicationContext() : ctx);
+        if (sInnerObserverInstalled) {
+            return;
+        }
+        try {
+            final android.content.ContentResolver cr0 = ctx.getContentResolver();
+            sLastSeenCr = readSysInt(cr0, "accelerometer_rotation", 0);
+            android.database.ContentObserver obs =
+                    new android.database.ContentObserver(
+                            new android.os.Handler(android.os.Looper.getMainLooper())) {
+                        @Override
+                        public void onChange(boolean selfChange) {
+                            try {
+                                onInnerSwitchMaybeChanged();
+                            } catch (Throwable th) {
+                                LogUtil.logAlways("[用户意志] 处理设置变化失败: " + th);
+                            }
+                        }
+                    };
+            android.content.ContentResolver cr = ctx.getContentResolver();
+            cr.registerContentObserver(
+                    android.provider.Settings.System.getUriFor("accelerometer_rotation"),
+                    false, obs);
+            cr.registerContentObserver(
+                    android.provider.Settings.System.getUriFor("accelerometer_rotation_inner"),
+                    false, obs);
+            sInnerObserverInstalled = true;
+            LogUtil.logAlways("[用户意志] 已监听旋转开关，用户手动改动优先于联动");
+            // 进程刚起来（可能刚被重启过）先自愈一次遗留占用
+            sInnerHandler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        healInnerLockIfStale("SystemUI 启动后自检");
+                    } catch (Throwable unused) {
+                    }
+                }
+            }, 1500L);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[用户意志] 监听注册失败: " + th);
+        }
+    }
+
+    /**
+     * 设置真的变了 → 判断是不是我们自己写的。
+     *
+     * <p>只有「用户面开关的值确实变了，且不是模块刚写的那次回声」才算用户意志。
+     */
+    private static void onInnerSwitchMaybeChanged() {
+        Context ctx = sInnerCtx;
+        if (ctx == null) {
+            return;
+        }
+        android.content.ContentResolver cr = ctx.getContentResolver();
+        int crV = readSysInt(cr, "accelerometer_rotation", 0);
+        int inV = readSysInt(cr, "accelerometer_rotation_inner", 0);
+        // ① 用户面开关没变（可能只是 _inner 被系统改写）→ 不记用户意志
+        if (crV == sLastSeenCr) {
+            return;
+        }
+        long dt = android.os.SystemClock.uptimeMillis() - sSelfWriteAt;
+        // ② 这是模块刚刚自己写出来的值 → 回声，忽略
+        if (dt >= 0 && dt < 1500L && sSelfWrittenCr >= 0 && crV == sSelfWrittenCr) {
+            sLastSeenCr = crV;
+            return;
+        }
+        sLastSeenCr = crV;
+        // ③ 外部改动 —— 用户亲手做的决定
+        sUserIntent = crV != 0 ? 1 : 0;
+        sOccupyUntil = 0L;
+        persistInnerState();
+        LogUtil.logAlways("[用户意志] 检测到手动改动：accelerometer_rotation=" + crV
+                + "，accelerometer_rotation_inner=" + inV
+                + " → 记为用户选择（" + (sUserIntent == 1 ? "自由旋转" : "锁定旋转") + "）");
+        if (sFollowing) {
+            cancelFollowTimer();
+            LogUtil.logAlways("[用户意志] 已放弃本次跟随与回锁，不覆盖用户选择");
+        }
+        // 让 WMS 的锁定态立刻跟着用户的开关走，避免「开关显示已锁定、
+        // 屏幕其实还能自由转」这种表里不一
+        try {
+            callWindowManagerRotation(sUserIntent == 0);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[用户意志] 对齐 WMS 锁定态失败: " + th);
+        }
+        RotationHint.reconcileRotationHint("用户手动改旋转开关");
+    }
+
+    /**
+     * 自愈：模块写的「临时解锁」本该在 {@link Constants#INNER_FOLLOW_DURATION_MS}
+     * 后收回，但 SystemUI 被杀 / 重启会把计时器一起带走，键就永久停在 1。
+     *
+     * <p>落盘的占用到期时刻就是为此准备的：只要它过期了，无论当前是否有计时器
+     * 在跑，都补一次恢复锁定 —— 这样「用久了锁再也不锁回去」不会再发生，
+     * 而且**不会**误伤用户自己打开的自动旋转（那种没有占用标记）。
+     */
+    private static boolean healInnerLockIfStale(String reason) {
+        if (!sInnerFollowRotation.get()) {
+            return false;
+        }
+        if (!isSystemUiProc()) {
+            return false;
+        }
+        Context ctx = sInnerCtx;
+        if (ctx == null) {
+            return false;
+        }
+        long until = sOccupyUntil;
+        if (until <= 0L) {
+            return false;   // 模块没有占用锁，无事可做
+        }
+        if (sFollowing) {
+            return false;   // 计时器还活着，交给它
+        }
+        if (System.currentTimeMillis() < until) {
+            return false;
+        }
+        try {
+            relockInner(ctx.getContentResolver(),
+                    "跟随窗口已过期（进程可能被杀）→ " + reason + "，已恢复锁定");
+            return true;
+        } catch (Throwable th) {
+            LogUtil.logAlways("[内屏联动] 自愈失败: " + th);
+            return false;
+        }
     }
 
     /**
@@ -1426,6 +1658,8 @@ public class MainHook extends XposedModule {
         }
         LogUtil.logAlways("[内屏联动] 已回写 accelerometer_rotation=" + v
                 + "，accelerometer_rotation_inner=" + v);
+        // 标记「这次是我们写的」，让设置观察者把随之而来的回调当成回声而不是用户操作
+        markSelfWrite(v, v);
     }
 
     /** 读「自动旋转」当前是否处于打开状态（任一键为 1 即视为打开）。 */
@@ -1568,20 +1802,20 @@ public class MainHook extends XposedModule {
     }
 
     /**
-     * 内屏展开时的旋转锁定联动（用户 2026-10-21 最终方案）。
+     * 内屏展开时的旋转锁定联动（用户 2026-10-21 方案 + 2026-10-25「用户意志优先」）。
      *
-     * <p>规则：
+     * <p>规则（v3.283.5）：
      * <ol>
-     *   <li>展开时若「屏幕旋转锁」是**打开**的 → 关掉它，让屏幕自由旋转，
-     *       5 秒后自动打开锁定；</li>
-     *   <li>展开时旋转锁**本来就是关闭**的 → 完全无视，不等待、不改写；</li>
-     *   <li>5 秒内**合上屏幕** → 立即停止计时，并打开旋转锁；</li>
-     *   <li>5 秒内**用户手动改了开关** → 视为用户已做选择，停止计时不覆盖。</li>
+     *   <li><b>用户意志最高优先级</b>：用户自己把「自动旋转」打开 → 联动彻底让位，
+     *       展开/亮屏/回锁一律不碰；用户再关掉 → 联动恢复；</li>
+     *   <li>锁定状态展开 → 临时放开 {@link Constants#INNER_FOLLOW_DURATION_MS}，
+     *       到期收回锁定；</li>
+     *   <li>窗口期内合上 / 熄屏 → 立即取消并收回锁定；</li>
+     *   <li>进程被杀导致计时器丢失 → 靠落盘的占用标记自愈（下次任意入口收回）。</li>
      * </ol>
      *
      * <p>⚠️ 全程**不写任何方向值**（user_rotation_inner 等一律不碰），
-     * 只切换系统的旋转锁定开关（accelerometer_rotation_inner）。
-     * 锁定后锁在哪个方向完全由系统当前值决定。
+     * 只切换系统的旋转锁定开关。
      */
     /**
      * 恢复锁定 —— **唯一出口**。
@@ -1596,6 +1830,10 @@ public class MainHook extends XposedModule {
         callWindowManagerRotation(true);
         setInnerAutoRotate(cr, false);
         sLockSnapshot = 0;
+        sFollowing = false;
+        // 占用标记一并清掉：从这里开始，键上的 0 不再属于模块
+        sOccupyUntil = 0L;
+        persistInnerState();
         LogUtil.logAlways("[内屏联动] " + reason);
         RotationHint.reconcileRotationHint("内屏联动：" + reason);
     }
@@ -1618,11 +1856,21 @@ public class MainHook extends XposedModule {
                     if (!sFollowing) {
                         return;   // 已被合上 / 熄屏取消
                     }
-                    // 规则 4：计时期间用户手动关掉了开关 → 尊重用户的选择
-                    // （两个键都要看：控制中心那个开关写的是 accelerometer_rotation）
+                    // 用户在窗口期内自己动了开关 → 已记为用户意志，最高优先级
+                    if (sUserIntent == 1) {
+                        sFollowing = false;
+                        sOccupyUntil = 0L;
+                        persistInnerState();
+                        LogUtil.logAlways("[内屏联动] 计时结束：用户已选择自由旋转，保持现状不回锁");
+                        return;
+                    }
+                    // 两个键都已是 0（用户自己关了）→ 已是锁定态，只需对齐 WMS
                     if (!isAutoRotateOn(cr)) {
                         callWindowManagerRotation(true);
-                        LogUtil.logAlways("[内屏联动] 计时结束（开关已被手动关闭）"
+                        sFollowing = false;
+                        sOccupyUntil = 0L;
+                        persistInnerState();
+                        LogUtil.logAlways("[内屏联动] 计时结束（开关已被关闭）"
                                 + "，已对齐旋转锁，不改写设置");
                         return;
                     }
@@ -1657,6 +1905,9 @@ public class MainHook extends XposedModule {
             Context ctx = (Context) app;
             final android.content.ContentResolver cr = ctx.getContentResolver();
 
+            // 装上「用户意志」监听（幂等），并确保本地状态已加载
+            ensureInnerStateObserver(ctx);
+
             android.hardware.display.DisplayManager dm =
                     (android.hardware.display.DisplayManager)
                             ctx.getSystemService(Context.DISPLAY_SERVICE);
@@ -1666,6 +1917,9 @@ public class MainHook extends XposedModule {
             }
 
             boolean isInnerActive = isInnerDisplayActive(dm, cr);
+
+            // 每次进来都先自愈一次「上次跟随被打断」的遗留（进程重启也能收回来）
+            boolean healed = healInnerLockIfStale("联动入口");
 
             // ── 合上 / 切到外屏 ──
             if (!isInnerActive) {
@@ -1677,6 +1931,9 @@ public class MainHook extends XposedModule {
                 if (sFollowing) {
                     cancelFollowTimer();
                     relockInner(cr, "合上时仍在计时，已取消并恢复锁定");
+                } else if (sOccupyUntil > 0L) {
+                    // 没有计时器但还留着占用标记：说明键上的 1 是我们的，收回
+                    relockInner(cr, "合上时发现跟随遗留，已恢复锁定");
                 }
                 return;
             }
@@ -1701,30 +1958,36 @@ public class MainHook extends XposedModule {
                 return;
             }
 
-            // 读当前旋转锁状态：两个键任一为 1 即视为「锁是打开的」
-            // （accelerometer_rotation 是控制中心开关那个通用键，
-            //   accelerometer_rotation_inner 是 MIUI 内屏专用键，二者不同步，
-            //   所以必须一起看）
+            // 本轮刚做过「遗留自愈」→ 已经收回锁定，本次不再重复放开，
+            // 否则会变成「收回来又立刻放开」的空转
+            if (healed) {
+                return;
+            }
+
+            // ⚠️ 2026-10-25 v3.283.5「用户意志最高优先级」重写：
+            //   v3.283.4 在这里对「旋转锁已是打开」**无差别**补一个跟随窗口，
+            //   DURATION 后强制关掉 —— 这样用户自己在控制中心打开的自动旋转
+            //   也会被关掉，等于模块压过了用户。用户明确要求以用户意志为准。
             //
-            // ⚠️ 2026-10-25 修复「用着用着内屏自动旋转锁就再也不锁回去了」：
-            //   这里原来是「规则 2：本来就是未锁定 → 完全无视」。
-            //   但「打开」有两种来源，代码当时分不出来：
-            //     a) 上一次跟随窗口被 SystemUI 重启 / 进程被杀打断，计时器随之丢失，
-            //        键就停在 1 —— 本机实测一天里 SystemUI 重启十几次到几十次；
-            //     b) 用户自己在控制中心把自动旋转打开了。
-            //   两种都被「无视」的后果是**永久放养**：之后每次展开都在这里 return，
-            //   再没有任何路径把锁关回去。现场日志是铁证 ——
-            //   93 次「检测到展开」全部命中这一行、0 次「已恢复锁定」。
-            //
-            //   现在统一补一个跟随窗口：不管是谁打开的，DURATION 后都恢复锁定。
-            //   这样既不会当场覆盖用户正在进行的旋转，又保证稳态一定是「已锁定」，
-            //   而且被进程重启打断的计时也能在下次展开/亮屏时自愈。
+            //   现在按来源区分，不再靠猜：
+            //     ① 有占用标记（sOccupyUntil，落盘）→ 这个 1 是我们写的，
+            //        例如上次跟随被 SystemUI 重启打断 → 收回锁定（自愈）；
+            //     ② 没有占用标记 → 那是用户自己开的，**一律不碰**。
+            //   占用标记让「自愈」和「尊重用户」可以同时成立，这是 v3.283.4
+            //   粗暴做法的正确替代。
             if (isAutoRotateOn(cr)) {
-                sFollowing = true;
-                LogUtil.logAlways("[内屏联动] 旋转锁已是打开状态（上次跟随遗留或用户手动），"
-                        + "补一个跟随窗口，" + Constants.INNER_FOLLOW_DURATION_MS + "ms 后恢复锁定");
-                RotationHint.reconcileRotationHint("内屏联动：临时放开锁定");
-                scheduleRelock(cr, Constants.INNER_FOLLOW_DURATION_MS);
+                if (sOccupyUntil > 0L) {
+                    relockInner(cr, "检测到上次跟随的遗留占用，已恢复锁定（自愈）");
+                    return;
+                }
+                // 记住这是用户的选择，之后展开/亮屏都不再介入
+                if (sUserIntent != 1) {
+                    sUserIntent = 1;
+                    persistInnerState();
+                }
+                sFollowing = false;
+                LogUtil.logAlways("[内屏联动] 旋转锁本来就是打开且不是模块所写"
+                        + " → 视为用户选择自由旋转，联动让位");
                 return;
             }
 
@@ -1739,6 +2002,11 @@ public class MainHook extends XposedModule {
             //   这里补写 1，并**以写完后的真实值**作为快照，两种回推行为都能自洽。
             setInnerAutoRotate(cr, true);
             sLockSnapshot = 1;
+            // 记下「这段时间这把 1 是模块的」，落盘 —— 即使 SystemUI 下一秒被杀，
+            // 下次启动也能认出来并收回，不会永久放养。
+            sOccupyUntil = System.currentTimeMillis()
+                    + Constants.INNER_FOLLOW_DURATION_MS + 3000L;
+            persistInnerState();
             LogUtil.logAlways("[内屏联动] 展开：已放开旋转锁，"
                     + Constants.INNER_FOLLOW_DURATION_MS + "ms 后恢复锁定");
             // 锁暂时打开 → 让旋转提示收起（屏幕会自己转，不需要旋钮）
