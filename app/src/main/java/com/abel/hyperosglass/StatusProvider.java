@@ -171,6 +171,19 @@ public class StatusProvider extends ContentProvider {
             bundle2.putInt(Constants.KEY_NOTIF_WIDTH_RATIO_LAND,
                     Constants.DEFAULT_NOTIF_WIDTH_RATIO_LAND);
         }
+        // ★ v3.45.x 状态栏通知图标上限（1~7）与溢出圆点模式（0/1/2）：连续值，走 int 通道
+        try {
+            bundle2.putInt(Constants.KEY_STATUS_ICON_MAX,
+                    sharedPreferences.getInt(Constants.PREFS_STATUS_ICON_MAX, Constants.DEFAULT_STATUS_ICON_MAX));
+        } catch (Throwable unused2) {
+            bundle2.putInt(Constants.KEY_STATUS_ICON_MAX, Constants.DEFAULT_STATUS_ICON_MAX);
+        }
+        try {
+            bundle2.putInt(Constants.KEY_STATUS_ICON_DOT_MODE,
+                    sharedPreferences.getInt(Constants.PREFS_STATUS_ICON_DOT_MODE, Constants.DEFAULT_STATUS_ICON_DOT_MODE));
+        } catch (Throwable unused2) {
+            bundle2.putInt(Constants.KEY_STATUS_ICON_DOT_MODE, Constants.DEFAULT_STATUS_ICON_DOT_MODE);
+        }
         bundle2.putBoolean("ok", true);
         return bundle2;
     }

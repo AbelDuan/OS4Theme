@@ -170,11 +170,6 @@ public class SettingsActivity extends Activity {
             } else {
                 sharedPreferencesCeSp.getBoolean(Constants.PREFS_NO_FOLD_HISTORY, z3);
             }
-            if (sharedPreferencesSp.contains(Constants.PREFS_NO_NOTIF_LIMIT)) {
-                sharedPreferencesSp.getBoolean(Constants.PREFS_NO_NOTIF_LIMIT, z3);
-            } else {
-                sharedPreferencesCeSp.getBoolean(Constants.PREFS_NO_NOTIF_LIMIT, z3);
-            }
             if (sharedPreferencesSp.contains(Constants.PREFS_KEEP_NOTIF)) {
                 sharedPreferencesSp.getBoolean(Constants.PREFS_KEEP_NOTIF, z3);
             } else {
@@ -320,7 +315,7 @@ public class SettingsActivity extends Activity {
         linearLayout.addView(linearLayoutNewCard3, cardLp());
         LinearLayout linearLayoutNewCard4 = newCard();
         addSectionTitle(linearLayoutNewCard4, "锁屏与息屏", null);
-        addSwitches(linearLayoutNewCard4, new Sw("锁屏通知下沉", Constants.PREFS_SINK_ENABLED, true), new Sw("息屏电量样式同步", Constants.PREFS_AOD_BATTERY_SYNC, true), new Sw("解锁后保留通知", Constants.PREFS_KEEP_NOTIF, true), new Sw("解除通知条数上限", Constants.PREFS_NO_NOTIF_LIMIT, true));
+        addSwitches(linearLayoutNewCard4, new Sw("锁屏通知下沉", Constants.PREFS_SINK_ENABLED, true), new Sw("息屏电量样式同步", Constants.PREFS_AOD_BATTERY_SYNC, true), new Sw("解锁后保留通知", Constants.PREFS_KEEP_NOTIF, true));
         linearLayout.addView(linearLayoutNewCard4, cardLp());
         LinearLayout linearLayoutNewCard5 = newCard();
         addSectionTitle(linearLayoutNewCard5, "功能隐藏", null);
@@ -345,6 +340,21 @@ public class SettingsActivity extends Activity {
         addNotifWidthSlider(linearLayoutNewCardWidth, false);
         addNotifWidthSlider(linearLayoutNewCardWidth, true);
         linearLayout.addView(linearLayoutNewCardWidth, cardLp());
+
+        // ── 状态栏通知图标（v3.45.x，移植自 HyperRefine）──
+        // 上限：反射改 NotificationIconContainer.mMaxIcons（默认约 3，可调到 7）。
+        // 圆点：hook StatusBarIconView.onDraw，可选系统默认 / 按隐藏数量 / 完全隐藏。
+        LinearLayout linearLayoutStatusIcon = newCard();
+        addSectionTitle(linearLayoutStatusIcon, "状态栏通知图标",
+                "接管状态栏通知图标的「显示数量」与「溢出圆点」。\n"
+                        + "数量上限可调到 7（系统默认约 3）；圆点可选 系统默认 / 按隐藏数量 / 完全隐藏。\n"
+                        + "改动后建议点右上角「重启系统界面」立即生效。");
+        addSwitch(linearLayoutStatusIcon, "接管状态栏通知图标",
+                Constants.PREFS_STATUS_ICON_LIMIT_ENABLE,
+                Constants.DEFAULT_STATUS_ICON_LIMIT_ENABLE);
+        addStatusIconMaxSlider(linearLayoutStatusIcon);
+        addStatusIconDotSlider(linearLayoutStatusIcon);
+        linearLayout.addView(linearLayoutStatusIcon, cardLp());
 
         LinearLayout linearLayoutRotationHint = newCard();
         addSectionTitle(linearLayoutRotationHint, "旋转提示",
@@ -504,6 +514,116 @@ public class SettingsActivity extends Activity {
     /** 兼容旧调用：默认按竖屏算标签。 */
     private String notifWidthLabel(int pct) {
         return notifWidthLabel(false, pct);
+    }
+
+    /**
+     * 状态栏「最多显示通知图标数」滑杆（1~7）。
+     *
+     * <p>系统原生上限约 3；这里放开到 {@link Constants#MAX_STATUS_ICON_MAX}（7）。
+     * 用 SeekBar 的整数进度承载数量（progress = 数量 − 1）。
+     */
+    private void addStatusIconMaxSlider(LinearLayout linearLayout) {
+        final int min = Constants.MIN_STATUS_ICON_MAX;
+        final int max = Constants.MAX_STATUS_ICON_MAX;
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(1);
+        row.setPadding(0, dp(6), 0, dp(6));
+
+        final TextView label = new TextView(this);
+        label.setTextSize(2, 13.0f);
+        label.setTextColor(Color.parseColor("#222222"));
+        int cur = readIntPref(Constants.PREFS_STATUS_ICON_MAX, Constants.DEFAULT_STATUS_ICON_MAX);
+        if (cur < min) cur = min;
+        if (cur > max) cur = max;
+        label.setText("最多显示通知图标：" + cur + " 个");
+
+        final SeekBar seekBar = new SeekBar(this);
+        seekBar.setMax(max - min);
+        seekBar.setProgress(cur - min);
+        seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar sb, int progress, boolean fromUser) {
+                int v = progress + min;
+                label.setText("最多显示通知图标：" + v + " 个");
+                if (fromUser) {
+                    // 只在用户拖动时写盘，程序设初值不写
+                    writeBothInt(Constants.PREFS_STATUS_ICON_MAX, v);
+                    sendReloadBroadcast();
+                }
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar sb) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar sb) {
+            }
+        });
+
+        row.addView(label, mw());
+        row.addView(seekBar, mw());
+        linearLayout.addView(row, mw());
+    }
+
+    /**
+     * 状态栏「溢出圆点模式」滑杆（0/1/2）。
+     *
+     * <p>0 = 系统默认（原生固定 3 点）；1 = 按隐藏图标数量画 1~3 点；
+     * 2 = 完全不画点（无论超多少图标都不显示小点）。
+     */
+    private void addStatusIconDotSlider(LinearLayout linearLayout) {
+        final int min = 0;
+        final int max = 2;
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(1);
+        row.setPadding(0, dp(6), 0, dp(6));
+
+        final TextView label = new TextView(this);
+        label.setTextSize(2, 13.0f);
+        label.setTextColor(Color.parseColor("#222222"));
+        int cur = readIntPref(Constants.PREFS_STATUS_ICON_DOT_MODE, Constants.DEFAULT_STATUS_ICON_DOT_MODE);
+        if (cur < min) cur = min;
+        if (cur > max) cur = max;
+        label.setText("溢出圆点：" + dotModeLabel(cur));
+
+        final SeekBar seekBar = new SeekBar(this);
+        seekBar.setMax(max - min);
+        seekBar.setProgress(cur - min);
+        seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar sb, int progress, boolean fromUser) {
+                int v = progress + min;
+                label.setText("溢出圆点：" + dotModeLabel(v));
+                if (fromUser) {
+                    writeBothInt(Constants.PREFS_STATUS_ICON_DOT_MODE, v);
+                    sendReloadBroadcast();
+                }
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar sb) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar sb) {
+            }
+        });
+
+        row.addView(label, mw());
+        row.addView(seekBar, mw());
+        linearLayout.addView(row, mw());
+    }
+
+    private static String dotModeLabel(int mode) {
+        switch (mode) {
+            case 1:
+                return "按隐藏数量（1~3 点）";
+            case 2:
+                return "完全隐藏（不显示小点）";
+            default:
+                return "系统默认（固定 3 点）";
+        }
     }
 
     private void addSectionTitle(LinearLayout linearLayout, String str, String str2) {        TextView textView = new TextView(this);

@@ -27,7 +27,6 @@ public final class Constants {
     public static final boolean DEFAULT_KEEP_NOTIF = true;
     public static final boolean DEFAULT_MUTE_SCREEN_ON = true;
     public static final boolean DEFAULT_NO_FOLD_HISTORY = true;
-    public static final boolean DEFAULT_NO_NOTIF_LIMIT = true;
     public static final boolean DEFAULT_PIN_GLASS = true;
     public static final boolean DEFAULT_QS_EDIT_HIDE = true;
     public static final boolean DEFAULT_SINK_ENABLED = false;
@@ -72,11 +71,10 @@ public final class Constants {
     public static final String NOTIF_CHANNEL_CLASS = "android.app.NotificationChannel";
     public static final String NOTIF_DISMISS_VIEW_ID_NAME = "notification_dismiss_view";
     public static final String NOTIF_ENTRY_CLASS = "com.android.systemui.statusbar.notification.collection.NotificationEntry";
-    public static final String NOTIF_LIMIT_ATTACH_METHOD = "attach";
-    public static final String NOTIF_LIMIT_CLASS = "com.android.systemui.statusbar.notification.collection.coordinator.CountLimitCoordinator";
-    public static final String NOTIF_LIMIT_LAMBDA_CLASS = "com.android.systemui.statusbar.notification.collection.coordinator.CountLimitCoordinator$$ExternalSyntheticLambda0";
-    public static final String NOTIF_LIMIT_ONVIEWBOUND_METHOD = "onViewBound$1";
-    public static final String NOTIF_PIPELINE_CLASS = "com.android.systemui.statusbar.notification.collection.NotifPipeline";
+    // ⛔ 已删除：「解除通知条数上限」相关常量（NOTIF_LIMIT_CLASS / NOTIF_LIMIT_LAMBDA_CLASS /
+    //    NOTIF_LIMIT_ONVIEWBOUND_METHOD / NOTIF_PIPELINE_CLASS）。
+    //    该功能通过把 CountLimitCoordinator.attach 拦成 no-op 来解除上限，副作用是
+    //    **同一应用的多条通知不再被系统收纳成一组，而是全部平铺展开**（用户 2026-10-26 明确要求去掉）。
     public static final int PIN_BACKDROP_BLUR_RADIUS = 80;
     public static final int PIN_BACKDROP_COLOR = -1;
     public static final int PIN_BACKDROP_OPACITY = 10;
@@ -101,7 +99,34 @@ public final class Constants {
     /** 通知优先级/重要性（v3.40，移植自 HyperCeiler 的 MoreNotificationSettings / NotificationImportanceHyperOSFix） */
     public static final String NOTIF_SETTINGS_CLASS = "com.android.settings.notification.BaseNotificationSettings";
     public static final String CHANNEL_NOTIF_SETTINGS_CLASS = "com.android.settings.notification.ChannelNotificationSettings";
+    /**
+     * 通道设置页在 HyperOS 4 上有**两个**实现，必须都挂：
+     *
+     * <ul>
+     *   <li>{@code notification.app.ChannelNotificationSettings} ——
+     *       系统通知面板弹出的「快捷面板」（{@code ChannelPanelActivity} 里 new 的就是这个），
+     *       用户日常点「信息」图标到这里；</li>
+     *   <li>{@code notification.ChannelNotificationSettings} ——
+     *       面板里点「更多设置」进入的完整页。</li>
+     * </ul>
+     *
+     * 两者都继承 {@code BaseNotificationSettings}，但 {@code setupChannelDefaultPrefs} /
+     * {@code updateDependents} 各自重写，所以必须分别挂。
+     */
+    public static final String[] CHANNEL_NOTIF_SETTINGS_CLASSES = {
+            "com.android.settings.notification.app.ChannelNotificationSettings",
+            "com.android.settings.notification.ChannelNotificationSettings"
+    };
     public static final String STACK_COORDINATOR_INNER_CLASS = "com.android.systemui.statusbar.notification.collection.coordinator.StackCoordinator$attach$1";
+    /**
+     * HyperOS 4 的 {@code onAfterRenderList} 只是把最终列表交给
+     * {@code RenderNotificationListInteractor.setRenderedList()}（统计/状态流用），
+     * 行视图早就挂到 NotificationStackScrollLayout 上了，在那里过滤阻止不了渲染。
+     * 真正有效的是 {@code applyFilters(NotificationEntry, long, List)} —— 每个 entry 的
+     * "要不要被过滤掉"的判定点，返回 true 就等于被系统自己的 NotifFilter 丢弃。
+     */
+    public static final String SHADE_LIST_BUILDER_CLASS = "com.android.systemui.statusbar.notification.collection.ShadeListBuilder";
+    public static final String SHADE_LIST_BUILDER_FILTER_METHOD = "applyFilters";
     public static final String PREFS = "hyperosglass";
     public static final String PREFS_FOD_MODE_LEGACY = "fod_mode";
     public static final String QS_EDIT_CONTROLLER_CLASS = "miui.systemui.controlcenter.panel.main.qs.EditButtonController";
@@ -361,7 +386,6 @@ public final class Constants {
     public static final String PREFS_PIN_GLASS = "pin_glass";
     public static final String PREFS_NO_FOLD_HISTORY = "no_fold_history";
     public static final String PREFS_SINK_ENABLED = "sink_enabled";
-    public static final String PREFS_NO_NOTIF_LIMIT = "no_notif_limit";
     public static final String PREFS_KEEP_NOTIF = "keep_notif";
     public static final String PREFS_HIDE_BT_UNLOCK = "hide_bt_unlock";
     public static final String PREFS_MUTE_SCREEN_ON = "mute_screen_on";
@@ -372,12 +396,37 @@ public final class Constants {
     public static final String PREFS_QS_EDIT_HIDE = "qs_edit_hide";
     public static final String PREFS_ENABLE_LOG = "enable_log";
     public static final String PREFS_NOTIF_IMPORTANCE = "notif_importance";
+    // ── 状态栏通知图标上限 + 溢出圆点（v3.45.x，移植自 HyperRefine）──
+    /**
+     * 总开关：是否接管状态栏通知图标的「显示数量上限」与「溢出圆点」。
+     * 关闭则完全不干预（系统原生行为）。
+     */
+    public static final String PREFS_STATUS_ICON_LIMIT_ENABLE = "status_icon_limit_enable";
+    /** 状态栏最多显示的通知图标数（1~7，系统原生约 3）。 */
+    public static final String PREFS_STATUS_ICON_MAX = "status_icon_max";
+    /**
+     * 溢出圆点模式（int）：
+     *   0 = 系统默认（原生固定 3 点，不干预）
+     *   1 = 按隐藏图标数量画 1~3 个点（移植自 HyperRefine 的 multiDot）
+     *   2 = 完全不画点（无论超多少图标都不显示小点）
+     */
+    public static final String PREFS_STATUS_ICON_DOT_MODE = "status_icon_dot_mode";
+    /** Model 侧 Bundle 回传用的 key（int 通道，与上面同名便于排查） */
+    public static final String KEY_STATUS_ICON_MAX = PREFS_STATUS_ICON_MAX;
+    public static final String KEY_STATUS_ICON_DOT_MODE = PREFS_STATUS_ICON_DOT_MODE;
+
+    public static final boolean DEFAULT_STATUS_ICON_LIMIT_ENABLE = true;
+    public static final int DEFAULT_STATUS_ICON_MAX = 3;
+    public static final int DEFAULT_STATUS_ICON_DOT_MODE = 0; // 系统默认
+    public static final int MIN_STATUS_ICON_MAX = 1;
+    public static final int MAX_STATUS_ICON_MAX = 7;
+
     // ⚠️ 这两个数组必须**同序同长**：reloadPrefs 与 StatusProvider 都按下标一一对应取值。
     //    新增开关只能往**末尾追加**，不可插队（v3.41.2 追加了通知宽度总开关）。
-    public static final String[] ALL_PREF_KEYS = {PREFS_GLASS_ENABLED, PREFS_FOCUS_GLASS, PREFS_AOD_BATTERY_SYNC, PREFS_PIN_GLASS, PREFS_NO_FOLD_HISTORY, PREFS_SINK_ENABLED, PREFS_NO_NOTIF_LIMIT, PREFS_KEEP_NOTIF, PREFS_HIDE_BT_UNLOCK, PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_ALLOW_MANAGE_ALL, PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE, PREFS_ENABLE_LOG, PREFS_NOTIF_IMPORTANCE, PREFS_NOTIF_WIDTH_ENABLE, PREFS_ROTATION_HINT, PREFS_INNER_FOLLOW_ROTATION};
+    public static final String[] ALL_PREF_KEYS = {PREFS_GLASS_ENABLED, PREFS_FOCUS_GLASS, PREFS_AOD_BATTERY_SYNC, PREFS_PIN_GLASS, PREFS_NO_FOLD_HISTORY, PREFS_SINK_ENABLED, PREFS_KEEP_NOTIF, PREFS_HIDE_BT_UNLOCK, PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_ALLOW_MANAGE_ALL, PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE, PREFS_ENABLE_LOG, PREFS_NOTIF_IMPORTANCE, PREFS_NOTIF_WIDTH_ENABLE, PREFS_ROTATION_HINT, PREFS_INNER_FOLLOW_ROTATION, PREFS_STATUS_ICON_LIMIT_ENABLE};
     // ★ 2026-10-24：默认值按「当前在用的那台设备」的实际配置对齐（v3.283.0）。
     //   对齐项：notif_width_enable=true、rotation_hint_enable=true、inner_follow_rotation=true；
     //   同时修掉这里多出来的第 21 个元素——数组曾比 ALL_PREF_KEYS 长 1，
     //   虽然按下标取值不受影响，但违反了上面「同序同长」的约束，容易埋坑。
-    public static final boolean[] ALL_PREF_DEFAULTS = {true, true, true, true, true, false, true, true, true, true, true, true, false, true, true, false, true, true, true, true};
+    public static final boolean[] ALL_PREF_DEFAULTS = {true, true, true, true, true, false, true, true, true, true, true, false, true, true, false, true, true, true, true, true};
 }

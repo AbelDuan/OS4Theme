@@ -45,8 +45,20 @@ public class MainHook extends XposedModule {
     private volatile boolean sNotifImportance = true;
     private static final String[] NOTIF_VISIBLE_PREF_KEYS = {"importance", "badge", "allow_keyguard"};
     private static Method sEntryRepresentative;
-    private static Method sEntryRanking;
+    /**
+     * HyperOS 4（Android 17）的 NotificationEntry **没有 getRanking() 方法**（dex 实测：
+     * 只有 {@code mRanking} 字段 + {@code setRanking()}），老代码用
+     * {@code entryClass.getMethod("getRanking")} 直接抛 NoSuchMethodException，
+     * 连带把 getRepresentativeEntry / getImportance 的解析一起废掉 → 过滤器永远透传。
+     * 改成直接读 public 字段 {@code mRanking}（类型是 framework 的
+     * {@code NotificationListenerService$Ranking}，其 getImportance() 是公开 API）。
+     */
+    private static java.lang.reflect.Field sEntryRankingField;
+    /** 老版本 AOSP 的 getRanking()，作为字段读取失败时的兜底 */
+    private static Method sEntryRankingMethod;
     private static Method sRankingImportance;
+    /** 上一次打印渲染过滤日志时的「剔除指纹」，用来避免每帧刷屏 */
+    private static volatile String sLastFilterLog = "";
     private volatile SharedPreferences sPrefs;
     private static final Set<String> sinkHooked = new HashSet();
     private static final Set<Class<?>> qsEditHooked = Collections.newSetFromMap(new WeakHashMap());
@@ -64,7 +76,6 @@ public class MainHook extends XposedModule {
     private static final AtomicBoolean sPinGlassFlag = new AtomicBoolean(true);
     private static final AtomicBoolean sQsEditHideFlag = new AtomicBoolean(true);
     private static final AtomicBoolean sNoFoldHistoryFlag = new AtomicBoolean(true);
-    private static final AtomicBoolean sNoNotifLimitFlag = new AtomicBoolean(true);
     private static final AtomicBoolean sKeepNotifFlag = new AtomicBoolean(true);
     private static final AtomicBoolean sHideBtUnlockFlag = new AtomicBoolean(true);
     private static final AtomicBoolean sMuteScreenOnFlag = new AtomicBoolean(true);
@@ -100,6 +111,17 @@ public class MainHook extends XposedModule {
             new android.os.Handler(android.os.Looper.getMainLooper());
     /** 屏幕开关 / 屏幕变化监听是否已装（惰性注册，幂等）。 */
     private static volatile boolean sScreenWatchersInstalled = false;
+    /**
+     * 状态栏通知图标「数量上限 + 溢出圆点」控制（v3.45.x，移植自 HyperRefine）。
+     * 三个值热路径只读这些原子量，避免每次都跨进程读 SharedPreferences。
+     */
+    public static final AtomicBoolean sStatusIconLimitEnable = new AtomicBoolean(false);
+    /** 状态栏最多显示的通知图标数（1~7）。 */
+    public static final java.util.concurrent.atomic.AtomicInteger sStatusIconMax =
+            new java.util.concurrent.atomic.AtomicInteger(Constants.DEFAULT_STATUS_ICON_MAX);
+    /** 溢出圆点模式：0=系统默认 1=按隐藏数量 2=完全隐藏。 */
+    public static final java.util.concurrent.atomic.AtomicInteger sStatusIconDotMode =
+            new java.util.concurrent.atomic.AtomicInteger(Constants.DEFAULT_STATUS_ICON_DOT_MODE);
     /** 启动兜底重试是否已排队。 */
     private static volatile boolean sBootstrapPosted = false;
     /** 启动兜底重试次数。 */
@@ -195,6 +217,7 @@ public class MainHook extends XposedModule {
                 //   把写死的 452dp 换成按屏宽比例（适配 内屏/外屏 × 横屏/竖屏）
                 installNotifWidthHooks(defaultClassLoader);
                 LogUtil.logAlways("[诊断] 通知宽度/旋转提示 hooks 安装返回");
+                installStatusIconLimitHooks(defaultClassLoader);
                 installThirdPartyThemeGlassHooks(defaultClassLoader);
             } else if (Constants.SETTINGS_PKG.equals(packageName)) {
                 // 设置：放开被 MIUI 隐藏的「重要性」，并让改动写回通知通道
@@ -421,7 +444,6 @@ public class MainHook extends XposedModule {
     }
 
     private void installNotifEnhanceHooks(ClassLoader classLoader) {
-        installNoNotifLimitHook(classLoader);
         installKeepNotifHook(classLoader);
         installHideBtUnlockHook(classLoader);
         installMuteScreenOnHook(classLoader);
@@ -459,6 +481,16 @@ public class MainHook extends XposedModule {
         }
     }
 
+    /** 状态栏通知图标「数量上限 + 溢出圆点」控制（v3.45.x，移植自 HyperRefine）。 */
+    private void installStatusIconLimitHooks(ClassLoader classLoader) {
+        try {
+            StatusIconLimit.install(this, classLoader);
+            LogUtil.logAlways("[诊断] 状态栏通知图标 hooks 安装返回");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[状态栏图标] 挂载失败: " + th);
+        }
+    }
+
     private static Field findField(Class<?> cls, String str) {
         while (cls != null) {
             try {
@@ -487,46 +519,16 @@ public class MainHook extends XposedModule {
         }
     }
 
-    private void installNoNotifLimitHook(ClassLoader classLoader) {
-        try {
-            Method declaredMethod = Class.forName(Constants.NOTIF_LIMIT_CLASS, false, classLoader).getDeclaredMethod("attach", Class.forName(Constants.NOTIF_PIPELINE_CLASS, false, classLoader));
-            declaredMethod.setAccessible(true);
-            hook(declaredMethod).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("no-notif-limit").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda4
-                public final Object intercept(XposedInterface.Chain chain) throws Throwable {
-                    return MainHook.lambda$installNoNotifLimitHook$2(chain);
-                }
-            });
-            LogUtil.logAlways("[解除通知限制] 已挂钩 com.android.systemui.statusbar.notification.collection.coordinator.CountLimitCoordinator.attach");
-        } catch (Throwable th) {
-            LogUtil.logAlways("[解除通知限制] 挂载失败: " + th);
-        }
-        try {
-            Method declaredMethod2 = Class.forName(Constants.NOTIF_LIMIT_LAMBDA_CLASS, false, classLoader).getDeclaredMethod(Constants.NOTIF_LIMIT_ONVIEWBOUND_METHOD, Class.forName(Constants.NOTIF_ENTRY_CLASS, false, classLoader));
-            declaredMethod2.setAccessible(true);
-            hook(declaredMethod2).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("no-notif-limit-lambda").intercept(new XposedInterface.Hooker() { // from class: com.abel.hyperosglass.MainHook$$ExternalSyntheticLambda5
-                public final Object intercept(XposedInterface.Chain chain) throws Throwable {
-                    return MainHook.lambda$installNoNotifLimitHook$3(chain);
-                }
-            });
-            LogUtil.logAlways("[解除通知限制] 已挂钩提示条 lambda");
-        } catch (Throwable th2) {
-            LogUtil.logAlways("[解除通知限制] 提示条 lambda 未命中（ROM 差异，可忽略）: " + th2);
-        }
-    }
-
-    static /* synthetic */ Object lambda$installNoNotifLimitHook$2(XposedInterface.Chain chain) throws Throwable {
-        if (sNoNotifLimitFlag.get()) {
-            return null;
-        }
-        return chain.proceed();
-    }
-
-    static /* synthetic */ Object lambda$installNoNotifLimitHook$3(XposedInterface.Chain chain) throws Throwable {
-        if (sNoNotifLimitFlag.get()) {
-            return null;
-        }
-        return chain.proceed();
-    }
+    // ⛔ 2026-10-26 整块删除：「解除通知条数上限」（installNoNotifLimitHook）。
+    //
+    // 原实现是把 com.android.systemui.statusbar.notification.collection.coordinator
+    // .CountLimitCoordinator.attach(...) 拦成 no-op，让「每个应用最多 N 条」的裁剪彻底不发生。
+    // 但 CountLimitCoordinator 同时负责**把超量的同应用通知收纳成一组**，
+    // 拦掉它之后表现为「同一个应用的通知不再收纳，全部平铺展开」——
+    // 用户明确要求恢复系统原生收纳行为，因此这个功能与其副作用一起移除。
+    //
+    // 相关常量（NOTIF_LIMIT_CLASS / NOTIF_LIMIT_LAMBDA_CLASS / NOTIF_LIMIT_ONVIEWBOUND_METHOD /
+    // NOTIF_PIPELINE_CLASS）、开关 sNoNotifLimitFlag、设置项「解除通知条数上限」均已删除。
 
     private void installKeepNotifHook(ClassLoader classLoader) {
         try {
@@ -2182,6 +2184,12 @@ public class MainHook extends XposedModule {
                         Constants.DEFAULT_NOTIF_WIDTH_RATIO_LAND);
             }
             applyRealPrefs(bundle);
+            // 状态栏通知图标：设置变化时对活着的容器重放（尽量不重启 SystemUI 也能生效）
+            try {
+                StatusIconLimit.onPrefsChanged();
+            } catch (Throwable unused) {
+                // 容器尚未创建时为空遍历，不影响
+            }
         } catch (Throwable th) {
             LogUtil.logAlways("读取设置失败: " + th);
         }
@@ -2268,7 +2276,6 @@ public class MainHook extends XposedModule {
             boolean z7 = bundle.getBoolean(Constants.PREFS_PIN_GLASS, true);
             boolean z8 = bundle.getBoolean(Constants.PREFS_QS_EDIT_HIDE, true);
             boolean z9 = bundle.getBoolean(Constants.PREFS_NO_FOLD_HISTORY, true);
-            boolean z10 = bundle.getBoolean(Constants.PREFS_NO_NOTIF_LIMIT, true);
             boolean z11 = bundle.getBoolean(Constants.PREFS_KEEP_NOTIF, true);
             boolean z12 = bundle.getBoolean(Constants.PREFS_HIDE_BT_UNLOCK, true);
             boolean z13 = bundle.getBoolean(Constants.PREFS_MUTE_SCREEN_ON, true);
@@ -2298,6 +2305,26 @@ public class MainHook extends XposedModule {
                     Constants.DEFAULT_ROTATION_HINT));
             sInnerFollowRotation.set(bundle.getBoolean(Constants.PREFS_INNER_FOLLOW_ROTATION,
                     Constants.DEFAULT_INNER_FOLLOW_ROTATION));
+            // 状态栏通知图标上限 + 溢出圆点（v3.45.x）：开关走 boolean 体系，
+            // 数量与模式是连续值，走单独 int 通道
+            sStatusIconLimitEnable.set(bundle.getBoolean(Constants.PREFS_STATUS_ICON_LIMIT_ENABLE,
+                    Constants.DEFAULT_STATUS_ICON_LIMIT_ENABLE));
+            int iconMax = bundle.getInt(Constants.KEY_STATUS_ICON_MAX, Constants.DEFAULT_STATUS_ICON_MAX);
+            if (iconMax < Constants.MIN_STATUS_ICON_MAX) {
+                iconMax = Constants.MIN_STATUS_ICON_MAX;
+            }
+            if (iconMax > Constants.MAX_STATUS_ICON_MAX) {
+                iconMax = Constants.MAX_STATUS_ICON_MAX;
+            }
+            sStatusIconMax.set(iconMax);
+            int dotMode = bundle.getInt(Constants.KEY_STATUS_ICON_DOT_MODE, Constants.DEFAULT_STATUS_ICON_DOT_MODE);
+            if (dotMode < 0) {
+                dotMode = 0;
+            }
+            if (dotMode > 2) {
+                dotMode = 2;
+            }
+            sStatusIconDotMode.set(dotMode);
             // 开关变化后立即尝试应用（内部会自己判断前置条件）
             try {
                 applyInnerFixedLandscape();
@@ -2323,14 +2350,13 @@ public class MainHook extends XposedModule {
             sPinGlassFlag.set(z7);
             sQsEditHideFlag.set(z8);
             sNoFoldHistoryFlag.set(z9);
-            sNoNotifLimitFlag.set(z10);
             sKeepNotifFlag.set(z11);
             sHideBtUnlockFlag.set(z12);
             sMuteScreenOnFlag.set(z13);
             sCancelVibrateScreenOnFlag.set(z14);
             sAllowManageAllFlag.set(z15);
             LogUtil.setEnabled(z16);
-            LogUtil.logAlways("设置(真实值同步)：sink=" + z + "，glass=" + z2 + "，hideLockFod=" + z3 + "，hideDismiss=" + z4 + "，focusGlass=" + z5 + "，aodBattery=" + z6 + "，qsEditHide=" + z8 + "，noFoldHistory=" + z9 + "，noNotifLimit=" + z10 + "，keepNotif=" + z11 + "，hideBtUnlock=" + z12 + "，muteScreenOn=" + z13 + "，allowManageAll=" + z15 + "，日志=" + z16 + "，内屏联动=" + sInnerFollowRotation.get() + "，旋转提示=" + sRotationHintEnable.get() + "，通知宽度=" + widthOn);
+            LogUtil.logAlways("设置(真实值同步)：sink=" + z + "，glass=" + z2 + "，hideLockFod=" + z3 + "，hideDismiss=" + z4 + "，focusGlass=" + z5 + "，aodBattery=" + z6 + "，qsEditHide=" + z8 + "，noFoldHistory=" + z9 + "，keepNotif=" + z11 + "，hideBtUnlock=" + z12 + "，muteScreenOn=" + z13 + "，allowManageAll=" + z15 + "，日志=" + z16 + "，内屏联动=" + sInnerFollowRotation.get() + "，旋转提示=" + sRotationHintEnable.get() + "，通知宽度=" + widthOn);
         } catch (Throwable th) {
             LogUtil.logAlways("设置(真实值同步) 应用失败: " + th);
         }
@@ -2858,15 +2884,48 @@ public class MainHook extends XposedModule {
     }
 
     /**
-     * 通知优先级 / 重要性（一）：设置侧。
-     * 移植自 HyperCeiler 的 MoreNotificationSettings：MIUI 把通知设置里的「重要性 / 角标 / 锁屏显示」
-     * 藏了起来，这里让它们重新可见，并接管通道设置页的重要性下拉：把用户选的值写回
-     * NotificationChannel（setImportance + lockFields(4) + NotificationBackend.updateChannel）。
+     * 通知优先级 / 重要性（一）：设置侧（HyperOS 4 重写，2026-10-26）。
+     *
+     * <p>参考 HyperCeiler 的 MoreNotificationSettings（rules/systemsettings）移植。但 HyperOS 4
+     * 把「重要性」这一行的**全部逻辑都抽掉了**，只在
+     * res/xml/miui_channel_notification_settings.xml 里留了一个
+     * {@code miuix.preference.DropDownPreference key="importance"} 的空壳。实测 Settings.apk 的 dex：
+     *
+     * <ul>
+     *   <li>{@code BaseNotificationSettings.mImportance} 字段**在整个 dex 里从未被赋值**
+     *       （只有 2 处 iget，都在 updateDependents 里对 null 做 setEnabled），
+     *       所以永远没人给它设初值、也没人监听它的变化；</li>
+     *   <li>{@code ChannelNotificationSettings.setupChannelDefaultPrefs()} 完全不碰 importance；</li>
+     *   <li>{@code ChannelNotificationSettings.removeDefaultPrefs()} 里有一句
+     *       {@code setPrefVisible(findPreference("importance"), false)} 把它**无条件隐藏**；</li>
+     *   <li>{@code BaseNotificationSettings.isIncludedInFilter("importance")} 默认 false，
+     *       还会连带把 block_category 移除、把 allow_float 隐藏。</li>
+     * </ul>
+     *
+     * <p>所以只挂 setupChannelDefaultPrefs 是死代码（旧实现的处境）。这里自己把链路补齐：
+     * ① 强制可见；② 用 {@code mChannel.getImportance()} 回填当前值；
+     * ③ 自挂 OnPreferenceChangeListener；④ 写完走 {@code MiuiNotificationBackend.updateChannel} 落盘。
      */
+
+    /** 已挂过 OnPreferenceChangeListener 的 Preference（弱引用，别把 fragment 拖住） */
+    private static final Set<Object> sImportanceBound =
+            Collections.newSetFromMap(new WeakHashMap<Object, Boolean>());
+    /** 防止 updateDependents → 我们 → updateDependents 的自我递归 */
+    private static final ThreadLocal<Boolean> sSyncingImportance = new ThreadLocal<Boolean>();
+    /** pref -> 所属 settings 实例：persistString 拿不到 owner，只能靠同步时记下来 */
+    private static final Map<Object, Object> sPrefOwner =
+            Collections.synchronizedMap(new WeakHashMap<Object, Object>());
+    /** 防止 persistString → 写回 → 刷新 → 再 persistString 的循环 */
+    private static final ThreadLocal<Boolean> sApplyingImportance = new ThreadLocal<Boolean>();
+    /** 上一次落盘是否失败（失败时允许同值重试） */
+    private static volatile boolean sLastImportanceApplyFailed = false;
+
     private void installNotificationImportanceSettingsHooks(ClassLoader classLoader) {
         if (classLoader == null) {
             return;
         }
+        String shortName;
+        // ① 放开被 MIUI 无条件隐藏的设置项（重要性 / 角标 / 锁屏显示）
         try {
             Class<?> base = Class.forName(Constants.NOTIF_SETTINGS_CLASS, false, classLoader);
             for (Method method : base.getDeclaredMethods()) {
@@ -2903,99 +2962,460 @@ public class MainHook extends XposedModule {
                 break;
             }
         } catch (Throwable th) {
-            LogUtil.log("[通知重要性] 设置项可见性挂钩失败: " + th);
+            LogUtil.logAlways("[通知重要性] 设置项可见性挂钩失败: " + th);
         }
+
+        // ② isIncludedInFilter("importance") 恒真：
+        //    否则 removeDefaultPrefs 会顺手删掉 block_category、并把 allow_float 一起藏掉。
         try {
-            Class<?> channelSettings = Class.forName(Constants.CHANNEL_NOTIF_SETTINGS_CLASS, false, classLoader);
-            Method setup = channelSettings.getDeclaredMethod("setupChannelDefaultPrefs");
-            setup.setAccessible(true);
-            hook(setup).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("notif-channel-defaults")
+            Class<?> base = Class.forName(Constants.NOTIF_SETTINGS_CLASS, false, classLoader);
+            Method included = base.getDeclaredMethod("isIncludedInFilter", String.class);
+            included.setAccessible(true);
+            hook(included).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("notif-importance-included")
                     .intercept(new XposedInterface.Hooker() {
                         public Object intercept(XposedInterface.Chain chain) throws Throwable {
                             Object result = chain.proceed();
-                            if (sNotifImportance) {
-                                try {
-                                    attachImportanceListener(chain.getThisObject());
-                                } catch (Throwable unused) {
+                            if (sNotifImportance && Boolean.FALSE.equals(result)
+                                    && "importance".equals(chain.getArg(0))) {
+                                return Boolean.TRUE;
+                            }
+                            return result;
+                        }
+                    });
+            LogUtil.logAlways("[通知重要性] 已挂钩 isIncludedInFilter（importance 视为已包含）");
+        } catch (Throwable th) {
+            LogUtil.log("[通知重要性] isIncludedInFilter 挂钩失败: " + th);
+        }
+
+        // ②b 诊断：确认「用户点下拉 → callChangeListener」这条链有没有真的走到。
+        //     没日志 = 选择根本没进 callChangeListener（说明得换触发点）；有日志但后面没写回 = 监听没挂上。
+        try {
+            Class<?> prefBase = Class.forName("androidx.preference.Preference", false, classLoader);
+            Method ccl = prefBase.getDeclaredMethod("callChangeListener", Object.class);
+            ccl.setAccessible(true);
+            hook(ccl).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("notif-importance-ccl")
+                    .intercept(new XposedInterface.Hooker() {
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            Object self = chain.getThisObject();
+                            String key = asString(invokeSafe(self, "getKey"));
+                            Object result = chain.proceed();
+                            if ("importance".equals(key)) {
+                                LogUtil.logAlways("[通知重要性] callChangeListener 命中：new="
+                                        + chain.getArg(0) + " 放行=" + result);
+                            }
+                            return result;
+                        }
+                    });
+            LogUtil.logAlways("[通知重要性] 已挂钩 Preference.callChangeListener（诊断）");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[通知重要性] callChangeListener 诊断挂钩失败: " + th);
+        }
+
+        // ②c 真正的触发点：MIUI 下拉项点击后是直接 setValue → persistString，
+        //     不经过 callChangeListener，所以 OnPreferenceChangeListener 永远不触发。
+        //     钩 persistString 才是唯一可靠的「用户改了值」信号。
+        try {
+            Class<?> prefBase2 = Class.forName("androidx.preference.Preference", false, classLoader);
+            Method persist = prefBase2.getDeclaredMethod("persistString", String.class);
+            persist.setAccessible(true);
+            hook(persist).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("notif-importance-persist")
+                    .intercept(new XposedInterface.Hooker() {
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            Object self = chain.getThisObject();
+                            Object result = chain.proceed();
+                            if (sNotifImportance && "importance".equals(asString(invokeSafe(self, "getKey")))) {
+                                Object owner;
+                                synchronized (sPrefOwner) {
+                                    owner = sPrefOwner.get(self);
+                                }
+                                Object newValue = chain.getArg(0);
+                                LogUtil.logAlways("[通知重要性] persistString 命中 value=" + newValue
+                                        + " owner=" + (owner == null ? "null" : owner.getClass().getSimpleName()));
+                                if (owner != null) {
+                                    applyImportanceChange(owner, newValue);
                                 }
                             }
                             return result;
                         }
                     });
-            LogUtil.logAlways("[通知重要性] 已挂钩 ChannelNotificationSettings.setupChannelDefaultPrefs");
+            LogUtil.logAlways("[通知重要性] 已挂钩 Preference.persistString（真实触发点）");
         } catch (Throwable th) {
-            LogUtil.log("[通知重要性] 通道设置页挂钩失败: " + th);
+            LogUtil.logAlways("[通知重要性] persistString 挂钩失败: " + th);
         }
-    }
 
-    private void attachImportanceListener(final Object settings) throws Exception {
-        Object pref = invoke(settings, "findPreference", new Class[]{CharSequence.class}, new Object[]{"importance"});
-        if (pref == null) {
-            return;
-        }
-        setField(settings, "mImportance", pref);
-        Object backup = getField(settings, "mBackupImportance");
-        if (backup instanceof Integer && ((Integer) backup).intValue() > 0) {
-            Object index = invoke(pref, "findSpinnerIndexOfValue", new Class[]{String.class},
-                    new Object[]{String.valueOf(((Integer) backup).intValue())});
-            if (index instanceof Integer && ((Integer) index).intValue() > -1) {
-                invoke(pref, "setValueIndex", new Class[]{int.class}, new Object[]{index});
+        // ③ 补齐「值 + 监听」：两个 ChannelNotificationSettings 实现的 setup/updateDependents，
+        //    再加基类 BaseNotificationSettings.onResume —— 覆盖「快捷面板」和「完整页」两条路径。
+        for (String className : Constants.CHANNEL_NOTIF_SETTINGS_CLASSES) {
+            Class<?> type = loadClassQuietly(className, classLoader);
+            if (type == null) {
+                LogUtil.log("[通知重要性] 类不存在，跳过: " + className);
+                continue;
             }
+            shortName = type.getSimpleName();
+            hookFragmentLifecycle(type, "notif-importance-setup-" + shortName, "setupChannelDefaultPrefs");
+            hookFragmentLifecycle(type, "notif-importance-dependents-" + shortName, "updateDependents", 1);
+            hookFragmentLifecycle(type, "notif-importance-dependents0-" + shortName, "updateDependents", 0);
+            LogUtil.logAlways("[通知重要性] 已接入 " + className);
         }
-        Class<?> listenerType = Class.forName("androidx.preference.Preference$OnPreferenceChangeListener",
-                false, settings.getClass().getClassLoader());
-        Object listener = Proxy.newProxyInstance(settings.getClass().getClassLoader(), new Class[]{listenerType},
-                new java.lang.reflect.InvocationHandler() {
-                    public Object invoke(Object proxy, Method method, Object[] args) {
-                        String name = method.getName();
-                        if ("onPreferenceChange".equals(name)) {
-                            try {
-                                applyImportanceChange(settings, args);
-                            } catch (Throwable unused) {
-                            }
-                            return Boolean.TRUE;
-                        }
-                        if ("equals".equals(name)) {
-                            return proxy == args[0];
-                        }
-                        if ("hashCode".equals(name)) {
-                            return Integer.valueOf(System.identityHashCode(proxy));
-                        }
-                        return null;
-                    }
-                });
-        invoke(pref, "setOnPreferenceChangeListener", new Class[]{listenerType}, new Object[]{listener});
+        // 基类的 onResume：两个子类都会走到（子类调 super.onResume）
+        hookFragmentLifecycle(loadClassQuietly(Constants.NOTIF_SETTINGS_CLASS, classLoader),
+                "notif-importance-resume", "onResume");
     }
 
-    private void applyImportanceChange(Object settings, Object[] args) throws Exception {
-        if (args == null || args.length < 2 || !(args[1] instanceof String)) {
+    private static Class<?> loadClassQuietly(String name, ClassLoader cl) {
+        try {
+            return Class.forName(name, false, cl);
+        } catch (Throwable unused) {
+            return null;
+        }
+    }
+
+    /** 在 onResume / updateDependents 之后补一次 importance 同步（存在即挂，缺了不影响主流程） */
+    private void hookFragmentLifecycle(Class<?> type, String hookId, String methodName) {
+        hookFragmentLifecycle(type, hookId, methodName, 0);
+    }
+
+    /** paramCount=0 时挂无参版本；=1 时挂 updateDependents(boolean) 这类版本。 */
+    private void hookFragmentLifecycle(Class<?> type, String hookId, String methodName, int paramCount) {
+        if (type == null) {
             return;
         }
-        int importance = Integer.parseInt((String) args[1]);
-        setField(settings, "mBackupImportance", Integer.valueOf(importance));
+        try {
+            Method method = null;
+            for (Method each : type.getDeclaredMethods()) {
+                if (methodName.equals(each.getName()) && each.getParameterCount() == paramCount) {
+                    method = each;
+                    break;
+                }
+            }
+            if (method == null) {
+                LogUtil.log("[通知重要性] 未找到 " + methodName + "，跳过");
+                return;
+            }
+            method.setAccessible(true);
+            hook(method).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId(hookId)
+                    .intercept(new XposedInterface.Hooker() {
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            Object result = chain.proceed();
+                            if (sNotifImportance) {
+                                syncImportancePref(chain.getThisObject());
+                            }
+                            return result;
+                        }
+                    });
+            LogUtil.logAlways("[通知重要性] 已挂钩 ChannelNotificationSettings." + methodName);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[通知重要性] " + methodName + " 挂钩失败: " + th);
+        }
+    }
+
+    /**
+     * 保证 importance 这一行「可见 + 显示当前值 + 有点击写回」。
+     *
+     * <p>MIUI 把这个 Preference 从 mImportance 字段上彻底解绑了，所以只能按 key 现找。
+     */
+    private static void syncImportancePref(Object settings) {
+        if (settings == null || Boolean.TRUE.equals(sSyncingImportance.get())) {
+            return;
+        }
+        sSyncingImportance.set(Boolean.TRUE);
+        try {
+            if (LogUtil.hitOnce("imp-sync-called")) {
+                LogUtil.logAlways("[通知重要性] sync 触发，settings=" + settings.getClass().getName());
+            }
+            Object pref = invoke(settings, "findPreference", new Class[]{CharSequence.class}, new Object[]{"importance"});
+            if (pref == null) {
+                if (LogUtil.hitOnce("imp-sync-null")) {
+                    LogUtil.logAlways("[通知重要性] findPreference(importance) 返回 null（这一页没有该控件）");
+                }
+                return;
+            }
+            if (LogUtil.hitOnce("imp-sync-found")) {
+                LogUtil.logAlways("[通知重要性] findPreference(importance) 命中: " + pref.getClass().getName());
+            }
+            invoke(pref, "setVisible", new Class[]{boolean.class}, new Object[]{Boolean.TRUE});
+            Object channel = getField(settings, "mChannel");
+            if (channel != null) {
+                Object importance = invoke(channel, "getImportance", new Class[0], new Object[0]);
+                if (LogUtil.hitOnce("imp-sync-value")) {
+                    LogUtil.logAlways("[通知重要性] 通道当前 importance=" + importance);
+                }
+                if (importance instanceof Integer && ((Integer) importance).intValue() >= 1) {
+                    String want = String.valueOf(importance);
+                    invoke(pref, "setValue", new Class[]{String.class}, new Object[]{want});
+                    // MIUI 的 setValue -> notifyChanged 不会重新选中 spinner，行上显示的一直是第一项。
+                    // 必须手动把选中位置对齐：否则「显示值 == 用户要选的值」时，点击会被
+                    // DropDownPreference$1$1.run 里的 equals 短路掉，表现就是「怎么调都没反应」。
+                    Object spinner = getField(pref, "mSpinner");
+                    if (spinner != null) {
+                        int idx = asInt(invokeSafe(pref, "getValueIndex"), -1);
+                        if (idx >= 0) {
+                            invoke(spinner, "setSelection", new Class[]{int.class}, new Object[]{idx});
+                            LogUtil.logAlways("[通知重要性] 显示已对齐：真实值=" + want + " 选中项=" + idx);
+                        }
+                    }
+                }
+            }
+            sPrefOwner.put(pref, settings);
+            if (sImportanceBound.add(pref)) {
+                bindImportanceListener(settings, pref);
+                LogUtil.logAlways("[通知重要性] importance 下拉已接管（可见 + 回填 + 写回监听）");
+            }
+        } catch (Throwable th) {
+            LogUtil.logAlways("[通知重要性] 同步 importance 失败: " + th);
+        } finally {
+            sSyncingImportance.remove();
+        }
+    }
+
+    private static void bindImportanceListener(final Object settings, Object pref) {
+        try {
+            ClassLoader cl = pref.getClass().getClassLoader();
+            Class<?> listenerType = Class.forName("androidx.preference.Preference$OnPreferenceChangeListener", false, cl);
+            Object listener = Proxy.newProxyInstance(cl, new Class[]{listenerType},
+                    new java.lang.reflect.InvocationHandler() {
+                        public Object invoke(Object proxy, Method method, Object[] args) {
+                            String name = method.getName();
+                            if ("onPreferenceChange".equals(name)) {
+                                try {
+                                    applyImportanceChange(settings, args == null || args.length < 2 ? null : args[1]);
+                                } catch (Throwable unused) {
+                                }
+                                // 吞掉默认处理：值的落盘由我们自己完成
+                                return Boolean.TRUE;
+                            }
+                            if ("equals".equals(name)) {
+                                return proxy == args[0];
+                            }
+                            if ("hashCode".equals(name)) {
+                                return Integer.valueOf(System.identityHashCode(proxy));
+                            }
+                            return null;
+                        }
+                    });
+            invoke(pref, "setOnPreferenceChangeListener", new Class[]{listenerType}, new Object[]{listener});
+        } catch (Throwable th) {
+            LogUtil.logAlways("[通知重要性] 挂监听失败: " + th);
+        }
+    }
+
+    /**
+     * 把用户选的重要性写回 NotificationChannel，并落盘到 NotificationManagerService。
+     *
+     * <p>MIUI 的 {@code ChannelNotificationSettings$N.onPreferenceChange} 走的正是
+     * {@code mChannel.setImportance()} → {@code lockFields(4)} → {@code mBackend.updateChannel(pkg, uid, channel)}，
+     * 这里照抄同一条路径，并额外加：字段别名兜底、compat 直连兜底、写完读回校验。
+     */
+    private static void applyImportanceChange(Object settings, Object value) {
+        if (settings == null || value == null) {
+            LogUtil.logAlways("[通知重要性] 写回被跳过（settings 或 value 为空）");
+            return;
+        }
+        int importance;
+        try {
+            importance = Integer.parseInt(String.valueOf(value));
+        } catch (Throwable unused) {
+            LogUtil.logAlways("[通知重要性] 值不是数字，放弃: " + value);
+            return;
+        }
+        if (Boolean.TRUE.equals(sApplyingImportance.get())) {
+            return;
+        }
         Object channel = getField(settings, "mChannel");
         if (channel == null) {
+            LogUtil.logAlways("[通知重要性] mChannel 为空，放弃写回");
             return;
         }
-        // NotificationChannel.setImportance + lockFields(USER_LOCKED_IMPORTANCE=4)
-        channel.getClass().getMethod("setImportance", int.class).invoke(channel, Integer.valueOf(importance));
+        int prev = asInt(invokeSafe(channel, "getImportance"), -1);
+        // 同值直接跳过：这是防「sync 回填 setValue → persistString → 又写回」死循环的关键。
+        // 但如果上次落盘失败过，就允许同值重试，避免「第一次没成功就永远改不动」。
+        if (prev == importance && !sLastImportanceApplyFailed) {
+            LogUtil.logAlways("[通知重要性] 值未变化(" + importance + ")，跳过落盘");
+            return;
+        }
+        sApplyingImportance.set(Boolean.TRUE);
+        try {
+        setField(settings, "mBackupImportance", Integer.valueOf(importance));
+
+        // ① 先改本地 channel 对象（后面 updateChannel 传的就是它）
+        boolean setOk;
+        try {
+            Method setImportance = channel.getClass().getMethod("setImportance", int.class);
+            setImportance.invoke(channel, Integer.valueOf(importance));
+            setOk = true;
+        } catch (Throwable th) {
+            LogUtil.logAlways("[通知重要性] setImportance 失败: " + th);
+            return;
+        }
+        // USER_LOCKED_IMPORTANCE = 4：标记成「用户显式设过」，否则应用下次建通道会被默认值覆盖
         try {
             Method lock = channel.getClass().getDeclaredMethod("lockFields", int.class);
             lock.setAccessible(true);
             lock.invoke(channel, Integer.valueOf(4));
         } catch (Throwable unused) {
         }
+
         Object backend = getField(settings, "mBackend");
-        Object pkg = getField(settings, "mPkg");
-        Object uid = getField(settings, "mUid");
-        if (backend != null && pkg instanceof String) {
-            Method update = findMethod(backend.getClass(), "updateChannel", 3);
-            if (update != null) {
-                update.invoke(backend, pkg, Integer.valueOf(uid instanceof Integer ? ((Integer) uid).intValue() : 0), channel);
+        String pkg = firstNonEmpty(asString(getField(settings, "mPkg")),
+                asString(getField(settings, "mTargetPkg")));
+        int uid = asInt(getField(settings, "mUid"), -1);
+        if (pkg == null || uid < 0) {
+            Object row = getField(settings, "mAppRow");
+            if (row != null) {
+                if (pkg == null) {
+                    pkg = firstNonEmpty(asString(getField(row, "pkg")), asString(getField(row, "mPkg")));
+                }
+                if (uid < 0) {
+                    uid = asInt(getField(row, "uid"), asInt(getField(row, "mUid"), -1));
+                }
             }
         }
-        invoke(settings, "updateDependents", new Class[]{boolean.class}, new Object[]{Boolean.FALSE});
-        LogUtil.logAlways("[通知重要性] 已写回通道重要性: " + importance);
+        LogUtil.logAlways("[通知重要性] 准备落盘 importance=" + importance + " prev=" + prev
+                + " pkg=" + pkg + " uid=" + uid
+                + " backend=" + (backend == null ? "null" : backend.getClass().getSimpleName()));
+
+        // ② 落盘：优先 MIUI 原生 backend，失败再直连 framework 的 compat 助手
+        boolean ok = false;
+        if (backend != null && pkg != null && uid >= 0) {
+            Method update = findMethod(backend.getClass(), "updateChannel", 3);
+            if (update != null) {
+                try {
+                    update.invoke(backend, pkg, Integer.valueOf(uid), channel);
+                    ok = true;
+                } catch (Throwable th) {
+                    LogUtil.logAlways("[通知重要性] backend.updateChannel 失败: " + th);
+                }
+            } else {
+                LogUtil.logAlways("[通知重要性] backend 上没有 updateChannel(String,int,NotificationChannel)");
+            }
+        }
+        if (!ok && pkg != null && uid >= 0) {
+            ok = updateChannelViaCompat(pkg, uid, channel);
+        }
+        LogUtil.logAlways("[通知重要性] 落盘结果 ok=" + ok + "（setImportance ok=" + setOk + "）");
+
+        // ③ 读回校验：只有它能证明「真的进了 NMS」
+        verifyChannelImportance(settings, pkg, uid, channel, importance);
+
+        sLastImportanceApplyFailed = !ok;
+
+        // ④ 刷新依赖项（浮窗 / 角标 / 锁屏）。MIUI 实际用的是 updateDependents(boolean)
+        refreshDependents(settings);
+        } finally {
+            sApplyingImportance.remove();
+        }
+    }
+
+    /** 直接调用 framework 里 Settings 自己也在用的静态助手，绕过 backend 对象不可用的情况。 */
+    private static boolean updateChannelViaCompat(String pkg, int uid, Object channel) {
+        try {
+            Class<?> compat = Class.forName("com.android.server.notification.NotificationManagerServiceCompat");
+            for (Method method : compat.getDeclaredMethods()) {
+                if (!"updateNotificationChannelForPackage".equals(method.getName())
+                        || method.getParameterCount() != 3) {
+                    continue;
+                }
+                method.setAccessible(true);
+                method.invoke(null, pkg, Integer.valueOf(uid), channel);
+                LogUtil.logAlways("[通知重要性] 落盘改走 NotificationManagerServiceCompat ✓");
+                return true;
+            }
+            LogUtil.logAlways("[通知重要性] compat 类里没有 updateNotificationChannelForPackage");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[通知重要性] compat 落盘失败: " + th);
+        }
+        return false;
+    }
+
+    /** 从 NotificationManager 读回服务端真实值，确认写回是否被接受。 */
+    private static void verifyChannelImportance(Object settings, String pkg, int uid, Object channel, int want) {
+        try {
+            String id = asString(invokeSafe(channel, "getId"));
+            Object nm = getField(settings, "mNm");
+            if (nm == null || pkg == null || id == null) {
+                LogUtil.logAlways("[通知重要性] 读回校验跳过（nm/pkg/id 缺失）");
+                return;
+            }
+            Object got = null;
+            for (Method method : nm.getClass().getMethods()) {
+                if (!"getNotificationChannelForPackage".equals(method.getName())
+                        && !"getNotificationChannel".equals(method.getName())) {
+                    continue;
+                }
+                Class<?>[] types = method.getParameterTypes();
+                try {
+                    if (types.length == 3 && types[0] == String.class && types[1] == int.class
+                            && types[2] == String.class) {
+                        got = method.invoke(nm, pkg, Integer.valueOf(uid), id);
+                    } else if (types.length == 1 && types[0] == String.class) {
+                        got = method.invoke(nm, id);
+                    } else {
+                        continue;
+                    }
+                } catch (Throwable unused) {
+                    continue;
+                }
+                if (got != null) {
+                    break;
+                }
+            }
+            if (got == null) {
+                LogUtil.logAlways("[通知重要性] 读回校验：拿不到服务端通道对象，无法确认");
+                return;
+            }
+            int actual = asInt(invokeSafe(got, "getImportance"), -1);
+            LogUtil.logAlways("[通知重要性] 读回校验：目标=" + want + " 服务端=" + actual
+                    + (actual == want ? " ✓ 已生效" : " ✗ 未被接受"));
+        } catch (Throwable th) {
+            LogUtil.logAlways("[通知重要性] 读回校验异常: " + th);
+        }
+    }
+
+    private static void refreshDependents(Object settings) {
+        try {
+            Method withArg = findMethod(settings.getClass(), "updateDependents", 1);
+            if (withArg != null) {
+                withArg.invoke(settings, Boolean.TRUE);
+                return;
+            }
+            Method noArg = findMethod(settings.getClass(), "updateDependents", 0);
+            if (noArg != null) {
+                noArg.invoke(settings);
+            }
+        } catch (Throwable th) {
+            LogUtil.log("[通知重要性] 刷新依赖项失败: " + th);
+        }
+    }
+
+    private static Object invokeSafe(Object target, String name) {
+        if (target == null) {
+            return null;
+        }
+        try {
+            Method method = target.getClass().getMethod(name);
+            method.setAccessible(true);
+            return method.invoke(target);
+        } catch (Throwable unused) {
+            return null;
+        }
+    }
+
+    private static int asInt(Object value, int fallback) {
+        return value instanceof Integer ? ((Integer) value).intValue() : fallback;
+    }
+
+    private static String asString(Object value) {
+        return value instanceof String ? (String) value : null;
+    }
+
+    private static String firstNonEmpty(String a, String b) {
+        if (a != null && a.length() > 0) {
+            return a;
+        }
+        if (b != null && b.length() > 0) {
+            return b;
+        }
+        return null;
     }
 
     /**
@@ -3009,14 +3429,42 @@ public class MainHook extends XposedModule {
         }
         try {
             Class<?> entryClass = Class.forName(Constants.NOTIF_ENTRY_CLASS, false, classLoader);
-            sEntryRepresentative = entryClass.getMethod("getRepresentativeEntry");
-            sEntryRanking = entryClass.getMethod("getRanking");
-            sRankingImportance = sEntryRanking.getReturnType().getMethod("getImportance");
+            // ① 代表项：分组通知取 group 的代表 entry；取不到就退回 entry 本身
+            try {
+                sEntryRepresentative = entryClass.getMethod("getRepresentativeEntry");
+            } catch (Throwable th) {
+                sEntryRepresentative = null;
+                LogUtil.logAlways("[通知重要性] 没有 getRepresentativeEntry，按 entry 本身取 importance");
+            }
+            // ② importance 的载体：HyperOS 4 只有 public 字段 mRanking（没有 getRanking()）
+            for (java.lang.reflect.Field field : entryClass.getDeclaredFields()) {
+                if (!"mRanking".equals(field.getName())) {
+                    continue;
+                }
+                field.setAccessible(true);
+                sEntryRankingField = field;
+                break;
+            }
+            try {
+                sEntryRankingMethod = entryClass.getMethod("getRanking");
+            } catch (Throwable unused) {
+                sEntryRankingMethod = null;
+            }
+            // ③ 字段/方法拿到的都是 framework 的 NotificationListenerService$Ranking
+            Class<?> rankingClass = Class.forName(
+                    "android.service.notification.NotificationListenerService$Ranking", false, classLoader);
+            sRankingImportance = rankingClass.getMethod("getImportance");
+            LogUtil.logAlways("[通知重要性] Ranking 反射就绪：field=" + (sEntryRankingField != null)
+                    + " method=" + (sEntryRankingMethod != null)
+                    + " importance=" + (sRankingImportance != null));
         } catch (Throwable th) {
-            LogUtil.log("[通知重要性] Ranking 反射准备失败: " + th);
+            LogUtil.logAlways("[通知重要性] Ranking 反射准备失败: " + th);
         }
         try {
             Class<?> stack = Class.forName(Constants.STACK_COORDINATOR_INNER_CLASS, false, classLoader);
+            // ⚠️ 这一层在 HyperOS 4 上**拦不住渲染**（2026-10-27 实测）：onAfterRenderList 里
+            //    NSSL 的行视图早就挂好了，改列表只影响交出去的 store（统计/状态流）。
+            //    保留它作为兜底（万一某条路径只走 store），真正的拦截在下面的 applyFilters。
             for (Method method : stack.getDeclaredMethods()) {
                 Class<?>[] types = method.getParameterTypes();
                 if (!"onAfterRenderList".equals(method.getName()) || types.length != 1
@@ -3035,14 +3483,25 @@ public class MainHook extends XposedModule {
                                     return chain.proceed();
                                 }
                                 List<?> source = (List<?>) arg;
-                                ArrayList<Object> kept = new ArrayList<Object>();
+                                ArrayList<Object> kept = new ArrayList<Object>(source.size());
+                                StringBuilder dropped = new StringBuilder();
                                 for (Object entry : source) {
-                                    if (entryImportance(entry) > 1) {
+                                    int importance = entryImportance(entry);
+                                    if (importance > 1) {
                                         kept.add(entry);
+                                    } else {
+                                        dropped.append(entryKey(entry)).append(':').append(importance).append(' ');
                                     }
                                 }
                                 if (kept.size() == source.size()) {
                                     return chain.proceed();
+                                }
+                                // 只在「被剔除的集合」发生变化时打一次，避免每帧刷屏
+                                String signature = dropped.toString();
+                                if (!signature.equals(sLastFilterLog)) {
+                                    sLastFilterLog = signature;
+                                    LogUtil.logAlways("[通知重要性] 渲染过滤：共 " + source.size() + " 条，剔除 "
+                                            + (source.size() - kept.size()) + " 条 [" + signature + "]");
                                 }
                                 Object[] args = chain.getArgs().toArray();
                                 args[0] = kept;
@@ -3053,15 +3512,72 @@ public class MainHook extends XposedModule {
                 break;
             }
         } catch (Throwable th) {
-            LogUtil.log("[通知重要性] 渲染列表过滤挂钩失败: " + th);
+            LogUtil.logAlways("[通知重要性] 渲染列表过滤挂钩失败: " + th);
+        }
+
+        // ② 真正的拦截点：ShadeListBuilder.applyFilters(entry, ...) —— 返回 true 表示
+        //    「这条被过滤掉」，等价于系统自己的 NotifFilter 命中。
+        //    这里下手才有用：行视图是流水线构建列表时才挂上去/摘下来的，
+        //    onAfterRenderList 里改列表已经太晚了（实测只改到统计用的 store）。
+        try {
+            Class<?> entryClass = Class.forName(Constants.NOTIF_ENTRY_CLASS, false, classLoader);
+            Class<?> builder = Class.forName(Constants.SHADE_LIST_BUILDER_CLASS, false, classLoader);
+            Method applyFilters = null;
+            for (Method method : builder.getDeclaredMethods()) {
+                Class<?>[] types = method.getParameterTypes();
+                if (Constants.SHADE_LIST_BUILDER_FILTER_METHOD.equals(method.getName())
+                        && types.length == 3 && types[0] == entryClass
+                        && types[1] == Long.TYPE && List.class.isAssignableFrom(types[2])) {
+                    applyFilters = method;
+                    break;
+                }
+            }
+            if (applyFilters == null) {
+                LogUtil.logAlways("[通知重要性] ShadeListBuilder 里没有 applyFilters(entry,long,List)");
+                return;
+            }
+            applyFilters.setAccessible(true);
+            hook(applyFilters).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).setId("notif-importance-shade")
+                    .intercept(new XposedInterface.Hooker() {
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            if (!sNotifImportance || sRankingImportance == null) {
+                                return chain.proceed();
+                            }
+                            Object entry = chain.getArg(0);
+                            int importance = entryImportance(entry);
+                            if (importance <= 1) {
+                                String key = entryKey(entry);
+                                if (LogUtil.hitOnce("imp-shade-" + key + importance)) {
+                                    LogUtil.logAlways("[通知重要性] ShadeListBuilder 过滤命中："
+                                            + key + " importance=" + importance);
+                                }
+                                return Boolean.TRUE;
+                            }
+                            return chain.proceed();
+                        }
+                    });
+            LogUtil.logAlways("[通知重要性] 已挂钩 ShadeListBuilder.applyFilters（importance<=1 直接过滤）");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[通知重要性] ShadeListBuilder 过滤挂钩失败: " + th);
         }
     }
 
     private static int entryImportance(Object entry) {
+        if (entry == null) {
+            return 2;
+        }
         try {
-            Object representative = entry == null ? null : sEntryRepresentative.invoke(entry);
-            Object target = representative == null ? entry : representative;
-            Object ranking = sEntryRanking.invoke(target);
+            Object target = entry;
+            if (sEntryRepresentative != null) {
+                Object representative = sEntryRepresentative.invoke(entry);
+                if (representative != null) {
+                    target = representative;
+                }
+            }
+            Object ranking = sEntryRankingField != null ? sEntryRankingField.get(target) : null;
+            if (ranking == null && sEntryRankingMethod != null) {
+                ranking = sEntryRankingMethod.invoke(target);
+            }
             if (ranking == null) {
                 return 2;
             }
@@ -3070,6 +3586,25 @@ public class MainHook extends XposedModule {
         } catch (Throwable unused) {
             return 2; // 取不到就保留，宁可不删
         }
+    }
+
+    /** 日志里用的通知标识（拿不到就退化成类名），纯粹为了排查 */
+    private static String entryKey(Object entry) {
+        try {
+            Object key = invokeSafe(entry, "getKey");
+            if (key != null) {
+                return String.valueOf(key);
+            }
+        } catch (Throwable unused) {
+        }
+        Object sbn = getField(entry, "mSbn");
+        if (sbn != null) {
+            Object key = invokeSafe(sbn, "getKey");
+            if (key != null) {
+                return String.valueOf(key);
+            }
+        }
+        return entry == null ? "null" : entry.getClass().getSimpleName();
     }
 
     private static Object invoke(Object target, String name, Class<?>[] types, Object[] args) {

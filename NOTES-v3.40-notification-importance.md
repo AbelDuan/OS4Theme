@@ -74,3 +74,39 @@ HyperCeiler 用两个 hook 把这条路补回来，本版把它移植进 OS4Them
 [通知重要性] 已写回通道重要性: 4
 ```
 修复后选择能落库（`channel.getImportance()` 与选择一致），不再弹回。
+
+## v3.283.10 修复：改低重要性后通知照样显示（2026-10-27，OS4.0.26 实机验证）
+
+**现象**：「重要性」已经能改、也确实写进了 NotificationManagerService
+（`dumpsys notification` 里该通道 `mImportance=1 / mUserLockedFields=4 / mImportanceExplanation=user`），
+但下拉通知栏里那条通知**照样在**。
+
+**两个根因，都属于「钩子装上了但永远不生效」：**
+
+1. **反射准备直接失败**：老代码用 `NotificationEntry.getRanking()` 取 Ranking。
+   HyperOS 4（Android 17）的 `NotificationEntry` **没有这个方法**（dex 实测：只有 public 字段
+   `mRanking` + `setRanking()`）。`getMethod("getRanking")` 抛 NoSuchMethodException，
+   把同一个 try 块里的 `getRepresentativeEntry` / `getImportance` 一起废掉，
+   三个静态方法全 null → 过滤器每帧都走 `proceed()` 透传。
+   而这条失败日志走的是 `LogUtil.log()`（受「详细日志」开关控制，默认关），所以看不见。
+   → 改成直接读 `mRanking` 字段，失败日志改 `logAlways`。
+
+2. **钩错了阶段**：`StackCoordinator$attach$1.onAfterRenderList` 在 HyperOS 4 里只是把最终列表
+   交给 `RenderNotificationListInteractor.setRenderedList()`（写进
+   `ActiveNotificationListRepository.activeNotifications` 这个 StateFlow，给统计/状态用）。
+   行视图早在流水线构建时就已经挂到 NotificationStackScrollLayout 上了，
+   在这里改 List 只改得到 store，**屏幕上一条都不少**（实测：日志已打出「剔除 2 条」，
+   截图里两条仍在，连新来的通知也只让列表多一条而不是替换）。
+   → 真正的拦截点是 `ShadeListBuilder.applyFilters(NotificationEntry, long, List)`：
+   返回 true 就等于被系统自己的 NotifFilter 掉，entry 不进流水线 → 行视图不挂 → 不显示。
+
+**实机验证日志（OS4.0.26）**：
+```
+[通知重要性] Ranking 反射就绪：field=true method=false importance=true
+[通知重要性] 已挂钩 ShadeListBuilder.applyFilters（importance<=1 直接过滤）
+[通知重要性] ShadeListBuilder 过滤命中：0|net.dinglisch.android.taskerm|2147483647|null|10413 importance=1
+[通知重要性] ShadeListBuilder 过滤命中：0|top.funcun.dshfolk|1001|null|10373 importance=1
+```
+截图对照：过滤前 4 条（含 Tasker、DSH-Folk），过滤后只剩 importance>1 的 3 条。
+
+**结论**：HyperCeiler 的 `onAfterRenderList` 写法在 HyperOS 4 已失效，仅 `applyFilters` 有效。
