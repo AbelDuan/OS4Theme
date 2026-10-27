@@ -117,16 +117,6 @@ public final class Constants {
             "com.android.settings.notification.app.ChannelNotificationSettings",
             "com.android.settings.notification.ChannelNotificationSettings"
     };
-    public static final String STACK_COORDINATOR_INNER_CLASS = "com.android.systemui.statusbar.notification.collection.coordinator.StackCoordinator$attach$1";
-    /**
-     * HyperOS 4 的 {@code onAfterRenderList} 只是把最终列表交给
-     * {@code RenderNotificationListInteractor.setRenderedList()}（统计/状态流用），
-     * 行视图早就挂到 NotificationStackScrollLayout 上了，在那里过滤阻止不了渲染。
-     * 真正有效的是 {@code applyFilters(NotificationEntry, long, List)} —— 每个 entry 的
-     * "要不要被过滤掉"的判定点，返回 true 就等于被系统自己的 NotifFilter 丢弃。
-     */
-    public static final String SHADE_LIST_BUILDER_CLASS = "com.android.systemui.statusbar.notification.collection.ShadeListBuilder";
-    public static final String SHADE_LIST_BUILDER_FILTER_METHOD = "applyFilters";
     public static final String PREFS = "hyperosglass";
     public static final String PREFS_FOD_MODE_LEGACY = "fod_mode";
     public static final String QS_EDIT_CONTROLLER_CLASS = "miui.systemui.controlcenter.panel.main.qs.EditButtonController";
