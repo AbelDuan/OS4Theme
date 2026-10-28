@@ -32,6 +32,8 @@ public final class NotifSuppressHook {
             "com.android.systemui.statusbar.notification.shared.ActiveNotificationModel";
     private static final String STORE =
             "com.android.systemui.statusbar.notification.data.repository.ActiveNotificationsStore";
+    private static final String NOTIF_COLLECTION =
+            "com.android.systemui.statusbar.notification.collection.NotifCollection";
 
     private NotifSuppressHook() {
     }
@@ -75,8 +77,62 @@ public final class NotifSuppressHook {
             LogUtil.logAlways("[源头抑制] 已挂钩 " + STORE_BUILDER + ".toModel(NotificationEntry)");
             cacheStoreField(builder);
             cacheModelField(cl);
+            installRankingRebuildHook(module, cl, builder);
         } catch (Throwable th) {
             LogUtil.logAlways("[源头抑制] 安装失败: " + th);
+        }
+    }
+
+    /**
+     * 让「改完优先级立刻生效」。
+     *
+     * <p>系统在渠道重要性变化时只会调 {@code NotifCollection.applyRanking(RankingMap)}，
+     * 它把新 Ranking 存进 {@code mLatestRankingMap} 并逐个更新条目，但<b>不会</b>重建渲染列表，
+     * 所以 {@code toModel} 不重跑，状态栏图标要等到下一条新通知才更新。
+     *
+     * <p>这里在 applyRanking 之后补一次 {@code dispatchEventsAndRebuildList(String)}，
+     * 强制重算。只在 Ranking 真的变化时触发一次，不是轮询，开销等同于收到一条通知。
+     */
+    private static void installRankingRebuildHook(final io.github.libxposed.api.XposedModule module,
+                                                  ClassLoader cl, final Class<?> builder) {
+        try {
+            Class<?> nc = Class.forName(NOTIF_COLLECTION, false, cl);
+            java.lang.reflect.Method applyRanking = null;
+            java.lang.reflect.Method rebuild = null;
+            for (java.lang.reflect.Method m : nc.getDeclaredMethods()) {
+                String n = m.getName();
+                if (n.equals("applyRanking") && m.getParameterCount() == 1) {
+                    applyRanking = m;
+                } else if (n.equals("dispatchEventsAndRebuildList") && m.getParameterCount() == 1) {
+                    rebuild = m;
+                }
+            }
+            if (applyRanking == null || rebuild == null) {
+                LogUtil.logAlways("[即时刷新] 未找到 applyRanking/dispatchEventsAndRebuildList");
+                return;
+            }
+            applyRanking.setAccessible(true);
+            rebuild.setAccessible(true);
+            final java.lang.reflect.Method rebuildM = rebuild;
+            module.hook(applyRanking)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("ranking-rebuild")
+                    .intercept(new XposedInterface.Hooker() {
+                        @Override
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            Object r = chain.proceed();
+                            try {
+                                rebuildM.invoke(chain.getThisObject(), "OS4Theme-importance-changed");
+                                LogUtil.logAlways("[即时刷新] 优先级变更后已重建通知列表");
+                            } catch (Throwable ignored) {
+                                // 重建失败不影响主流程，只是图标要等下次刷新
+                            }
+                            return r;
+                        }
+                    });
+            LogUtil.logAlways("[即时刷新] 已挂钩 NotifCollection.applyRanking");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[即时刷新] 安装失败: " + th);
         }
     }
 
