@@ -78,6 +78,11 @@ public final class LogUtil {
     }
 
     private static void writeAlways(String str) {
+        // 直接写 logcat：LSPosed 的 log() 会限流/丢条，调试期必须走原生路
+        try {
+            android.util.Log.i(Constants.LOG_TAG, str);
+        } catch (Throwable ignored) {
+        }
         XposedModule xposedModule = sLogger;
         if (xposedModule != null) {
             try {

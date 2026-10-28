@@ -43,6 +43,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class MainHook extends XposedModule {
     /* ===== 通知优先级/重要性（v3.40，移植自 HyperCeiler）===== */
     public volatile boolean sNotifImportance = true;
+    /** 低重要级通知不显示状态栏图标：全局可读的开关快照（StatusIconLimit 的 onDraw 里用）。 */
+    public static final java.util.concurrent.atomic.AtomicBoolean sNotifImportanceFlag =
+            new java.util.concurrent.atomic.AtomicBoolean(true);
     private static final String[] NOTIF_VISIBLE_PREF_KEYS = {"importance", "badge", "allow_keyguard"};
     private volatile SharedPreferences sPrefs;
     private static final Set<String> sinkHooked = new HashSet();
@@ -204,6 +207,10 @@ public class MainHook extends XposedModule {
                 // ★ 低重要级通知不显示状态栏图标（HyperOS 4 已废弃静默分区，
                 //   只能在渲染后监听器里剔除条目）
                 installLowImportanceFilterHook(defaultClassLoader);
+                // ★ v3.43 状态栏图标专项：HyperOS 4 的状态栏图标数据走
+                //   RenderNotificationListInteractor.setRenderedList → ActiveNotificationsStore，
+                //   与通知面板的 onAfterRenderList 是两条链路，必须在 Store 层补标记。
+                installSuppressStatusBarIconHook(defaultClassLoader);
                 installStatusIconLimitHooks(defaultClassLoader);
                 installThirdPartyThemeGlassHooks(defaultClassLoader);
             } else if (Constants.SETTINGS_PKG.equals(packageName)) {
@@ -529,6 +536,8 @@ public class MainHook extends XposedModule {
                     .intercept(new XposedInterface.Hooker() {
                         @Override
                         public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            LogUtil.logAlwaysOnce("lowimp-called-" + label,
+                                    "[低重要性] onAfterRenderList 被调用: " + label);
                             if (MainHook.this.sNotifImportance) {
                                 try {
                                     filterLowImportance(chain);
@@ -560,6 +569,10 @@ public class MainHook extends XposedModule {
         int dropped = 0;
         for (Object item : list) {
             int importance = importanceOf(item);
+            // 顺手把「key → 重要性」记下来：状态栏图标那条链路上拿不到 Ranking，
+            // 只能靠这里喂数据给 NotifIconBlock（v3.52 实测 SystemUI 进程里
+            // NotificationManager.getNotificationChannel 对三方包一律返回 null）。
+            rememberImportance(item, importance);
             if (importance >= 0 && importance <= IMPORTANCE_MIN) {
                 dropped++;
                 continue;
@@ -582,6 +595,25 @@ public class MainHook extends XposedModule {
                 + " 条低重要级通知（剩余 " + kept.size() + " 条）");
     }
 
+    /** 把条目的 key → 重要性 记进 NotifIconBlock 的表（状态栏图标那边要用）。 */
+    private static void rememberImportance(Object item, int importance) {
+        if (importance < 0) {
+            return;
+        }
+        try {
+            Object entry = invokeSafe(item, "getRepresentativeEntry");
+            if (entry == null) {
+                entry = item;
+            }
+            Object key = getField(entry, "key");
+            if (key instanceof String) {
+                NotifIconBlock.remember((String) key, importance);
+            }
+        } catch (Throwable unused) {
+            // 记不上不影响过滤本身
+        }
+    }
+
     /** 取条目的重要性：getRepresentativeEntry().mRanking.getImportance()；取不到返回 -1。 */
     private static int importanceOf(Object item) {
         try {
@@ -600,12 +632,235 @@ public class MainHook extends XposedModule {
         }
     }
 
+    /* ================= v3.43：状态栏图标按重要性抑制 =================
+     *
+     * HyperOS 4 的状态栏图标不再从通知面板的 List<NotificationEntry> 取，
+     * 而是走另一条数据链：
+     *
+     *   StackCoordinator$attach$1.onAfterRenderList(List<NotificationEntry>)
+     *     └─ RenderNotificationListInteractor.setRenderedList(list)
+     *          └─ RenderNotificationListInteractorKt.access$buildActiveNotificationsStore(...)
+     *               └─ 逐条 toModel(entry) 生成 ActiveNotificationModel
+     *                    （其中 isSuppressedFromStatusBar 布尔字段决定状态栏是否画图标）
+     *          └─ repository.activeNotifications = ActiveNotificationsStore
+     *
+     *   StatusBarNotificationIconsInteractor ← NotificationIconsInteractor.filteredNotifSet
+     *     └─ 只读 ActiveNotificationModel.isSuppressedFromStatusBar，不会再看 NotificationEntry
+     *
+     * 因此 HyperCeiler 那种「在 onAfterRenderList 里从 List 里删条目」只影响通知面板，
+     * 状态栏图标照样出现。这里的做法是在 setRenderedList 结束后，
+     * 把 Store 里重要性 ≤ 阈值的 ActiveNotificationModel 的 isSuppressedFromStatusBar
+     * 直接改成 true（只改内存对象，不碰任何系统文件）。
+     */
+
+    /** 状态栏图标抑制：Store 类名（可能随 ROM 版本微调，逐个尝试）。 */
+    private static final String[] STORE_CLASS_NAMES = {
+            "com.android.systemui.statusbar.notification.data.repository.ActiveNotificationsStore",
+    };
+
+    /** 状态栏图标抑制：setRenderedList 所在类。 */
+    private static final String RENDER_INTERACTOR_CLASS =
+            "com.android.systemui.statusbar.notification.domain.interactor.RenderNotificationListInteractor";
+    private static final String RENDER_INTERACTOR_KT_CLASS =
+            "com.android.systemui.statusbar.notification.domain.interactor.RenderNotificationListInteractorKt";
+    private static final String MODEL_CLASS =
+            "com.android.systemui.statusbar.notification.shared.ActiveNotificationModel";
+
+    private static volatile Class<?> sModelClass;
+
+    private void installSuppressStatusBarIconHook(ClassLoader classLoader) {
+        try {
+            sModelClass = Class.forName(MODEL_CLASS, false, classLoader);
+        } catch (Throwable th) {
+            sModelClass = null;
+        }
+        Class<?> interactor = null;
+        try {
+            interactor = Class.forName(RENDER_INTERACTOR_CLASS, false, classLoader);
+        } catch (Throwable unused) {
+        }
+        if (interactor == null) {
+            LogUtil.logAlways("[状态栏抑制] 未找到 " + RENDER_INTERACTOR_CLASS);
+            return;
+        }
+        Method target = null;
+        for (Method m : interactor.getDeclaredMethods()) {
+            if ("setRenderedList".equals(m.getName()) && m.getParameterCount() == 1
+                    && List.class.isAssignableFrom(m.getParameterTypes()[0])) {
+                target = m;
+                break;
+            }
+        }
+        if (target == null) {
+            LogUtil.logAlways("[状态栏抑制] 未找到 setRenderedList(List)");
+            return;
+        }
+        try {
+            target.setAccessible(true);
+            hook(target).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("suppress-statusbar-icon")
+                    .intercept(new XposedInterface.Hooker() {
+                        @Override
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            Object result = chain.proceed();
+                            if (MainHook.this.sNotifImportance) {
+                                try {
+                                    suppressLowImportanceInStore(chain.getThisObject());
+                                } catch (Throwable th) {
+                                    LogUtil.logAlwaysOnce("suppress-sb-err",
+                                            "[状态栏抑制] 异常: " + th);
+                                }
+                            }
+                            return result;
+                        }
+                    });
+            LogUtil.logAlways("[状态栏抑制] 已挂钩 setRenderedList");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[状态栏抑制] 挂载失败: " + th);
+        }
+    }
+
+    /**
+     * 把 Store 里所有重要性 ≤ {@link #IMPORTANCE_MIN} 的 ActiveNotificationModel
+     * 的 isSuppressedFromStatusBar 置 true。
+     *
+     * <p>遍历 store.groups / store.individuals（都是 Map），组取 summary 与 children。
+     * 只在还带 statusBarIcon 的模型上动手，避免把空模型也标记。
+     */
+    private static void suppressLowImportanceInStore(Object interactor) {
+        if (interactor == null || sModelClass == null) {
+            return;
+        }
+        Object repository = getField(interactor, "repository");
+        if (repository == null) {
+            return;
+        }
+        Object flow = getField(repository, "activeNotifications");
+        Object store = null;
+        try {
+            if (flow != null) {
+                Method getValue = flow.getClass().getMethod("getValue");
+                getValue.setAccessible(true);
+                store = getValue.invoke(flow);
+            }
+        } catch (Throwable unused) {
+            store = null;
+        }
+        if (store == null) {
+            return;
+        }
+        sCurrentStore = store;
+        int marked = 0;
+        Field flag = findField(sModelClass, "isSuppressedFromStatusBar");
+        if (flag == null) {
+            LogUtil.logAlwaysOnce("suppress-sb-nofield",
+                    "[状态栏抑制] ActiveNotificationModel 无 isSuppressedFromStatusBar");
+            return;
+        }
+        flag.setAccessible(true);
+
+        // 1) groups: Map<String, ActiveNotificationGroupModel>
+        Object groups = getField(store, "groups");
+        if (groups instanceof Map) {
+            for (Object group : ((Map<?, ?>) groups).values()) {
+                if (group == null) {
+                    continue;
+                }
+                marked += markModel(getField(group, "summary"), flag);
+                Object children = getField(group, "children");
+                if (children instanceof List) {
+                    for (Object child : (List<?>) children) {
+                        marked += markModel(child, flag);
+                    }
+                }
+            }
+        }
+        // 2) individuals: Map<String, ActiveNotificationModel>
+        Object individuals = getField(store, "individuals");
+        if (individuals instanceof Map) {
+            for (Object model : ((Map<?, ?>) individuals).values()) {
+                marked += markModel(model, flag);
+            }
+        }
+        if (marked > 0) {
+            LogUtil.logAlways("[状态栏抑制] 已抑制 " + marked + " 条低重要性通知的状态栏图标");
+        }
+    }
+
+    /** 单个模型：重要性 ≤ 阈值且未被标记过 → 置 true。返回 1 表示本次改动。 */
+    private static int markModel(Object model, Field flag) {
+        if (model == null || !sModelClass.isInstance(model)) {
+            return 0;
+        }
+        try {
+            if (flag.getBoolean(model)) {
+                return 0;
+            }
+            int importance = importanceOfRanking(getField(model, "key"));
+            if (importance < 0 || importance > IMPORTANCE_MIN) {
+                return 0;
+            }
+            flag.setBoolean(model, true);
+            return 1;
+        } catch (Throwable unused) {
+            return 0;
+        }
+    }
+
+    /**
+     * 由通知 key 反查重要性。
+     *
+     * <p>ActiveNotificationModel 本身不带 importance，只能回到榜单数据：
+     * Store.rankingsMap 的 key 是通知 key、value 是 RankingMap.Ranking，
+     * 用 {@code getRanking(key)} 取回后调用 {@code getImportance()}。
+     */
+    private static final Map<String, Integer> sImportanceCache = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static int importanceOfRanking(Object key) {
+        if (!(key instanceof String)) {
+            return -1;
+        }
+        String k = (String) key;
+        Integer cached = sImportanceCache.get(k);
+        if (cached != null) {
+            return cached.intValue();
+        }
+        int importance = -1;
+        try {
+            Object store = sCurrentStore;
+            if (store != null) {
+                Object rankings = getField(store, "rankingsMap");
+                if (rankings instanceof Map) {
+                    Object ranking = ((Map<?, ?>) rankings).get(k);
+                    if (ranking != null) {
+                        Object v = invokeSafe(ranking, "getImportance");
+                        if (v instanceof Integer) {
+                            importance = ((Integer) v).intValue();
+                        }
+                    }
+                }
+            }
+        } catch (Throwable unused) {
+        }
+        if (importance >= 0) {
+            sImportanceCache.put(k, Integer.valueOf(importance));
+        }
+        return importance;
+    }
+
+    private static volatile Object sCurrentStore;
+
     private void installStatusIconLimitHooks(ClassLoader classLoader) {
         try {
             StatusIconLimit.install(this, classLoader);
             LogUtil.logAlways("[诊断] 状态栏通知图标 hooks 安装返回");
         } catch (Throwable th) {
             LogUtil.logAlways("[状态栏图标] 挂载失败: " + th);
+        }
+        try {
+            NotifIconBlock.install(this, classLoader);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[图标屏蔽] 挂载失败: " + th);
         }
     }
 
@@ -2458,6 +2713,7 @@ public class MainHook extends XposedModule {
             this.sSinkEnabled = z;
             this.sGlassEnabled = z2;
             this.sNotifImportance = z17;
+            sNotifImportanceFlag.set(z17);
             this.sHideLockFod = z3;
             sHideLockFodFlag.set(z3);
             this.sHideDismissBtn = z4;
