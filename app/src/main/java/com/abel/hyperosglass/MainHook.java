@@ -42,7 +42,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /* JADX INFO: loaded from: classes.dex */
 public class MainHook extends XposedModule {
     /* ===== 通知优先级/重要性（v3.40，移植自 HyperCeiler）===== */
-    private volatile boolean sNotifImportance = true;
+    public volatile boolean sNotifImportance = true;
     private static final String[] NOTIF_VISIBLE_PREF_KEYS = {"importance", "badge", "allow_keyguard"};
     private volatile SharedPreferences sPrefs;
     private static final Set<String> sinkHooked = new HashSet();
@@ -201,6 +201,9 @@ public class MainHook extends XposedModule {
                 //   把写死的 452dp 换成按屏宽比例（适配 内屏/外屏 × 横屏/竖屏）
                 installNotifWidthHooks(defaultClassLoader);
                 LogUtil.logAlways("[诊断] 通知宽度/旋转提示 hooks 安装返回");
+                // ★ 低重要级通知不显示状态栏图标（HyperOS 4 已废弃静默分区，
+                //   只能在渲染后监听器里剔除条目）
+                installLowImportanceFilterHook(defaultClassLoader);
                 installStatusIconLimitHooks(defaultClassLoader);
                 installThirdPartyThemeGlassHooks(defaultClassLoader);
             } else if (Constants.SETTINGS_PKG.equals(packageName)) {
@@ -466,6 +469,130 @@ public class MainHook extends XposedModule {
     }
 
     /** 状态栏通知图标「数量上限 + 溢出圆点」控制（v3.45.x，移植自 HyperRefine）。 */
+    /**
+     * 低重要级通知不显示状态栏图标（移植自 HyperCeiler 的
+     * NotificationImportanceHyperOSFix）。
+     *
+     * <p>HyperOS 4 已废弃静默分区（{@code RankingCoordinator$2.isInSection} 恒返回 false），
+     * {@code StatusBarIconView.onDraw} 也不再走通知图标绘制，所以只能在
+     * {@code onAfterRenderList} 这一环把低重要级条目从列表里剔除。
+     *
+     * <p>实测：HyperOS 4 上真正回调的是 {@code MiuiNotifCoordinator$attach$1}，
+     * 但不同版本/机型可能换人，故四个实现全部挂上，命中哪个都生效。
+     */
+    private void installLowImportanceFilterHook(ClassLoader classLoader) {
+        for (String name : LOW_IMP_FILTER_TARGETS) {
+            Class<?> target;
+            try {
+                target = Class.forName(name, false, classLoader);
+            } catch (Throwable unused) {
+                continue;
+            }
+            installLowImportanceFilterHook(target, name);
+        }
+    }
+
+    /** 所有实现了 {@code onAfterRenderList(List)} 的渲染后监听器。 */
+    private static final String[] LOW_IMP_FILTER_TARGETS = {
+            "com.android.systemui.statusbar.notification.collection.coordinator.MiuiNotifCoordinator$attach$1",
+            "com.android.systemui.statusbar.notification.collection.coordinator.StackCoordinator$attach$1",
+            "com.android.systemui.statusbar.notification.collection.coordinator.RowAppearanceCoordinator$attach$2",
+            "com.android.systemui.statusbar.notification.collection.coordinator.NotifLiveDataStoreCoordinator$attach$1",
+    };
+
+    /** NotificationManager.IMPORTANCE_LOW；更低（MIN=1、NONE=0）同样隐藏。 */
+    private static final int IMPORTANCE_LOW = 2;
+
+    private void installLowImportanceFilterHook(Class<?> target, String label) {
+        try {
+            Method m = null;
+            for (Method each : target.getDeclaredMethods()) {
+                if ("onAfterRenderList".equals(each.getName()) && each.getParameterCount() == 1
+                        && java.util.List.class.isAssignableFrom(each.getParameterTypes()[0])) {
+                    m = each;
+                    break;
+                }
+            }
+            if (m == null) {
+                return;
+            }
+            m.setAccessible(true);
+            hook(m).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("low-importance-filter")
+                    .intercept(new XposedInterface.Hooker() {
+                        @Override
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            if (MainHook.this.sNotifImportance) {
+                                try {
+                                    filterLowImportance(chain);
+                                } catch (Throwable th) {
+                                    LogUtil.logAlwaysOnce("lowimp-filter-err",
+                                            "[低重要性] 过滤异常: " + th);
+                                }
+                            }
+                            return chain.proceed();
+                        }
+                    });
+            LogUtil.logAlways("[低重要性] 已挂钩 " + label);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[低重要性] 挂载失败 " + label + ": " + th);
+        }
+    }
+
+    /** 把列表中 importance ≤ LOW 的条目剔除，并原地改写传入的 List。 */
+    private static void filterLowImportance(XposedInterface.Chain chain) {
+        Object arg = chain.getArg(0);
+        if (!(arg instanceof java.util.List)) {
+            return;
+        }
+        java.util.List<?> list = (java.util.List<?>) arg;
+        if (list.isEmpty()) {
+            return;
+        }
+        java.util.ArrayList<Object> kept = new java.util.ArrayList<>(list.size());
+        int dropped = 0;
+        for (Object item : list) {
+            int importance = importanceOf(item);
+            if (importance >= 0 && importance <= IMPORTANCE_LOW) {
+                dropped++;
+                continue;
+            }
+            kept.add(item);
+        }
+        if (dropped == 0) {
+            return;
+        }
+        // XposedInterface.Chain 不提供 setArg，直接原地改写传入的 List 内容
+        try {
+            @SuppressWarnings("unchecked")
+            java.util.List<Object> writable = (java.util.List<Object>) list;
+            writable.clear();
+            writable.addAll(kept);
+        } catch (Throwable unused) {
+            return;
+        }
+        LogUtil.logAlways("[低重要性] 已从状态栏隐藏 " + dropped
+                + " 条低重要级通知（剩余 " + kept.size() + " 条）");
+    }
+
+    /** 取条目的重要性：getRepresentativeEntry().mRanking.getImportance()；取不到返回 -1。 */
+    private static int importanceOf(Object item) {
+        try {
+            Object entry = invokeSafe(item, "getRepresentativeEntry");
+            if (entry == null) {
+                return -1;
+            }
+            Object ranking = getField(entry, "mRanking");
+            if (ranking == null) {
+                return -1;
+            }
+            Object v = invokeSafe(ranking, "getImportance");
+            return v instanceof Integer ? ((Integer) v).intValue() : -1;
+        } catch (Throwable unused) {
+            return -1;
+        }
+    }
+
     private void installStatusIconLimitHooks(ClassLoader classLoader) {
         try {
             StatusIconLimit.install(this, classLoader);
