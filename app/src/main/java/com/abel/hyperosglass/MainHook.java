@@ -862,6 +862,14 @@ public class MainHook extends XposedModule {
         } catch (Throwable th) {
             LogUtil.logAlways("[图标屏蔽] 挂载失败: " + th);
         }
+        try {
+            // ★ 数据源头抑制：把低重要级模型的 isSuppressedFromStatusBar 置 true，
+            //   图标在 filteredNotifSet 里就被过滤，容器不会收到它（不占位、不崩）。
+            NotifSuppressHook.install(this, classLoader);
+            LogUtil.logAlways("[诊断] 源头抑制 hooks 安装返回");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[源头抑制] 挂载失败: " + th);
+        }
     }
 
     private static Field findField(Class<?> cls, String str) {
