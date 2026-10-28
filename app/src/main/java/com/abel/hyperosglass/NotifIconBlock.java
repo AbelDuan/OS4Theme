@@ -200,50 +200,8 @@ public final class NotifIconBlock {
                 return;
             }
         }
-        // 2) 光 mBlocked 只是「不画」，尺寸还在，容器照样占位 → 必须把 View 彻底收掉
-        shrink(view);
         LogUtil.logAlwaysOnce("icon-block-" + sbn.getKey(),
                 "[图标屏蔽] 已屏蔽 importance=" + importance + " key=" + sbn.getKey());
-    }
-
-    /**
-     * 把被屏蔽图标的尺寸彻底归零。
-     *
-     * <p>HyperOS 4 的状态栏图标由 {@code NotificationIconContainer} 逐个子 View 排布，
-     * 只设 {@code mBlocked} 时该 View 仍然保留原本的宽高，于是在状态栏里留下一段空白
-     * （实测反馈「前后是空的，中间没图标」）。这里把可见性、最小尺寸、内边距全部清零，
-     * 让容器算出的占位也是 0。
-     */
-    private static void shrink(final View view) {
-        try {
-            view.setVisibility(View.GONE);
-            view.setMinimumWidth(0);
-            view.setMinimumHeight(0);
-            view.setPadding(0, 0, 0, 0);
-            android.view.ViewGroup.LayoutParams lp = view.getLayoutParams();
-            if (lp != null) {
-                lp.width = 0;
-                lp.height = 0;
-                view.setLayoutParams(lp);
-            }
-        } catch (Throwable ignored) {
-        }
-        // 光把尺寸清零，容器排版时仍会按模型列表占一格（用户反馈「前后是空的，中间没图标」）。
-        // 等布局稳定后直接把 View 从父容器摘掉，容器就再也算不到这一格。
-        view.post(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    android.view.ViewParent parent = view.getParent();
-                    if (parent instanceof android.view.ViewGroup) {
-                        ((android.view.ViewGroup) parent).removeView(view);
-                        LogUtil.logAlwaysOnce("icon-remove-" + System.identityHashCode(view),
-                                "[图标屏蔽] 已从容器移除该图标 View（彻底不占位）");
-                    }
-                } catch (Throwable ignored) {
-                }
-            }
-        });
     }
 
     /** 渠道重要性（用户在设置里调的那一项）优先，其次通知自带的重要性；都取不到返回 -1。 */
