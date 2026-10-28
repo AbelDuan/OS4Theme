@@ -200,8 +200,82 @@ public final class NotifIconBlock {
                 return;
             }
         }
+        // 2) 让容器排版时不算这一格：改 IconState 而不是动 View 树。
+        //
+        //    2026-10-28 实测：早先用 removeView 把 View 摘出容器，
+        //    NotificationIconContainer.resetViewStates 会遍历 getChildCount()，
+        //    再拿子 View 去 mIconStates 查状态；View 被摘掉后遍历对不上，
+        //    取到 null 直接抛 IllegalStateException，SystemUI 反复崩溃（解锁黑屏）。
+        //
+        //    ViewState.applyToView 会把 visibleState 映射回 View：
+        //    8(GONE) → gone=true，4(INVISIBLE) → hidden=true。
+        //    容器 onLayout 对 GONE 的子 View 不分配宽度，因此设成 8 即可「不占位」，
+        //    且 mIconStates 里的记录保持完整，不会崩。
+        markIconStateGone(view);
         LogUtil.logAlwaysOnce("icon-block-" + sbn.getKey(),
                 "[图标屏蔽] 已屏蔽 importance=" + importance + " key=" + sbn.getKey());
+    }
+
+    /**
+     * 把图标在容器里的排版状态标记为 GONE，使其不占宽度。
+     *
+     * <p>两条路径都试：
+     * <ol>
+     *   <li>容器侧的 {@code mIconStates} 里那条记录（真正决定排版的那份）；</li>
+     *   <li>View 自身的 {@code visibleState} 字段（容器在下次 {@code initFrom} 前不会覆盖它）。</li>
+     * </ol>
+     *
+     * <p>⚠️ 绝不能 {@code removeView}：容器 {@code resetViewStates} 会因查不到
+     * {@code IconState} 抛 {@code IllegalStateException}，导致 SystemUI 崩溃循环。
+     */
+    private static void markIconStateGone(View view) {
+        try {
+            view.setVisibility(View.GONE);
+        } catch (Throwable ignored) {
+        }
+        // 容器自己持有的那份状态
+        try {
+            android.view.ViewParent parent = view.getParent();
+            if (parent != null) {
+                Field statesField = fieldOf(parent.getClass(), "mIconStates");
+                Object states = statesField == null ? null : statesField.get(parent);
+                if (states instanceof java.util.Map) {
+                    Object st = ((java.util.Map<?, ?>) states).get(view);
+                    if (st != null) {
+                        setStateGone(st);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 把一个 ViewState/IconState 标记为 GONE。 */
+    private static void setStateGone(Object state) {
+        try {
+            Field vs = fieldOf(state.getClass(), "visibleState");
+            if (vs != null) {
+                vs.setInt(state, 8);   // View.GONE
+            }
+        } catch (Throwable ignored) {
+        }
+        // 父类 ViewState 的 gone / hidden
+        try {
+            Class<?> c = state.getClass();
+            while (c != null && c != Object.class) {
+                for (String name : new String[]{"gone", "hidden"}) {
+                    try {
+                        Field f = c.getDeclaredField(name);
+                        f.setAccessible(true);
+                        f.setBoolean(state, true);
+                    } catch (NoSuchFieldException ignored) {
+                    } catch (Throwable ignored) {
+                    }
+                }
+                c = c.getSuperclass();
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     /** 渠道重要性（用户在设置里调的那一项）优先，其次通知自带的重要性；都取不到返回 -1。 */
