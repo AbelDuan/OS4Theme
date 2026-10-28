@@ -500,8 +500,15 @@ public class MainHook extends XposedModule {
             "com.android.systemui.statusbar.notification.collection.coordinator.NotifLiveDataStoreCoordinator$attach$1",
     };
 
-    /** NotificationManager.IMPORTANCE_LOW；更低（MIN=1、NONE=0）同样隐藏。 */
-    private static final int IMPORTANCE_LOW = 2;
+    /**
+     * 隐藏状态栏图标的最高重要性档位：IMPORTANCE_MIN(1)。
+     *
+     * <p>与 HyperCeiler 的 NotificationImportanceHyperOSFix 判据完全一致
+     * （源码里是 {@code if (importance > 1) list.add(it)}）：
+     * 只隐藏 NONE(0) 与 MIN(1)，LOW(2) 及以上照常显示。
+     * 早期误写成 2 会连 LOW 一起藏掉，比 HyperCeiler 更激进。
+     */
+    private static final int IMPORTANCE_MIN = 1;
 
     private void installLowImportanceFilterHook(Class<?> target, String label) {
         try {
@@ -553,7 +560,7 @@ public class MainHook extends XposedModule {
         int dropped = 0;
         for (Object item : list) {
             int importance = importanceOf(item);
-            if (importance >= 0 && importance <= IMPORTANCE_LOW) {
+            if (importance >= 0 && importance <= IMPORTANCE_MIN) {
                 dropped++;
                 continue;
             }
@@ -2432,8 +2439,8 @@ public class MainHook extends XposedModule {
             if (dotMode < 0) {
                 dotMode = 0;
             }
-            if (dotMode > 2) {
-                dotMode = 2;
+            if (dotMode > 3) {
+                dotMode = 3;
             }
             sStatusIconDotMode.set(dotMode);
             // 开关变化后立即尝试应用（内部会自己判断前置条件）

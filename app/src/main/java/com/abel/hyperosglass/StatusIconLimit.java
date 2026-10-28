@@ -44,6 +44,7 @@ public final class StatusIconLimit {
     public static final int DOT_MODE_SYSTEM = 0; // 系统默认：原生固定 3 点，不干预
     public static final int DOT_MODE_MULTI = 1;  // 按隐藏图标数量画 1~3 个点
     public static final int DOT_MODE_NONE = 2;   // 完全不画点
+    public static final int DOT_MODE_ONE = 3;    // 溢出时固定只画 1 个点
 
     /** AOSP / MIUI 两套可能的类名，按序尝试，命中第一个可加载的。 */
     private static final String[] CONTAINER_CLASSES = {
@@ -273,13 +274,14 @@ public final class StatusIconLimit {
                                     setFloatField(view, "mDotAppearAmount", origDot);
                                 }
                             }
-                            if (mode == DOT_MODE_MULTI) {
+                            if (mode == DOT_MODE_MULTI || mode == DOT_MODE_ONE) {
                                 Canvas canvas = null;
                                 Object arg = chain.getArg(0);
                                 if (arg instanceof Canvas) {
                                     canvas = (Canvas) arg;
                                 }
-                                drawDots(view, canvas);
+                                // DOT_MODE_ONE：溢出时固定只画 1 个点
+                                drawDots(view, canvas, mode == DOT_MODE_ONE ? 1 : 0);
                             }
                             // DOT_MODE_NONE：什么都不补画（原生点已被压没）
                             return r;
@@ -400,7 +402,10 @@ public final class StatusIconLimit {
      * 仅在「父容器是 NotificationIconContainer、且本图标就是溢出点（mFirstOverflowIndex、
      * mVisibleState==1、mDotAppearAmount>0）」时生效，其余图标一律不动。
      */
-    private static void drawDots(View view, Canvas canvas) {
+    /**
+     * @param fixedCount 0 = 按隐藏数量决定点数（1~3）；&gt;0 = 固定该数量
+     */
+    private static void drawDots(View view, Canvas canvas, int fixedCount) {
         if (canvas == null) return;
         ViewGroup parent = view.getParent() instanceof ViewGroup ? (ViewGroup) view.getParent() : null;
         if (parent == null) return;
@@ -431,7 +436,12 @@ public final class StatusIconLimit {
                 ? Math.min(first, maxIcons) : first;
         int count = childCount - effFirst;
         if (count < 1) count = 1;
-        if (count > 3) count = 3;
+        if (fixedCount > 0) {
+            // 固定点数模式：溢出多少都只画这么多个
+            count = fixedCount;
+        } else if (count > 3) {
+            count = 3;
+        }
 
         float alpha = (Color.alpha(color) / 255f) *
                 (progress <= 1f ? 1f : Math.max(0f, 2f - progress));

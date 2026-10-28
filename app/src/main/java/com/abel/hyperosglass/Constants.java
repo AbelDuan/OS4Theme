@@ -399,6 +399,7 @@ public final class Constants {
      *   0 = 系统默认（原生固定 3 点，不干预）
      *   1 = 按隐藏图标数量画 1~3 个点（移植自 HyperRefine 的 multiDot）
      *   2 = 完全不画点（无论超多少图标都不显示小点）
+     *   3 = 溢出时固定只画 1 个点
      */
     public static final String PREFS_STATUS_ICON_DOT_MODE = "status_icon_dot_mode";
     /** Model 侧 Bundle 回传用的 key（int 通道，与上面同名便于排查） */

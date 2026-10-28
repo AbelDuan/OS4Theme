@@ -556,6 +556,25 @@ public final class RotationHint {
      *
      * @return 锁定中返回 true；读不到时返回 true（宁可显示，不让功能整体失效）
      */
+    /**
+     * 锁屏是否正在显示（含亮屏未解锁）。
+     *
+     * <p>优先用 KeyguardManager.isKeyguardLocked()：它在「锁屏已亮屏、用户还没解锁」时
+     * 返回 true，正好是旋钮不该出现的时机。拿不到时退化为 false（保持原行为）。
+     */
+    private static boolean isKeyguardShowing(Context ctx) {
+        if (ctx == null) {
+            return false;
+        }
+        try {
+            android.app.KeyguardManager km = (android.app.KeyguardManager)
+                    ctx.getSystemService(Context.KEYGUARD_SERVICE);
+            return km != null && km.isKeyguardLocked();
+        } catch (Throwable th) {
+            return false;
+        }
+    }
+
     private static boolean isRotationLocked(Context ctx) {
         try {
             android.content.ContentResolver cr = ctx.getContentResolver();
@@ -582,6 +601,13 @@ public final class RotationHint {
         // 支持自动旋转（锁已关闭）时不提示：屏幕会自己转，不需要用户点
         if (!isRotationLocked(ctx)) {
             LogUtil.logAlways("[旋转提示] 旋转锁未开启，不显示提示");
+            return;
+        }
+        // 锁屏界面不显示旋钮：用户在锁屏上不需要转屏建议，
+        // 而且旋钮会盖住锁屏内容。解锁后状态重算会重新弹出来。
+        if (isKeyguardShowing(ctx)) {
+            LogUtil.logAlways("[旋转提示] 锁屏界面，不显示旋钮");
+            hideButtonNow();
             return;
         }
         int corner = RotationButtonOverlay.cornerFor(targetRotation, current);

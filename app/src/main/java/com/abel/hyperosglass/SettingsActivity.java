@@ -570,11 +570,11 @@ public class SettingsActivity extends Activity {
      * 状态栏「溢出圆点模式」滑杆（0/1/2）。
      *
      * <p>0 = 系统默认（原生固定 3 点）；1 = 按隐藏图标数量画 1~3 点；
-     * 2 = 完全不画点（无论超多少图标都不显示小点）。
+     * 2 = 完全不画点；3 = 溢出时固定只画 1 个点。
      */
     private void addStatusIconDotSlider(LinearLayout linearLayout) {
         final int min = 0;
-        final int max = 2;
+        final int max = 3;
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(1);
         row.setPadding(0, dp(6), 0, dp(6));
@@ -621,6 +621,8 @@ public class SettingsActivity extends Activity {
                 return "按隐藏数量（1~3 点）";
             case 2:
                 return "完全隐藏（不显示小点）";
+            case 3:
+                return "固定 1 点";
             default:
                 return "系统默认（固定 3 点）";
         }
