@@ -472,14 +472,17 @@ public class MainHook extends XposedModule {
 
     /** 状态栏通知图标「数量上限 + 溢出圆点」控制（v3.45.x，移植自 HyperRefine）。 */
     private void installStatusIconLimitHooks(ClassLoader classLoader) {
+        LogUtil.logAlways("[诊断] >>> 进入 installStatusIconLimitHooks");
         try {
             StatusIconLimit.install(this, classLoader);
             LogUtil.logAlways("[诊断] 状态栏通知图标 hooks 安装返回");
         } catch (Throwable th) {
             LogUtil.logAlways("[状态栏图标] 挂载失败: " + th);
         }
+        LogUtil.logAlways("[诊断] >>> 即将 NotifIconBlock.install");
         try {
             NotifIconBlock.install(this, classLoader);
+            LogUtil.logAlways("[诊断] NotifIconBlock 安装返回");
         } catch (Throwable th) {
             LogUtil.logAlways("[图标屏蔽] 挂载失败: " + th);
         }

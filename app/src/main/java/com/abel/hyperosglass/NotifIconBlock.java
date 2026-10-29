@@ -35,6 +35,7 @@ public final class NotifIconBlock {
         }
         LogUtil.logAlways("[图标屏蔽] 开始安装，类=" + cls.getName());
         installNotifCollectionCache(module, cl);
+        installRenderListFilter(module, cl);
         try {
             int ctors = 0;
             for (Constructor<?> ctor : cls.getDeclaredConstructors()) {
@@ -179,8 +180,8 @@ public final class NotifIconBlock {
      * 这里清掉缓存再逐个重判，低→中能恢复、中→低能立即藏。
      */
     public static void reapplyAll() {
-        sImportance.clear();
-        sChannel.clear();
+        // 只清渠道缓存（用户在设置里改了重要性时要重查），不清 sImportance：
+        // 那是从 Ranking 拿到的权威值，清掉后一旦重查失败就会退化成 -1。
         java.util.List<View> snapshot;
         synchronized (sViews) {
             snapshot = new java.util.ArrayList<>(sViews.keySet());
@@ -197,28 +198,238 @@ public final class NotifIconBlock {
                 if (raw instanceof StatusBarNotification) {
                     sbn = (StatusBarNotification) raw;
                 }
-                int imp = sbn == null ? -1 : importanceOf(v, sbn);
-                boolean hide = imp >= 0 && imp <= IMPORTANCE_MIN;
-                setHidden(v, hide);
-                // [诊断] 确认这个 View 是否真的是状态栏在用的那一个（防误判 ancora）。
-                if (hide && sbn != null) {
-                    String key = sbn.getKey();
-                    if (key != null && key.contains(DBG_PKG)) {
-                        View parent = (View) v.getParent();
-                        LogUtil.logAlways("[诊断V] key=" + key + " 可见=" + v.getVisibility()
-                                + " blocked=" + isBlocked(v)
-                                + " 父=" + (parent == null ? "null" : parent.getClass().getSimpleName())
-                                + " 父子数=" + (parent == null ? -1 : ((android.view.ViewGroup) parent).getChildCount())
-                                + " 宽高=" + v.getWidth() + "x" + v.getHeight()
-                                + " 位置=" + v.getLeft() + "," + v.getTop());
-                    }
+                if (sbn == null) {
+                    // 拿不到通知对象：保持原状，不要恢复（恢复才是「全部失效」的元凶）
+                    continue;
                 }
-                if (!hide && sbn != null) {
+                int imp = importanceOf(v, sbn);
+                if (imp < 0) {
+                    // 查不到重要性：保持原状。绝不能用 -1 去「恢复」，
+                    // 否则一次缓存未命中就会把已隐藏的图标全部放出来。
+                    continue;
+                }
+                boolean hide = imp <= IMPORTANCE_MIN;
+                setHidden(v, hide);
+                if (!hide) {
                     LogUtil.logAlwaysOnce("icon-restore-" + sbn.getKey(),
                             "[图标屏蔽] 已恢复 statusbar icon key=" + sbn.getKey());
                 }
             } catch (Throwable ignored) {
             }
+        }
+    }
+
+    /**
+     * 挂 {@code StatusIconContainer.onMeasure}：让它每次都按<b>当前</b>重要性算 block。
+     *
+     * <p>为什么非要这一层：{@code mBlocked} 会被系统反复改写 ——
+     * <pre>
+     *   StatusBarIconControllerImpl.refreshIconGroup(IconManager)
+     *     遍历 mGroup 每个子 View，末尾无条件 setBlocked(showList.contains(slot))
+     * </pre>
+     * 通知图标的 slot 是通知 key，永远不在用户配置的 show 列表里，
+     * 于是系统算出来的值与我们的判断相互覆盖，表现就是「一会儿藏一会儿全冒出来」
+     * 以及「藏了但那一格还占着宽度」。
+     *
+     * <p>这里不与系统抢：只在<b>测量前</b>把每个图标的 blocked 校正成
+     * {@code importance <= IMPORTANCE_MIN}。系统自己的 onMeasure 读到
+     * {@code isIconBlocked()} 就不会把这一格计入 {@code mMeasureViews}，
+     * 宽度自然不给它，后面图标紧凑跟上，不留空位。
+     */
+    private static String stackOf(Throwable th) {
+        java.io.StringWriter sw = new java.io.StringWriter();
+        th.printStackTrace(new java.io.PrintWriter(sw));
+        String all = sw.toString();
+        return all.length() > 800 ? all.substring(0, 800) : all;
+    }
+
+    private static void installContainerMeasureHook(final io.github.libxposed.api.XposedModule module,
+                                                    ClassLoader cl) {
+        try {
+            Class<?> c = Class.forName("com.android.systemui.statusbar.phone.StatusIconContainer", false, cl);
+            java.lang.reflect.Method m = null;
+            for (java.lang.reflect.Method cand : c.getDeclaredMethods()) {
+                if ("onMeasure".equals(cand.getName())
+                        && cand.getParameterCount() == 2
+                        && cand.getParameterTypes()[0] == int.class) {
+                    m = cand;
+                    break;
+                }
+            }
+            if (m == null) {
+                LogUtil.logAlways("[图标屏蔽] 找不到 StatusIconContainer.onMeasure");
+                return;
+            }
+            m.setAccessible(true);
+            module.hook(m)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("status-icon-container-onMeasure")
+                    .intercept(new XposedInterface.Hooker() {
+                        @Override
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            Object self = chain.getThisObject();
+                            if (self instanceof android.view.ViewGroup) {
+                                syncChildren((android.view.ViewGroup) self);
+                            }
+                            return chain.proceed();
+                        }
+                    });
+            LogUtil.logAlways("[图标屏蔽] 已挂钩 StatusIconContainer.onMeasure");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[图标屏蔽] 挂钩容器失败: " + th);
+            LogUtil.logAlways("[图标屏蔽] 失败详情: " + stackOf(th));
+        }
+    }
+
+    /** 测量前把容器里每个通知图标的 blocked 校正成当前重要性对应的值。 */
+    private static void syncChildren(android.view.ViewGroup group) {
+        if (!MainHook.sNotifImportanceFlag.get()) {
+            return;
+        }
+        int n = group.getChildCount();
+        long now = android.os.SystemClock.elapsedRealtime();
+        boolean dump = now - sLastDump > 3000;
+        if (dump) {
+            sLastDump = now;
+        }
+        StringBuilder sb = dump ? new StringBuilder("[容器] n=" + n) : null;
+        for (int i = 0; i < n; i++) {
+            View child = group.getChildAt(i);
+            if (child == null) {
+                continue;
+            }
+            boolean isIcon = "StatusBarIconView".equals(child.getClass().getSimpleName());
+            if (isIcon) {
+                try {
+                    java.lang.reflect.Field nf = fieldOf(child.getClass(), "mNotification");
+                    Object raw = nf == null ? null : nf.get(child);
+                    if (raw instanceof StatusBarNotification) {
+                        StatusBarNotification sbn = (StatusBarNotification) raw;
+                        sViews.put(child, Boolean.TRUE);
+                        int imp = importanceOf(child, sbn);
+                        if (imp >= 0) {
+                            setHidden(child, imp <= IMPORTANCE_MIN);
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+            if (sb != null) {
+                String blk = "?";
+                try {
+                    java.lang.reflect.Method ib = child.getClass().getMethod("isIconBlocked");
+                    ib.setAccessible(true);
+                    blk = String.valueOf(ib.invoke(child));
+                } catch (Throwable ignored) {
+                }
+                sb.append(" |").append(child.getClass().getSimpleName().replace("View", ""))
+                        .append(",v").append(child.getVisibility())
+                        .append(",b").append(blk)
+                        .append(",w").append(child.getWidth());
+            }
+        }
+        if (sb != null) {
+            LogUtil.logAlways(sb.toString());
+        }
+    }
+
+    /**
+     * 完全照 HyperCeiler 的 NotificationImportanceHyperOSFix 实现。
+     *
+     * <p>源码（Kotlin）：
+     * <pre>
+     *   loadClass("...StackCoordinator$attach$1").beforeHookMethod("onAfterRenderList") { param ->
+     *       val entries = param.args[0] as List&lt;*&gt;
+     *       val keep = ArrayList&lt;Any&gt;()
+     *       entries.forEach {
+     *           val imp = it.getRepresentativeEntry().mRanking.getImportance() as Int
+     *           if (imp &gt; 1) keep.add(it)
+     *       }
+     *       if (keep.size != entries.size) param.args[0] = keep
+     *   }
+     * </pre>
+     *
+     * <p>要点：<b>beforeHook + 替换 param.args[0]</b>，绝不在原列表上 clear/addAll
+     * （传入的是 {@code Collections$UnmodifiableRandomAccessList}，原地改会抛
+     * {@link UnsupportedOperationException}）。下游 {@code setRenderedList(list)}
+     * 拿到的就是过滤后的列表。
+     */
+    private static void installRenderListFilter(final io.github.libxposed.api.XposedModule module,
+                                                 ClassLoader cl) {
+        try {
+            final Class<?> cls = Class.forName(
+                    "com.android.systemui.statusbar.notification.collection.coordinator.StackCoordinator$attach$1",
+                    false, cl);
+            java.lang.reflect.Method target = null;
+            for (java.lang.reflect.Method cand : cls.getDeclaredMethods()) {
+                if ("onAfterRenderList".equals(cand.getName()) && cand.getParameterCount() == 1) {
+                    target = cand;
+                    break;
+                }
+            }
+            if (target == null) {
+                LogUtil.logAlways("[图标屏蔽] 找不到 StackCoordinator$attach$1.onAfterRenderList");
+                return;
+            }
+            target.setAccessible(true);
+            module.hook(target)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("render-list-filter")
+                    .intercept(new XposedInterface.Hooker() {
+                        @Override
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            if (MainHook.sNotifImportanceFlag.get()) {
+                                try {
+                                    Object arg = chain.getArg(0);
+                                    if (arg instanceof java.util.List) {
+                                        java.util.List<?> src = (java.util.List<?>) arg;
+                                        java.util.ArrayList<Object> keep = new java.util.ArrayList<>(src.size());
+                                        for (Object e : src) {
+                                            if (e != null && importanceOfEntry(e) > IMPORTANCE_MIN) {
+                                                keep.add(e);
+                                            }
+                                        }
+                                        if (keep.size() != src.size()) {
+                                            LogUtil.logAlways("[过滤] 渲染列表 "
+                                                    + src.size() + " → " + keep.size());
+                                            return chain.proceedWith(chain.getThisObject(), new Object[]{keep});
+                                        }
+                                    }
+                                } catch (Throwable th) {
+                                    LogUtil.logAlways("[过滤] 异常: " + th);
+                                }
+                            }
+                            return chain.proceed();
+                        }
+                    });
+            LogUtil.logAlways("[图标屏蔽] 已挂钩 StackCoordinator$attach$1.onAfterRenderList（照抄 HyperCeiler）");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[图标屏蔽] 挂钩渲染列表失败: " + th);
+        }
+    }
+
+    /** 从 ListEntry/NotificationEntry 里读 ranking importance；读不到返回 -1。 */
+    private static int importanceOfEntry(Object entry) {
+        try {
+            Object e = entry;
+            // GroupEntry 要先取 representative；NotificationEntry 自身也有该方法
+            try {
+                java.lang.reflect.Method gr = e.getClass().getMethod("getRepresentativeEntry");
+                Object rep = gr.invoke(e);
+                if (rep != null) {
+                    e = rep;
+                }
+            } catch (Throwable ignored) {
+            }
+            java.lang.reflect.Field rf = fieldOf(e.getClass(), "mRanking");
+            Object ranking = rf == null ? null : rf.get(e);
+            if (ranking == null) {
+                return -1;
+            }
+            Object imp = ranking.getClass().getMethod("getImportance").invoke(ranking);
+            return imp instanceof Integer ? (Integer) imp : -1;
+        } catch (Throwable ignored) {
+            return -1;
         }
     }
 
@@ -255,20 +466,8 @@ public final class NotifIconBlock {
 
     private static java.lang.reflect.Method sSetBlocked;
 
-    /** [诊断] 只打印这个包的图标详情。 */
-    private static final String DBG_PKG = "taskerm";
-
-    /** [诊断] 读当前 blocked 状态。 */
-    private static boolean isBlocked(View v) {
-        try {
-            java.lang.reflect.Method m = v.getClass().getMethod("isIconBlocked");
-            m.setAccessible(true);
-            Object r = m.invoke(v);
-            return r instanceof Boolean && (Boolean) r;
-        } catch (Throwable th) {
-            return false;
-        }
-    }
+    /** [诊断] 上次打印容器子 View 的时间。 */
+    private static long sLastDump = 0L;
 
     private static void apply(XposedInterface.Chain chain, View view, StatusBarNotification sbn) {
         if (!MainHook.sNotifImportanceFlag.get()) {
