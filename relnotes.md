@@ -9,15 +9,21 @@
 外屏上大量应用在清单里把 `screenOrientation` 写死成 `portrait`，于是用户旋转永远被应用盖掉 ——
 点击旋钮看起来完全没反应（日志里 freezeRotation 还是「成功」的，所以特别迷惑）。
 
-**做法**：新增 `OrientationForcer`，把「锁定方向」升级成「强制方向」，自适应分三级：
+**做法**：新增 `OrientationForcer`，把「锁定方向」升级成「强制方向」。本机逐条实测过两条系统开关：
+- `wm set-ignore-orientation-request true`（`setIgnoreOrientationRequest`）**是空转**：
+  命令返回成功、`get` 也读得到 true，但「强制竖屏窗口 + 用户旋转锁到 1」实测仍是 0
+  （WMS 里被 `config_ignoreOrientationRequest` 挡着）；
+- `wm fixed-to-user-rotation enabled`（`setFixedToUserRotation(displayId, 2)`）**真正生效**：
+  同一个窗口立刻 0 → 1，关掉又回 0。
+
+所以按「前一级验证失败才升级」做三级自适应：
 1. 先按老路径 `setRotationLockForFold(true, target, isFold) + freezeRotation(target)` 锁方向 ——
    对本身支持该方向的应用，一步就够，全局开关都不碰；
-2. 700ms 后校验屏幕是否真的转过去了。没转 → 说明应用锁死了方向 →
-   打开 `IWindowManager#setIgnoreOrientationRequest(displayId, true)`，
-   即系统命令 `wm set-ignore-orientation-request` 背后的那个开关，
-   让 WMS 计算方向时**不再看应用请求**，再锁一次；
-3. 还不转 → `thawRotation + freezeRotation` 顶一下，逼 WMS 重算一次方向
-   （有些 ROM 只在「用户旋转值变化」时才走 updateOrientation）。
+2. 700ms 后校验屏幕有没有真的转过去。没转 → 说明应用锁死了方向 →
+   打开 **`fixed-to-user-rotation`**（`DisplayContent#mFixedToUserRotation`，打开期间
+   WMS 算方向只认用户旋转/传感器），再锁一次；
+3. 仍不行 → 再打开 `ignore-orientation-request`，并用 `thawRotation + freezeRotation`
+   顶一下（有些 ROM 只在「用户旋转值变化」时才走 updateOrientation）。
 
 **边界处理**（全局开关不能常开，否则相机这类自己管方向的应用会乱）：
 - 只在「点旋钮」到「离开该应用」之间保持；前台包名连续两次（≈2.4s）变化才释放，
