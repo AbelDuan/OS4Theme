@@ -470,14 +470,36 @@ public final class RotationHint {
     /**
      * 点击旋钮：把屏幕转到传感器当前朝向。
      *
-     * <p>用的还是系统的旋转锁定接口 {@code freezeRotation(rotation, packageName)}，
-     * 不写任何 Settings 值，符合「只用系统开关」的约束。
+     * <h2>v3.292.0 起：强制旋转</h2>
+     * 原来这里只调 {@code freezeRotation(rotation, pkg)}。它改的是「用户旋转」，
+     * 而 WMS 决定方向时的优先级是
+     * <b>应用请求的固定方向 &gt; 用户旋转/旋转锁</b> —— 外屏上大量应用把
+     * {@code screenOrientation} 写死成竖屏，于是「点旋钮没任何反应」。
+     *
+     * <p>现在改为交给 {@link OrientationForcer}：先按老办法锁方向，
+     * 700ms 后如果屏幕没转过去，就让 WMS **忽略应用的固定方向请求**
+     * （{@code IWindowManager#setIgnoreOrientationRequest}，即系统
+     * {@code wm set-ignore-orientation-request} 背后的接口），再锁一次，
+     * 真正把应用强制转过去（必要时由系统加黑边）。
+     *
+     * <p>开关 {@link MainHook#sForceRotateEnable} 关掉时退回老行为。
      */
     private static void applyRotationSuggestion() {
         final int target = sSensorTargetRotation;
         if (target < 0) {
+            // ⚠️ 以前这里直接 return，用户看到的就是「点了没反应」且没有任何日志。
+            LogUtil.logAlways("[旋转提示] 点击失败：还没有传感器方向（target=-1）");
+            hideButtonNow();
             return;
         }
+        final Context ctx = sContext;
+        hideButtonNow();
+        if (MainHook.sForceRotateEnable.get() && ctx != null
+                && OrientationForcer.force(ctx, target, "点击旋钮")) {
+            LogUtil.logAlways("[旋转提示] 已请求强制旋转 → rotation=" + target);
+            return;
+        }
+        // 老路径 / 兜底：只锁方向
         try {
             Object wm = MainHook.getWindowManagerServicePublic();
             if (wm == null) {
@@ -489,7 +511,6 @@ public final class RotationHint {
             m.setAccessible(true);
             m.invoke(wm, target, "HyperOSGlass");
             LogUtil.logAlways("[旋转提示] 已接受旋转建议，转到 rotation=" + target);
-            hideButtonNow();
         } catch (Throwable th) {
             LogUtil.logAlways("[旋转提示] 点击旋转失败: " + th);
         }
@@ -593,15 +614,69 @@ public final class RotationHint {
         }
     }
 
+    /**
+     * 「自动旋转开着，但应用拒绝跟着转」时，旋钮延迟多久才出现（毫秒）。
+     *
+     * <p>留这么长是为了兜住正常转屏的耗时（系统从收到方向变化到真正转完
+     * 一般 200~500ms）。只有超过这个时间屏幕仍没动，才认定是应用锁死了方向。
+     */
+    private static final long FORCE_HINT_DELAY_MS = 800L;
+
+    /** 延迟判定任务（自动旋转场景专用；保持单例，避免被反复 post）。 */
+    private static volatile Runnable sForceHintTask;
+
+    /**
+     * 自动旋转开着时，是否该把旋钮弹出来（= 应用拒绝旋转）。
+     *
+     * <p>判定依据：传感器方向已经稳定超过 {@link #FORCE_HINT_DELAY_MS}。
+     * 没到点就先挂一个延时任务到点再重算，返回 false 让调用方这次先不显示。
+     */
+    private static boolean allowHintWhileUnlocked(Context ctx) {
+        if (!MainHook.sForceRotateEnable.get()) {
+            return false;
+        }
+        long age = android.os.SystemClock.uptimeMillis() - sStableSince;
+        if (age < FORCE_HINT_DELAY_MS) {
+            scheduleForceHint(FORCE_HINT_DELAY_MS - age + 30L);
+            return false;
+        }
+        return true;
+    }
+
+    /** 到点后重新走一遍完整判定（方向盘稳了再说）。 */
+    private static void scheduleForceHint(long delay) {
+        Runnable prev = sForceHintTask;
+        if (prev != null) {
+            sMain.removeCallbacks(prev);
+            sForceHintTask = null;
+        }
+        Runnable r = new Runnable() {
+            @Override
+            public void run() {
+                sForceHintTask = null;
+                reconcileRotationHint("自动旋转下的延迟判定");
+            }
+        };
+        sForceHintTask = r;
+        sMain.postDelayed(r, delay);
+    }
+
     private static void showNow(int targetRotation, int current) {
         Context ctx = sContext;
         if (ctx == null) {
             return;
         }
-        // 支持自动旋转（锁已关闭）时不提示：屏幕会自己转，不需要用户点
+        // 支持自动旋转（锁已关闭）时一般不需要提示：屏幕会自己转。
+        // 🔑 v3.292.0：但如果「强制旋转」开着，而方向早就变了屏幕却没跟着转，
+        //   说明**应用把方向锁死了**（外屏上非常常见）—— 这时把旋钮弹出来，
+        //   让用户有一个手动强制的入口。用 FORCE_HINT_DELAY_MS 兜住正常转屏的耗时，
+        //   避免应用只是慢一点也跟着弹。
         if (!isRotationLocked(ctx)) {
-            LogUtil.logAlways("[旋转提示] 旋转锁未开启，不显示提示");
-            return;
+            if (!allowHintWhileUnlocked(ctx)) {
+                LogUtil.logAlways("[旋转提示] 旋转锁未开启（或仍在等应用自己转），不显示提示");
+                return;
+            }
+            LogUtil.logAlways("[旋转提示] 自动旋转开着但应用没跟着转 → 弹出旋钮（可点击强制）");
         }
         // 锁屏界面不显示旋钮：用户在锁屏上不需要转屏建议，
         // 而且旋钮会盖住锁屏内容。解锁后状态重算会重新弹出来。
@@ -758,6 +833,9 @@ public final class RotationHint {
             if (ctx == null) {
                 return;
             }
+            // v3.292.0：拿到 Context 后清一次可能残留的「忽略应用方向请求」
+            // （SystemUI 被重启时，WMS 里那个全局开关不会跟着复位）
+            OrientationForcer.clearStale(ctx);
             int screen = currentSurfaceRotation(ctx);
             int sensor = sSensorTargetRotation;
             if (screen < 0) {
@@ -771,11 +849,14 @@ public final class RotationHint {
                 return;
             }
             if (!isRotationLocked(ctx)) {
-                if (sShownFor >= 0) {
-                    LogUtil.logAlways("[旋转提示] " + reason + "：旋转锁未开启，收起");
-                    hideButtonNow();
+                if (!allowHintWhileUnlocked(ctx)) {
+                    if (sShownFor >= 0) {
+                        LogUtil.logAlways("[旋转提示] " + reason + "：旋转锁未开启，收起");
+                        hideButtonNow();
+                    }
+                    return;
                 }
-                return;
+                // 落到下面继续判定：方向确实不一致就弹旋钮（点击即强制）
             }
             if (sensor == screen) {
                 if (sShownFor >= 0) {
@@ -2059,6 +2140,9 @@ public final class RotationHint {
             // ⚡ 同时注销传感器：功能关掉后没有任何理由让它继续 60Hz 上报
             unregisterSensor();
             hideButtonNow();
+            // v3.292.0：关掉旋钮就等于关掉「强制」入口，全局的
+            // 「忽略应用方向请求」也必须一起还回去，否则别的应用会莫名其妙跟着转
+            OrientationForcer.release("旋转提示已关闭");
             return;
         }
         // 开关刚打开时补一次判定：可能此时方向早就和屏幕不一致了

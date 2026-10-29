@@ -103,6 +103,13 @@ public class MainHook extends XposedModule {
     /** 内屏固定横屏（摄像头右上角）开关。 */
     /** 展开时联动自动旋转（3 秒跟随后锁定）。 */
     public static final AtomicBoolean sInnerFollowRotation = new AtomicBoolean(false);
+    /**
+     * 点击旋钮 = 强制旋转（v3.292.0，用户 2026-10-29 要求）。
+     *
+     * <p>开启后：点旋钮时让 WMS 忽略应用的固定方向请求，并且「自动旋转开着
+     * 但应用拒绝跟随」时也会把旋钮弹出来。详见 {@link OrientationForcer}。
+     */
+    public static final AtomicBoolean sForceRotateEnable = new AtomicBoolean(true);
     /** 内屏联动的延时任务调度器（独立线程，不打扰主线程）。 */
     private static final android.os.Handler sInnerHandler =
             new android.os.Handler(android.os.Looper.getMainLooper());
@@ -2325,6 +2332,15 @@ public class MainHook extends XposedModule {
                     Constants.DEFAULT_ROTATION_HINT));
             sInnerFollowRotation.set(bundle.getBoolean(Constants.PREFS_INNER_FOLLOW_ROTATION,
                     Constants.DEFAULT_INNER_FOLLOW_ROTATION));
+            // 点击旋钮=强制旋转（v3.292.0）：默认开启；用户手动关过就以配置为准
+            boolean forceRotate = bundle.getBoolean(Constants.PREFS_FORCE_ROTATE,
+                    Constants.DEFAULT_FORCE_ROTATE);
+            sForceRotateEnable.set(forceRotate);
+            // ⚠️ 关掉时必须立刻把 WMS 的「忽略应用方向请求」还回去，
+            //    否则强制状态会一直残留到下次熄屏 —— 别的应用会莫名其妙跟着转。
+            if (!forceRotate || !sRotationHintEnable.get()) {
+                OrientationForcer.release(forceRotate ? "旋转提示已关闭" : "强制旋转开关已关闭");
+            }
             // 状态栏通知图标上限 + 溢出圆点（v3.45.x）：开关走 boolean 体系，
             // 数量与模式是连续值，走单独 int 通道
             sStatusIconLimitEnable.set(bundle.getBoolean(Constants.PREFS_STATUS_ICON_LIMIT_ENABLE,

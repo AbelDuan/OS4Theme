@@ -373,10 +373,14 @@ public class SettingsActivity extends Activity {
         LinearLayout linearLayoutRotationHint = newCard();
         addSectionTitle(linearLayoutRotationHint, "旋转提示",
                 "锁定屏幕方向时，如果手机被转动到了与当前画面不一致的方向，\n"
-                        + "弹出系统原生的手动旋转按钮（安卓自带的那一个）。\n"
-                        + "仅在「自动旋转」关闭时生效 —— 开着时系统会自己转。");
+                        + "弹出旋转按钮；点击即把屏幕转到你手持的方向。\n"
+                        + "「点击旋钮强制旋转」开启后，即使应用自己在清单里锁死了方向\n"
+                        + "也会被强制转过去（必要时由系统加黑边），\n"
+                        + "并且在「自动旋转」开着但应用不跟随旋转时也会弹出旋钮。");
         addSwitch(linearLayoutRotationHint, "方向不一致时提示旋转",
                 Constants.PREFS_ROTATION_HINT, Constants.DEFAULT_ROTATION_HINT);
+        addSwitch(linearLayoutRotationHint, "点击旋钮强制旋转",
+                Constants.PREFS_FORCE_ROTATE, Constants.DEFAULT_FORCE_ROTATE);
         addSwitch(linearLayoutRotationHint, "展开时联动自动旋转（跟随 5 秒后锁定）",
                 Constants.PREFS_INNER_FOLLOW_ROTATION,
                 Constants.DEFAULT_INNER_FOLLOW_ROTATION);

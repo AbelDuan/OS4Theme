@@ -131,7 +131,7 @@ public final class Constants {
     public static final String TARGET_PLUGIN_PKG = "miui.systemui.plugin";
     // 日志里打印的模块版本号。⚠️ 必须和 app/build.gradle 的 versionName 一致，
     // 否则排查时会被日志骗（2026-10-25 就发生过：跑的是 3.283.3，日志写 3.41.2）。
-    public static final String VERSION = "3.291.0";
+    public static final String VERSION = "3.292.0";
 
     // ============================================================
     // 通知宽度调节（v3.41.2 新增）
@@ -223,6 +223,26 @@ public final class Constants {
     public static final String PREFS_INNER_FOLLOW_ROTATION = "inner_follow_rotation";
     /** ★ v3.283.0：默认改为**开启**，与当前在用的设备配置保持一致。 */
     public static final boolean DEFAULT_INNER_FOLLOW_ROTATION = true;
+
+    /**
+     * 点击旋钮 = 强制旋转（v3.292.0，用户 2026-10-29 要求）。
+     *
+     * <p>背景：外屏（以及内屏）上有大量应用在清单里把 {@code screenOrientation}
+     * 写死成竖屏，WMS 会以「应用请求的方向」为准，我们点旋钮时只调
+     * {@code freezeRotation()} 改的是「用户旋转」，优先级低于应用请求 ——
+     * 于是点击没有任何反应。
+     *
+     * <p>开启后点旋钮会额外让 WMS **忽略应用的固定方向请求**
+     * （{@code IWindowManager#setIgnoreOrientationRequest}，就是
+     * {@code wm set-ignore-orientation-request} 那条系统命令背后的接口），
+     * 屏幕就一定会转到旋钮指示的方向，应用被强制旋转（必要时由系统加黑边）。
+     *
+     * <p>同时，当「自动旋转」开着、但应用拒绝跟随旋转时，也会把旋钮弹出来，
+     * 让用户有一个「手动强制」的入口（原来这种情况下旋钮是不出现的）。
+     */
+    public static final String PREFS_FORCE_ROTATE = "force_rotate";
+    /** ★ 默认**开启**（用户 2026-10-29 明确要求「点击旋钮即强制旋转」）。 */
+    public static final boolean DEFAULT_FORCE_ROTATE = true;
 
     /** 开启联动时，跟随传感器的时长（毫秒）。 */
     public static final long INNER_FOLLOW_DURATION_MS = 5000L;
@@ -433,12 +453,13 @@ public final class Constants {
 
     // ⚠️ 这两个数组必须**同序同长**：reloadPrefs 与 StatusProvider 都按下标一一对应取值。
     //    新增开关只能往**末尾追加**，不可插队（v3.41.2 追加了通知宽度总开关）。
-    public static final String[] ALL_PREF_KEYS = {PREFS_GLASS_ENABLED, PREFS_FOCUS_GLASS, PREFS_AOD_BATTERY_SYNC, PREFS_PIN_GLASS, PREFS_NO_FOLD_HISTORY, PREFS_SINK_ENABLED, PREFS_KEEP_NOTIF, PREFS_HIDE_BT_UNLOCK, PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_ALLOW_MANAGE_ALL, PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE, PREFS_ENABLE_LOG, PREFS_NOTIF_IMPORTANCE, PREFS_NOTIF_WIDTH_ENABLE, PREFS_ROTATION_HINT, PREFS_INNER_FOLLOW_ROTATION, PREFS_STATUS_ICON_LIMIT_ENABLE, PREFS_PREVENT_BATTERY_WHITELIST};
+    public static final String[] ALL_PREF_KEYS = {PREFS_GLASS_ENABLED, PREFS_FOCUS_GLASS, PREFS_AOD_BATTERY_SYNC, PREFS_PIN_GLASS, PREFS_NO_FOLD_HISTORY, PREFS_SINK_ENABLED, PREFS_KEEP_NOTIF, PREFS_HIDE_BT_UNLOCK, PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_ALLOW_MANAGE_ALL, PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE, PREFS_ENABLE_LOG, PREFS_NOTIF_IMPORTANCE, PREFS_NOTIF_WIDTH_ENABLE, PREFS_ROTATION_HINT, PREFS_INNER_FOLLOW_ROTATION, PREFS_STATUS_ICON_LIMIT_ENABLE, PREFS_PREVENT_BATTERY_WHITELIST, PREFS_FORCE_ROTATE};
     // ★ 2026-10-24：默认值按「当前在用的那台设备」的实际配置对齐（v3.283.0）。
     //   对齐项：notif_width_enable=true、rotation_hint_enable=true、inner_follow_rotation=true；
     //   同时修掉这里多出来的第 21 个元素——数组曾比 ALL_PREF_KEYS 长 1，
     //   虽然按下标取值不受影响，但违反了上面「同序同长」的约束，容易埋坑。
     // ★ 2026-10-29（v3.291.0）：末尾追加 prevent_battery_whitelist=true，
     //   与上一条同样遵守「同序同长」（现在两个数组都是 21 个元素）。
-    public static final boolean[] ALL_PREF_DEFAULTS = {true, true, true, true, true, false, true, true, true, true, true, false, true, true, false, true, true, true, true, true, true};
+    // ★ 2026-10-29（v3.292.0）：再追加 force_rotate=true（22 个元素，仍然同序同长）。
+    public static final boolean[] ALL_PREF_DEFAULTS = {true, true, true, true, true, false, true, true, true, true, true, false, true, true, false, true, true, true, true, true, true, true};
 }

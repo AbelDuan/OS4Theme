@@ -33,6 +33,8 @@
 
 11. **禁止恢复电池优化白名单**（v3.291.0）— 移植自 HyperCeiler：hook 省电服务的 `com.miui.powerkeeper.utils.CommonAdapter#addPowerSaveWhitelistApps(String[])`，只拦**批量写入**（数组长度 > 1，即系统定期/开机把名单回写），用户在「省电策略」里手动改「无限制」的单包写入照常放行。作用域因此新增 `com.miui.powerkeeper`（旧版升级需在 LSPosed 里手动勾选一次）。
 
+12. **旋钮点击 = 强制旋转**（v3.292.0）— 外屏上大量应用把 `screenOrientation` 写死成竖屏，WMS 以应用请求优先，`freezeRotation()` 只改「用户旋转」所以点了没反应。现在点旋钮先锁方向，700ms 没转过去就打开 `IWindowManager#setIgnoreOrientationRequest`（`wm set-ignore-orientation-request` 的接口）让 WMS 忽略应用请求，再锁一次；必要时 `thaw + freeze` 逼其重算。只在「该应用前台」期间保持，熄屏 / 切应用 / 关开关即释放。**自动旋转开着但应用不跟随**时也会弹出旋钮，点一下即可强制。
+
 ### 内置功能（无独立开关）
 
 8. **通知展开按钮白透** — 跟随「三方主题柔光玻璃」开关。把展开按钮的染色替换为白透药丸 / 清 tint，避免第三方主题把按钮染成深色。
