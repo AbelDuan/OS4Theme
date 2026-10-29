@@ -596,6 +596,44 @@ public final class RotationHint {
         }
     }
 
+    /**
+     * 外屏桌面（Launcher）包名。
+     *
+     * <p>HyperOS 桌面就是 {@code com.miui.home}；用前缀匹配兜住个别机型的别名包
+     * （{@code com.miui.home.launcher} 之类）。
+     */
+    private static final String LAUNCHER_PKG = "com.miui.home";
+
+    /** 当前是不是外屏（折叠态）。与 {@link #isRotationLocked} 用同一套判定。 */
+    private static boolean isOuterScreen(Context ctx) {
+        try {
+            int state = android.provider.Settings.Global.getInt(
+                    ctx.getContentResolver(), "current_device_state", -1);
+            return state != 3;
+        } catch (Throwable unused) {
+            return true;
+        }
+    }
+
+    /**
+     * 外屏桌面是否在前台。
+     *
+     * <p>外屏桌面不弹旋钮，理由和锁屏一样 —— 那个位置没有「转屏建议」的意义：
+     * <ul>
+     *   <li>外屏桌面只有一套竖屏布局，转了也没有额外内容；</li>
+     *   <li>旋钮正好压在图标 / 图标长按菜单上，误触代价高；</li>
+     *   <li>桌面本身会跟随自动旋转，方向不一致的时机极多，一转身就弹。</li>
+     * </ul>
+     * 判定失败（拿不到前台包名）时返回 false，保持原行为，不误伤应用内提示。
+     */
+    private static boolean isOuterLauncherForeground(Context ctx) {
+        if (ctx == null || !isOuterScreen(ctx)) {
+            return false;
+        }
+        String pkg = OrientationForcer.topPackage(ctx);
+        return pkg != null && (pkg.equals(LAUNCHER_PKG) || pkg.startsWith(LAUNCHER_PKG + "."));
+    }
+
     private static boolean isRotationLocked(Context ctx) {
         try {
             android.content.ContentResolver cr = ctx.getContentResolver();
@@ -664,6 +702,14 @@ public final class RotationHint {
     private static void showNow(int targetRotation, int current) {
         Context ctx = sContext;
         if (ctx == null) {
+            return;
+        }
+        // 🔑 v3.293.0：外屏桌面不弹旋钮 —— 与锁屏同等对待。
+        //   放在最前面，连「自动旋转下延迟判定」的调度都不进，
+        //   避免桌面上一转身就安排一次无意义的 reconcile。
+        if (isOuterLauncherForeground(ctx)) {
+            LogUtil.logAlways("[旋转提示] 外屏桌面，不显示旋钮");
+            hideButtonNow();
             return;
         }
         // 支持自动旋转（锁已关闭）时一般不需要提示：屏幕会自己转。
@@ -831,6 +877,15 @@ public final class RotationHint {
             }
             Context ctx = sContext;
             if (ctx == null) {
+                return;
+            }
+            // v3.293.0：外屏桌面（含「应用里旋钮正显示着，用户按 Home 回桌面」这种情况）
+            // 一律收起且不再弹，和锁屏同样是硬屏蔽。
+            if (isOuterLauncherForeground(ctx)) {
+                if (sShownFor >= 0) {
+                    LogUtil.logAlways("[旋转提示] " + reason + "：外屏桌面，收起旋钮");
+                    hideButtonNow();
+                }
                 return;
             }
             // v3.292.0：拿到 Context 后清一次可能残留的「忽略应用方向请求」

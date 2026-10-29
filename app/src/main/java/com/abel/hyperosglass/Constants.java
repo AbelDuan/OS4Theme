@@ -131,7 +131,7 @@ public final class Constants {
     public static final String TARGET_PLUGIN_PKG = "miui.systemui.plugin";
     // 日志里打印的模块版本号。⚠️ 必须和 app/build.gradle 的 versionName 一致，
     // 否则排查时会被日志骗（2026-10-25 就发生过：跑的是 3.283.3，日志写 3.41.2）。
-    public static final String VERSION = "3.292.0";
+    public static final String VERSION = "3.293.0";
 
     // ============================================================
     // 通知宽度调节（v3.41.2 新增）
