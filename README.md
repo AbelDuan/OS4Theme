@@ -12,7 +12,7 @@
 | --- | --- |
 | 系统 | 澎湃OS 4 / HyperOS 4（Android 17，API 37） |
 | 框架 | LSPosed（LibXposed 102，最低框架版本 100） |
-| 作用域 | `com.android.systemui`（系统界面） |
+| 作用域 | `com.android.systemui`（系统界面）、`com.android.settings`（设置）、`miui.systemui.plugin`（控制中心插件）、`com.miui.powerkeeper`（省电与电池） |
 | 安装 | 最低 `minSdk 33`（Android 13+ 可装），功能针对 HyperOS 4 验证 |
 | 权限 | 设备需 root（KernelSU / Magisk）以重启 SystemUI（设置内提供按钮） |
 
@@ -30,6 +30,8 @@
 10. **通知优先级 / 重要性**（v3.40）— 移植自 HyperCeiler：放开系统设置里被 MIUI 隐藏的「重要性」选项，并把改动写回通知通道（`NotificationChannel.setImportance` + `lockFields` + `NotificationBackend.updateChannel`）；同时在系统界面侧按 `Ranking.getImportance() <= 1` 过滤掉「已关闭 / 最低」的通知，让设置真正生效。作用域因此新增 `com.android.settings`。
 8. **手势导航白条**（v3.6）— 手势导航提示线（底部小白条）不可见，但底栏抬高与手势区照常保留：hook `NavigationHandle.onDraw` 与 `QuickswitchOrientedNavHandle.onDraw`（`com.android.systemui.navigationbar.gestural`），开启时直接跳过绘制 → 小白条不画，视图仍占位。
 9. **控制中心编辑**（v3.7 / 修复于 v3.8）— 下拉控制中心底栏的「编辑」按钮视觉隐藏，但点击区域与编辑入口保留：hook `miui.systemui.controlcenter.panel.main.qs.EditButtonController.onBindViewHolder`（位于 `MIUISystemUIPlugin` 插件 APK 的独立 ClassLoader，经 `PluginFactory.createClassLoader` 拿到插件 loader 后补挂）。`onBindViewHolder` 内已把编辑点击设到 `binding.touchContainer`（LinearLayout），故执行原绑定后对该 View `setAlpha(0f)`——alpha 只影响绘制、不改 `VISIBILITY` 标志位，View 仍是 `VISIBLE`、仍接收触摸事件，因此「完全透明但点击命中保留」（v3.7 初版误用 `INVISIBLE`，框架 `canViewReceivePointerEvents` 要求 `VISIBILITY==VISIBLE` 才派发触摸，导致按钮隐了但点不动，v3.8 修正），其余按钮不受影响。
+
+11. **禁止恢复电池优化白名单**（v3.291.0）— 移植自 HyperCeiler：hook 省电服务的 `com.miui.powerkeeper.utils.CommonAdapter#addPowerSaveWhitelistApps(String[])`，只拦**批量写入**（数组长度 > 1，即系统定期/开机把名单回写），用户在「省电策略」里手动改「无限制」的单包写入照常放行。作用域因此新增 `com.miui.powerkeeper`（旧版升级需在 LSPosed 里手动勾选一次）。
 
 ### 内置功能（无独立开关）
 

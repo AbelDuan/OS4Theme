@@ -1,3 +1,23 @@
+## v3.291.0 移植 HyperCeiler「禁止恢复电池优化白名单」（默认开）
+
+- 现象：在「设置 → 应用 → 省电策略」里把应用从「无限制」改成「优化 / 限制」，
+  过一阵（开机、插电、定期巡检）又被系统写回白名单 —— 省电服务拿自己存的名单批量回写。
+- HyperCeiler 的做法（`rules/powerkeeper/PreventBatteryWitelist.java`）：
+  hook `com.miui.powerkeeper.utils.CommonAdapter#addPowerSaveWhitelistApps(String[])`，
+  **数组长度 > 1 才 `setResult(null)`** 拦掉；长度 = 1（用户自己改「无限制」）放行。
+  早期版本写死类名反射挂钩，新版本改用 DexKit 按字符串常量 `addPowerSaveWhitelistApps: ` 定位。
+- 本模块（无 DexKit 依赖）分两级：
+  1. 直连 `com.miui.powerkeeper.utils.CommonAdapter` 的 `addPowerSaveWhitelistApps`（首参 `String[]`）；
+  2. 直连失败时，延迟 10s 在后台枚举本进程 dex 类名，找同名方法补挂（给改类名的版本留退路）。
+  开关判定在回调里实时读 `MainHook.sPreventBatteryWhitelist`，关了立刻放行，无需重启省电服务。
+- 作用域新增 **`com.miui.powerkeeper`**（`scope.list` / `module.prop` 已加）。
+  ⚠️ 已装旧版升级的情况：LSPosed 不会自动补新作用域，需要到 LSPosed → 模块 → 作用域里
+  **手动勾选「省电与电池」**，否则省电进程根本不注入、开关无效（全新安装会自动带上）。
+- 设置页新增卡片「电池与省电」，开关 `prevent_battery_whitelist`，**默认开启**
+  （追加在 `ALL_PREF_KEYS` / `ALL_PREF_DEFAULTS` 末尾，两数组仍同序同长 21 项；
+  老用户键不存在 → 取默认 true 并落盘，等价于默认打开）。
+- 版本 3.291.0 / versionCode 446；与历史版本同签名，可直接覆盖安装。
+
 ## v3.41 修 v3.40 的重要性写回无效（改成「低」会弹回）
 
 - 根因：AOSP 的 `mChannel` / `mBackend` / `mPkg` / `mUid` / `mBackupImportance` 声明在父类

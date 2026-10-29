@@ -4,15 +4,19 @@ plugins {
 
 android {
     namespace 'com.abel.hyperosglass'
-    compileSdk 37
-    buildToolsVersion '37.0.0'
+    // ⚠️ 用 36 而不是 37：本机 AGP 8.7.0 只认 SDK XML v3，而 platforms/android-37 是
+    // API 37.2（XML v4），声明 37 会报 "Failed to find target with hash string 'android-37'"。
+    // 历史 release APK 的 compileSdkVersion 一直是 36（aapt2 dump badging 可查），
+    // 模块也没用到 API 37 的符号，故统一到 36 保证本机可复现构建。
+    compileSdk 36
+    buildToolsVersion '36.0.0'
 
     defaultConfig {
         applicationId 'com.abel.hyperosglass'
         minSdk 33
         targetSdk 34
-        versionCode 445
-        versionName '3.290.5'
+        versionCode 446
+        versionName '3.291.0'
     }
 
     signingConfigs {

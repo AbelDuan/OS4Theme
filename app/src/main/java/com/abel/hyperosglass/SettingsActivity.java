@@ -321,6 +321,20 @@ public class SettingsActivity extends Activity {
         addSectionTitle(linearLayoutNewCard5, "功能隐藏", null);
         addSwitches(linearLayoutNewCard5, new Sw("锁屏指纹图标", Constants.PREFS_HIDE_LOCK_FOD, true), new Sw("通知清除按钮", Constants.PREFS_HIDE_DISMISS_BTN, true), new Sw("控制中心「编辑」", Constants.PREFS_QS_EDIT_HIDE, true), new Sw("蓝牙设备解锁提示", Constants.PREFS_HIDE_BT_UNLOCK, true));
         linearLayout.addView(linearLayoutNewCard5, cardLp());
+
+        // ── 电池与省电（v3.291.0，移植自 HyperCeiler）──
+        // 省电服务会把用户移除的应用重新写回「电池优化白名单」，
+        // 这里拦住它的批量写入入口，单包写入（用户自己改设置）仍放行。
+        LinearLayout linearLayoutBattery = newCard();
+        addSectionTitle(linearLayoutBattery, "电池与省电",
+                "系统会定期把用户从「电池优化白名单」里移除的应用重新写回。\n"
+                        + "开启后只拦截**批量恢复**，你在「省电策略」里手动选「无限制」仍然生效。\n"
+                        + "⚠️ 生效前提：已在 LSPosed 作用域里勾选「省电与电池」（com.miui.powerkeeper）。\n"
+                        + "改完无需重启，省电服务下次恢复白名单时就会被拦下。");
+        addSwitch(linearLayoutBattery, "禁止恢复电池优化白名单",
+                Constants.PREFS_PREVENT_BATTERY_WHITELIST,
+                Constants.DEFAULT_PREVENT_BATTERY_WHITELIST);
+        linearLayout.addView(linearLayoutBattery, cardLp());
         LinearLayout linearLayoutNewCardNotif = newCard();
         addSectionTitle(linearLayoutNewCardNotif, "通知优先级 / 重要性", "放开系统设置里被隐藏的重要性选项，并让改动生效");
         addSwitch(linearLayoutNewCardNotif, "重要性可调（含低重要性过滤）", Constants.PREFS_NOTIF_IMPORTANCE, true);

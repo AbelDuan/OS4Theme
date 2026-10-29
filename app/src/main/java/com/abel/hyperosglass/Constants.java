@@ -131,7 +131,7 @@ public final class Constants {
     public static final String TARGET_PLUGIN_PKG = "miui.systemui.plugin";
     // 日志里打印的模块版本号。⚠️ 必须和 app/build.gradle 的 versionName 一致，
     // 否则排查时会被日志骗（2026-10-25 就发生过：跑的是 3.283.3，日志写 3.41.2）。
-    public static final String VERSION = "3.290.5";
+    public static final String VERSION = "3.291.0";
 
     // ============================================================
     // 通知宽度调节（v3.41.2 新增）
@@ -406,6 +406,25 @@ public final class Constants {
     public static final String KEY_STATUS_ICON_MAX = PREFS_STATUS_ICON_MAX;
     public static final String KEY_STATUS_ICON_DOT_MODE = PREFS_STATUS_ICON_DOT_MODE;
 
+    // ── 禁止恢复电池优化白名单（v3.291.0，移植自 HyperCeiler PreventBatteryWitelist）──
+    /**
+     * 省电服务进程。<b>需要新增 LSPosed 作用域</b>，否则模块不会注入这个包，
+     * 开关形同虚设（见 {@code scope.list} / {@code module.prop}）。
+     */
+    public static final String POWERKEEPER_PKG = "com.miui.powerkeeper";
+    /**
+     * MIUI/HyperOS 的省电策略适配器。{@code addPowerSaveWhitelistApps(String[])} 是
+     * 「把一批应用写入电池优化白名单」的入口 —— 系统的定期/开机恢复走这里，
+     * 用户在「省电策略」里手动改成「无限制」只走单包入口。
+     */
+    public static final String POWERKEEPER_ADAPTER_CLASS = "com.miui.powerkeeper.utils.CommonAdapter";
+    /** 批量写入白名单的方法名（DexKit 兜底扫描时按这个名字找）。 */
+    public static final String POWERKEEPER_ADD_WL_METHOD = "addPowerSaveWhitelistApps";
+    /** 开关：禁止系统把用户移除的应用重新写回电池优化白名单。 */
+    public static final String PREFS_PREVENT_BATTERY_WHITELIST = "prevent_battery_whitelist";
+    /** ★ 默认**开启**（用户 2026-10-29 明确要求）。 */
+    public static final boolean DEFAULT_PREVENT_BATTERY_WHITELIST = true;
+
     public static final boolean DEFAULT_STATUS_ICON_LIMIT_ENABLE = true;
     public static final int DEFAULT_STATUS_ICON_MAX = 3;
     public static final int DEFAULT_STATUS_ICON_DOT_MODE = 0; // 系统默认
@@ -414,10 +433,12 @@ public final class Constants {
 
     // ⚠️ 这两个数组必须**同序同长**：reloadPrefs 与 StatusProvider 都按下标一一对应取值。
     //    新增开关只能往**末尾追加**，不可插队（v3.41.2 追加了通知宽度总开关）。
-    public static final String[] ALL_PREF_KEYS = {PREFS_GLASS_ENABLED, PREFS_FOCUS_GLASS, PREFS_AOD_BATTERY_SYNC, PREFS_PIN_GLASS, PREFS_NO_FOLD_HISTORY, PREFS_SINK_ENABLED, PREFS_KEEP_NOTIF, PREFS_HIDE_BT_UNLOCK, PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_ALLOW_MANAGE_ALL, PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE, PREFS_ENABLE_LOG, PREFS_NOTIF_IMPORTANCE, PREFS_NOTIF_WIDTH_ENABLE, PREFS_ROTATION_HINT, PREFS_INNER_FOLLOW_ROTATION, PREFS_STATUS_ICON_LIMIT_ENABLE};
+    public static final String[] ALL_PREF_KEYS = {PREFS_GLASS_ENABLED, PREFS_FOCUS_GLASS, PREFS_AOD_BATTERY_SYNC, PREFS_PIN_GLASS, PREFS_NO_FOLD_HISTORY, PREFS_SINK_ENABLED, PREFS_KEEP_NOTIF, PREFS_HIDE_BT_UNLOCK, PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_ALLOW_MANAGE_ALL, PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE, PREFS_ENABLE_LOG, PREFS_NOTIF_IMPORTANCE, PREFS_NOTIF_WIDTH_ENABLE, PREFS_ROTATION_HINT, PREFS_INNER_FOLLOW_ROTATION, PREFS_STATUS_ICON_LIMIT_ENABLE, PREFS_PREVENT_BATTERY_WHITELIST};
     // ★ 2026-10-24：默认值按「当前在用的那台设备」的实际配置对齐（v3.283.0）。
     //   对齐项：notif_width_enable=true、rotation_hint_enable=true、inner_follow_rotation=true；
     //   同时修掉这里多出来的第 21 个元素——数组曾比 ALL_PREF_KEYS 长 1，
     //   虽然按下标取值不受影响，但违反了上面「同序同长」的约束，容易埋坑。
-    public static final boolean[] ALL_PREF_DEFAULTS = {true, true, true, true, true, false, true, true, true, true, true, false, true, true, false, true, true, true, true, true};
+    // ★ 2026-10-29（v3.291.0）：末尾追加 prevent_battery_whitelist=true，
+    //   与上一条同样遵守「同序同长」（现在两个数组都是 21 个元素）。
+    public static final boolean[] ALL_PREF_DEFAULTS = {true, true, true, true, true, false, true, true, true, true, true, false, true, true, false, true, true, true, true, true, true};
 }

@@ -69,6 +69,15 @@ public class MainHook extends XposedModule {
     private static final AtomicBoolean sMuteScreenOnFlag = new AtomicBoolean(true);
     private static final AtomicBoolean sCancelVibrateScreenOnFlag = new AtomicBoolean(true);
     private static final AtomicBoolean sAllowManageAllFlag = new AtomicBoolean(true);
+    /**
+     * 禁止恢复电池优化白名单（v3.291.0，移植自 HyperCeiler）。
+     *
+     * <p>只在 {@code com.miui.powerkeeper} 进程里被读取（见
+     * {@link PowerWhitelistGuard}），默认开启；设置页关闭后拦截立即失效，
+     * 不需要重启省电服务（回调里实时判断）。
+     */
+    public static final AtomicBoolean sPreventBatteryWhitelist =
+            new AtomicBoolean(Constants.DEFAULT_PREVENT_BATTERY_WHITELIST);
 
     // ── 通知宽度调节（v3.41.2）──
     /** 总开关。宽度是连续值，走单独通道，不参与 ALL_PREF_KEYS 的下标体系。 */
@@ -214,6 +223,9 @@ public class MainHook extends XposedModule {
             } else if (Constants.TARGET_PLUGIN_PKG.equals(packageName)) {
                 // 插件进程：只补三方主题玻璃的判定点，其余 hook 都不属于这个进程
                 installThirdPartyThemeGlassHooks(defaultClassLoader);
+            } else if (Constants.POWERKEEPER_PKG.equals(packageName)) {
+                // 省电服务：禁止批量恢复电池优化白名单（v3.291.0，移植自 HyperCeiler）
+                PowerWhitelistGuard.install(this, defaultClassLoader);
             }
         } catch (Throwable th) {
             LogUtil.logAlways("onPackageLoaded 异常: " + th);
@@ -2333,6 +2345,10 @@ public class MainHook extends XposedModule {
                 dotMode = 3;
             }
             sStatusIconDotMode.set(dotMode);
+            // 禁止恢复电池优化白名单（v3.291.0）：默认开启，用户关过就以配置为准
+            sPreventBatteryWhitelist.set(bundle.getBoolean(
+                    Constants.PREFS_PREVENT_BATTERY_WHITELIST,
+                    Constants.DEFAULT_PREVENT_BATTERY_WHITELIST));
             // 开关变化后立即尝试应用（内部会自己判断前置条件）
             try {
                 applyInnerFixedLandscape();
@@ -2365,7 +2381,7 @@ public class MainHook extends XposedModule {
             sCancelVibrateScreenOnFlag.set(z14);
             sAllowManageAllFlag.set(z15);
             LogUtil.setEnabled(z16);
-            LogUtil.logAlways("设置(真实值同步)：sink=" + z + "，glass=" + z2 + "，hideLockFod=" + z3 + "，hideDismiss=" + z4 + "，focusGlass=" + z5 + "，aodBattery=" + z6 + "，qsEditHide=" + z8 + "，noFoldHistory=" + z9 + "，keepNotif=" + z11 + "，hideBtUnlock=" + z12 + "，muteScreenOn=" + z13 + "，allowManageAll=" + z15 + "，日志=" + z16 + "，内屏联动=" + sInnerFollowRotation.get() + "，旋转提示=" + sRotationHintEnable.get() + "，通知宽度=" + widthOn);
+            LogUtil.logAlways("设置(真实值同步)：sink=" + z + "，glass=" + z2 + "，hideLockFod=" + z3 + "，hideDismiss=" + z4 + "，focusGlass=" + z5 + "，aodBattery=" + z6 + "，qsEditHide=" + z8 + "，noFoldHistory=" + z9 + "，keepNotif=" + z11 + "，hideBtUnlock=" + z12 + "，muteScreenOn=" + z13 + "，allowManageAll=" + z15 + "，日志=" + z16 + "，内屏联动=" + sInnerFollowRotation.get() + "，旋转提示=" + sRotationHintEnable.get() + "，通知宽度=" + widthOn + "，电池白名单=" + sPreventBatteryWhitelist.get());
         } catch (Throwable th) {
             LogUtil.logAlways("设置(真实值同步) 应用失败: " + th);
         }
