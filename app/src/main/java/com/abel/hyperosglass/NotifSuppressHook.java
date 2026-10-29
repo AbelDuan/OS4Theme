@@ -30,73 +30,24 @@ public final class NotifSuppressHook {
             "com.android.systemui.statusbar.notification.collection.NotificationEntry";
     private static final String MODEL =
             "com.android.systemui.statusbar.notification.shared.ActiveNotificationModel";
-    private static final String STORE =
-            "com.android.systemui.statusbar.notification.data.repository.ActiveNotificationsStore";
     private static final String NOTIF_COLLECTION =
             "com.android.systemui.statusbar.notification.collection.NotifCollection";
-    private static final String ICONS_INTERACTOR =
-            "com.android.systemui.statusbar.notification.icon.domain.interactor.NotificationIconsInteractor";
-    private static final String GROUP_MODEL =
-            "com.android.systemui.statusbar.notification.shared.ActiveNotificationGroupModel";
 
-    /** 最近一次 toModel 用的 store，用来给过滤层反查 rankingsMap。 */
-    private static volatile Object sLastStore;
-    /** key → 最近一次读到的 importance，rankingsMap 查不到时兜底。 */
-    private static final java.util.concurrent.ConcurrentHashMap<String, Integer> sImportanceByKey =
-            new java.util.concurrent.ConcurrentHashMap<>();
-    private static Class<?> sModelClass;
-    private static Class<?> sGroupClass;
-    /** 参与 toModel 快速比对、且对低重要级通知无实际意义的字段，用来强制重建。 */
-    private static java.lang.reflect.Field sFocusFlag;
-    private static boolean sFocusFlagAvailable;
 
-    private NotifSuppressHook() {
-    }
-
+    /**
+     * 只做一件事：挂系统「渠道重要性变更」回调，在回调里把状态栏图标重判一遍。
+     *
+     * <p>刻意<b>不</b>在 {@code toModel} 上做抑制：那条路改的是不可变 model 的字段，
+     * StateFlow 不会因为字段被改而重新发射，低→中恢复不出来，
+     * 与 View 层的 {@code setBlocked} 抢同一个图标时还会留下空白占位。
+     *
+     * <p>也没有轮询：只有用户真的改了通知渠道才会走到这里，平时不占任何资源。
+     */
     public static void install(final io.github.libxposed.api.XposedModule module, final ClassLoader cl) {
         try {
-            Class<?> builder = Class.forName(STORE_BUILDER, false, cl);
-            Class<?> entryCls = Class.forName(ENTRY, false, cl);
-            java.lang.reflect.Method target = null;
-            for (java.lang.reflect.Method m : builder.getDeclaredMethods()) {
-                if (!m.getName().equals("toModel")) {
-                    continue;
-                }
-                Class<?>[] p = m.getParameterTypes();
-                if (p.length == 1 && p[0] == entryCls) {
-                    target = m;
-                    break;
-                }
-            }
-            if (target == null) {
-                LogUtil.logAlways("[源头抑制] 未找到 toModel(NotificationEntry)");
-                return;
-            }
-            target.setAccessible(true);
-            final java.lang.reflect.Method tm = target;
-            module.hook(tm)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("notif-suppress-statusbar")
-                    .intercept(new XposedInterface.Hooker() {
-                        @Override
-                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                            Object model = chain.proceed();
-                            try {
-                                suppress(chain.getThisObject(), chain.getArg(0), model, cl);
-                                forceRebuildIfSuppressed(model);
-                            } catch (Throwable ignored) {
-                                // 一律不影响通知正常渲染
-                            }
-                            return model;
-                        }
-                    });
-            LogUtil.logAlways("[源头抑制] 已挂钩 " + STORE_BUILDER + ".toModel(NotificationEntry)");
-            cacheStoreField(builder);
-            cacheModelField(cl);
             installChannelChangedHook(module, cl);
-            installFilterHook(module, cl);
         } catch (Throwable th) {
-            LogUtil.logAlways("[源头抑制] 安装失败: " + th);
+            LogUtil.logAlways("[即时刷新] 安装失败: " + th);
         }
     }
 
@@ -178,6 +129,13 @@ public final class NotifSuppressHook {
      * 如果每次都排一次重建，就会堆积出好几轮全量重算。这里用同一个 Runnable 实例反复
      * remove + post，保证任何时刻最多只有一个待执行的重建。
      */
+    /**
+     * 渠道重要性变了之后，把 store 里所有模型的抑制位按「当前」重要性重算一遍。
+     *
+     * <p>{@code toModel} 只在列表结构变化时才跑，单纯改渠道不会重算，
+     * 于是 {@code isSuppressedFromStatusBar=true} 会一直挂在那里——
+     * 这就是「低→中之后状态栏只剩空白占位」的直接原因。
+     */
     private static void scheduleRebuild(final Object collection, final java.lang.reflect.Method rebuildM) {
         android.os.Handler h = sMainHandler;
         if (h == null) {
@@ -204,6 +162,9 @@ public final class NotifSuppressHook {
                         // 此时 isFocusNotification 才被我们抹掉；必须再算一次，
                         // 第二次比对必然失配 → 走 new-instance → store.equals 判定变化 → 界面刷新。
                         method.invoke(target, "OS4Theme-channel-changed-again");
+                        // 重建只更新数据模型，状态栏那些 StatusBarIconView 是复用的；
+                        // 必须显式 setBlocked() 才会走 updateVisibility() 真正隐藏/恢复。
+                        NotifIconBlock.reapplyAll();
                         LogUtil.logAlways("[即时刷新] 渠道变更后已立即重算通知列表");
                     } catch (Throwable ignored) {
                     }
@@ -219,267 +180,7 @@ public final class NotifSuppressHook {
     private static android.os.Handler sMainHandler;
     private static Runnable sRebuildTask;
 
-    /**
-     * 强制绕过 {@code toModel} 的「快速路径」。
-     *
-     * <p>反编译可见：{@code toModel} 在构造新 model 前会拿旧 model 逐字段比对
-     * （bucket / callType / promotedContent / requestedPromotion / isScreenShareNotification /
-     * style / isPersistent / isFocusNotification）。<b>全部相等就直接 return 旧对象</b>。
-     *
-     * <p>而 {@code isSuppressedFromStatusBar} 恰好<b>不在</b>这份比对列表里——
-     * 于是只改它，新旧 model 在系统眼里仍然「相等」，
-     * {@code ActiveNotificationsStore.equals} 返回 true，下游 {@code distinctUntilChanged()}
-     * 不 emit，界面停在旧样子。这就是「必须等下一条新通知才生效」的真正原因。
-     *
-     * <p>对策：低重要级的 model 额外把 {@code isFocusNotification} 抹成 false。
-     * 它参与比对，于是下一次必然走 new-instance 构造新对象，equals 判定「变了」，界面随之刷新；
-     * 对低重要级通知来说不参与「实时聚焦」本身也符合语义。
-     */
-    private static void forceRebuildIfSuppressed(Object model) {
-        if (model == null || sFlag == null || !sFocusFlagAvailable) {
-            return;
-        }
-        try {
-            if (!sFlag.getBoolean(model)) {
-                return;
-            }
-            Object v = sFocusFlag.get(model);
-            if (Boolean.TRUE.equals(v)) {
-                sFocusFlag.setBoolean(model, false);
-            }
-        } catch (Throwable ignored) {
-        }
-    }
-
-    /**
-     * 在最终过滤点 {@code NotificationIconsInteractor.areAllChildrenSuppressed(List)} 上兜底。
-     *
-     * <p>为什么还要这一层：{@code toModel} 里有「快速路径」——只要 5 个展示字段都没变，
-     * 系统直接 <b>返回旧的 model 对象</b>，不再走 new-instance。而我们在返回后原地改
-     * {@code isSuppressedFromStatusBar}，改的是<b>同一个对象</b>，
-     * 于是旧 store 与新 store 里躺的是同一份数据，{@code ActiveNotificationsStore.equals}
-     * 判定「没变」，下游 {@code distinctUntilChanged()} 不 emit，界面就停在旧样子。
-     *
-     * <p>所以这里不强求 model 字段，而是直接在过滤时刻读取 model.key 反查当前重要性，
-     * 自己算「这条该不该上状态栏」。原方法返回 true 表示「整组都已抑制」，
-     * 我们在此基础上把「低重要级」也算作已抑制。
-     */
-    private static void installFilterHook(final io.github.libxposed.api.XposedModule module,
-                                          ClassLoader cl) {
-        try {
-            Class<?> interactor = Class.forName(ICONS_INTERACTOR, false, cl);
-            java.lang.reflect.Method target = null;
-            for (java.lang.reflect.Method m : interactor.getDeclaredMethods()) {
-                if (m.getName().equals("areAllChildrenSuppressed") && m.getParameterCount() == 1
-                        && java.util.List.class.isAssignableFrom(m.getParameterTypes()[0])) {
-                    target = m;
-                    break;
-                }
-            }
-            if (target == null) {
-                LogUtil.logAlways("[状态栏过滤] 未找到 areAllChildrenSuppressed(List)");
-                return;
-            }
-            target.setAccessible(true);
-            final java.lang.reflect.Method tm = target;
-            module.hook(tm)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .setId("icons-suppressed-filter")
-                    .intercept(new XposedInterface.Hooker() {
-                        @Override
-                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                            Object base = chain.proceed();
-                            try {
-                                Object arg0 = chain.getArg(0);
-                                int size = (arg0 instanceof java.util.List) ? ((java.util.List<?>) arg0).size() : -1;
-                                if (Boolean.TRUE.equals(base)) {
-                                    return base;
-                                }
-                                Object list = chain.getArg(0);
-                                boolean allLow = allLowImportance(list);
-                                if (allLow) {
-                                    LogUtil.logAlways("[状态栏过滤] 整组低重要级，判为已抑制");
-                                    return Boolean.TRUE;
-                                }
-                            } catch (Throwable ignored) {
-                            }
-                            return base;
-                        }
-                    });
-            LogUtil.logAlways("[状态栏过滤] 已挂钩 areAllChildrenSuppressed");
-        } catch (Throwable th) {
-            LogUtil.logAlways("[状态栏过滤] 安装失败: " + th);
-        }
-    }
-
-    /**
-     * 列表里每个条目是否都属于「低重要级」。
-     * 递归处理分组：{@code ActiveNotificationGroupModel.children} 里只要有一条不是低重要级，就返回 false。
-     */
-    private static boolean allLowImportance(Object list) {
-        if (!(list instanceof java.util.List)) {
-            return false;
-        }
-        java.util.List<?> items = (java.util.List<?>) list;
-        if (items.isEmpty()) {
-            return false;
-        }
-        for (Object item : items) {
-            if (item == null) {
-                return false;
-            }
-            if (sModelClass != null && sModelClass.isInstance(item)) {
-                if (!isLowImportanceModel(item)) {
-                    return false;
-                }
-            } else if (sGroupClass != null && sGroupClass.isInstance(item)) {
-                Object children = readField(item, "children");
-                if (children == null) {
-                    return false;
-                }
-                if (!allLowImportance(children)) {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /** 由 model.key 反查当前重要性；查不到就当作「不是低重要级」，宁可不抑制。 */
-    private static boolean isLowImportanceModel(Object model) {
-        Object key = readField(model, "key");
-        if (!(key instanceof String)) {
-            return false;
-        }
-        int imp = importanceByKey((String) key);
-        return imp >= 0 && imp <= IMPORTANCE_MIN;
-    }
-
-    /**
-     * 按 key 反查重要性。key 形如 {@code 0|com.tencent.mm|755600475|null|10301}，
-     * 第二段是包名。取值顺序：rankingsMap → 缓存的 entry.mRanking。
-     */
-    private static int importanceByKey(String key) {
-        Object store = sLastStore;
-        if (store != null) {
-            Object rankings = readField(store, "rankingsMap");
-            if (rankings instanceof java.util.Map) {
-                Object ranking = ((java.util.Map<?, ?>) rankings).get(key);
-                if (ranking != null) {
-                    Object v = invokeSafe(ranking, "getImportance");
-                    if (v instanceof Integer) {
-                        return (Integer) v;
-                    }
-                }
-            }
-        }
-        Integer cached = sImportanceByKey.get(key);
-        return cached == null ? -1 : cached;
-    }
-
-    private static java.lang.reflect.Field sExistingModels;
-    private static java.lang.reflect.Field sFlag;
-
-    private static void cacheStoreField(Class<?> builder) {
-        try {
-            java.lang.reflect.Field f = builder.getDeclaredField("existingModels");
-            f.setAccessible(true);
-            sExistingModels = f;
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private static void cacheModelField(ClassLoader cl) {
-        try {
-            Class<?> model = Class.forName(MODEL, false, cl);
-            java.lang.reflect.Field f = model.getDeclaredField("isSuppressedFromStatusBar");
-            f.setAccessible(true);
-            sFlag = f;
-            sModelClass = model;
-            try {
-                sGroupClass = Class.forName(GROUP_MODEL, false, cl);
-            } catch (Throwable ignored) {
-            }
-            try {
-                java.lang.reflect.Field ff = model.getDeclaredField("isFocusNotification");
-                ff.setAccessible(true);
-                sFocusFlag = ff;
-                sFocusFlagAvailable = true;
-            } catch (Throwable ignored) {
-            }
-        } catch (Throwable ignored) {
-        }
-    }
-
-    /** 低重要级就置 isSuppressedFromStatusBar=true。 */
-    private static void suppress(Object builder, Object entry, Object model,
-                                 ClassLoader cl) throws Throwable {
-        if (model == null || entry == null) {
-            return;
-        }
-        if (sFlag == null || sExistingModels == null) {
-            return;
-        }
-        if (sFlag.getBoolean(model)) {
-            return; // 系统自己已经抑制了，不必再动
-        }
-        Object key = readField(entry, "key");
-        if (!(key instanceof String)) {
-            return;
-        }
-        int importance = importanceOf(entry, builder, (String) key);
-        sLastStore = sExistingModels.get(builder);
-        sImportanceByKey.put((String) key, importance);
-        if (importance < 0 || importance > IMPORTANCE_MIN) {
-            return;
-        }
-        sFlag.setBoolean(model, true);
-        LogUtil.logAlways("[源头抑制] 已抑制状态栏图标 key=" + key + " importance=" + importance);
-    }
-
-    /**
-     * 取重要性。HyperOS 4 的 NotificationEntry 没有 getRanking() 方法，
-     * 但有 {@code mRanking} 字段，直接读它最可靠（rankingsMap 是上一轮的快照，
-     * 首次渲染时还查不到当前 key）。
-     */
-    private static int importanceOf(Object entry, Object builder, String key) {
-        Object ranking = readField(entry, "mRanking");
-        if (ranking != null) {
-            Object v = invokeSafe(ranking, "getImportance");
-            if (v instanceof Integer) {
-                return (Integer) v;
-            }
-        }
-        return lookupImportance(builder, key, null);
-    }
-
-    /** 由 key 去 store.rankingsMap 反查 Ranking.getImportance()。 */
-    private static int lookupImportance(Object builder, String key, ClassLoader cl) {
-        try {
-            Object store = sExistingModels.get(builder);
-            if (store == null) {
-                return -1;
-            }
-            if (!STORE.equals(store.getClass().getName())) {
-                return -1;
-            }
-            Object rankings = readField(store, "rankingsMap");
-            if (!(rankings instanceof java.util.Map)) {
-                return -1;
-            }
-            Object ranking = ((java.util.Map<?, ?>) rankings).get(key);
-            if (ranking == null) {
-                return -1;
-            }
-            Object v = invokeSafe(ranking, "getImportance");
-            return v instanceof Integer ? (Integer) v : -1;
-        } catch (Throwable th) {
-            return -1;
-        }
-    }
-
+    /** 状态栏图标容器：onLayout 里靠 isIconBlocked() 跳过，被 block 的图标不占位。 */
     private static Object readField(Object target, String name) {
         try {
             Class<?> c = target.getClass();

@@ -167,6 +167,81 @@ public final class NotifIconBlock {
         }
     }
 
+    /** 所有见过的状态栏图标 View（弱引用，View 销毁自动清掉）。 */
+    private static final java.util.Map<View, Boolean> sViews =
+            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<View, Boolean>());
+
+    /**
+     * 渠道重要性变了之后，对所有现存图标重新判一遍。
+     *
+     * <p>为什么非要这一层：改渠道<b>不会</b>重建 {@code StatusBarIconView}，
+     * 也不一定重跑 {@code toModel}，单靠构造器 hook 永远等不到第二次机会。
+     * 这里清掉缓存再逐个重判，低→中能恢复、中→低能立即藏。
+     */
+    public static void reapplyAll() {
+        sImportance.clear();
+        sChannel.clear();
+        java.util.List<View> snapshot;
+        synchronized (sViews) {
+            snapshot = new java.util.ArrayList<>(sViews.keySet());
+        }
+        LogUtil.logAlways("[图标屏蔽] 重新判定 " + snapshot.size() + " 个状态栏图标");
+        for (View v : snapshot) {
+            if (v == null) {
+                continue;
+            }
+            try {
+                StatusBarNotification sbn = null;
+                java.lang.reflect.Field nf = fieldOf(v.getClass(), "mNotification");
+                Object raw = nf == null ? null : nf.get(v);
+                if (raw instanceof StatusBarNotification) {
+                    sbn = (StatusBarNotification) raw;
+                }
+                int imp = sbn == null ? -1 : importanceOf(v, sbn);
+                boolean hide = imp >= 0 && imp <= IMPORTANCE_MIN;
+                setHidden(v, hide);
+                if (!hide && sbn != null) {
+                    LogUtil.logAlwaysOnce("icon-restore-" + sbn.getKey(),
+                            "[图标屏蔽] 已恢复 statusbar icon key=" + sbn.getKey());
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /**
+     * 隐藏/恢复一个状态栏图标。
+     *
+     * <p>只调系统自己的 {@code setBlocked(boolean)}：
+     * <pre>
+     *   public void setBlocked(boolean blocked) {
+     *       if (mBlocked != blocked) { mBlocked = blocked; updateVisibility$7(); }
+     *   }
+     * </pre>
+     * 它会同时更新 {@code mBlocked} 与可见性，容器 {@code onLayout/onMeasure}
+     * 读到 {@code isIconBlocked()} 直接跳过这一格的宽度 —— 藏起来不留空位，
+     * 恢复也很干净。
+     *
+     * <p>⚠️ 绝不能改写成 {@code mBlocked=true} 直赋字段：那样绕过了
+     * {@code updateVisibility$7()}，图标不重绘，而且容器排版缓存不会跟着变，
+     * 恢复时就停在一个空白占位上。
+     */
+    private static void setHidden(View view, boolean hide) {
+        if (sSetBlocked == null) {
+            try {
+                sSetBlocked = view.getClass().getMethod("setBlocked", boolean.class);
+            } catch (Throwable ignored) {
+                return;
+            }
+        }
+        try {
+            sSetBlocked.invoke(view, hide);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static java.lang.reflect.Method sSetBlocked;
+
     private static void apply(XposedInterface.Chain chain, View view, StatusBarNotification sbn) {
         if (!MainHook.sNotifImportanceFlag.get()) {
             return;
@@ -187,96 +262,19 @@ public final class NotifIconBlock {
         if (sbn == null) {
             return;
         }
+        sViews.put(view, Boolean.TRUE);
         int importance = importanceOf(view, sbn);
         if (importance < 0 || importance > IMPORTANCE_MIN) {
             return;
         }
-        // 1) mBlocked=true：图标自身不绘制
-        Field blocked = fieldOf(view.getClass(), "mBlocked");
-        if (blocked != null) {
-            try {
-                blocked.setBoolean(view, true);
-            } catch (Throwable ignored) {
-                return;
-            }
-        }
-        // 2) 让容器排版时不算这一格：改 IconState 而不是动 View 树。
-        //
-        //    2026-10-28 实测：早先用 removeView 把 View 摘出容器，
-        //    NotificationIconContainer.resetViewStates 会遍历 getChildCount()，
-        //    再拿子 View 去 mIconStates 查状态；View 被摘掉后遍历对不上，
-        //    取到 null 直接抛 IllegalStateException，SystemUI 反复崩溃（解锁黑屏）。
-        //
-        //    ViewState.applyToView 会把 visibleState 映射回 View：
-        //    8(GONE) → gone=true，4(INVISIBLE) → hidden=true。
-        //    容器 onLayout 对 GONE 的子 View 不分配宽度，因此设成 8 即可「不占位」，
-        //    且 mIconStates 里的记录保持完整，不会崩。
-        markIconStateGone(view);
+        // 统一走系统的 setBlocked(true)：既不绘制，容器排版也不再给它留宽度。
+        setHidden(view, true);
         LogUtil.logAlwaysOnce("icon-block-" + sbn.getKey(),
                 "[图标屏蔽] 已屏蔽 importance=" + importance + " key=" + sbn.getKey());
     }
 
     /**
      * 把图标在容器里的排版状态标记为 GONE，使其不占宽度。
-     *
-     * <p>两条路径都试：
-     * <ol>
-     *   <li>容器侧的 {@code mIconStates} 里那条记录（真正决定排版的那份）；</li>
-     *   <li>View 自身的 {@code visibleState} 字段（容器在下次 {@code initFrom} 前不会覆盖它）。</li>
-     * </ol>
-     *
-     * <p>⚠️ 绝不能 {@code removeView}：容器 {@code resetViewStates} 会因查不到
-     * {@code IconState} 抛 {@code IllegalStateException}，导致 SystemUI 崩溃循环。
-     */
-    private static void markIconStateGone(View view) {
-        try {
-            view.setVisibility(View.GONE);
-        } catch (Throwable ignored) {
-        }
-        // 容器自己持有的那份状态
-        try {
-            android.view.ViewParent parent = view.getParent();
-            if (parent != null) {
-                Field statesField = fieldOf(parent.getClass(), "mIconStates");
-                Object states = statesField == null ? null : statesField.get(parent);
-                if (states instanceof java.util.Map) {
-                    Object st = ((java.util.Map<?, ?>) states).get(view);
-                    if (st != null) {
-                        setStateGone(st);
-                    }
-                }
-            }
-        } catch (Throwable ignored) {
-        }
-    }
-
-    /** 把一个 ViewState/IconState 标记为 GONE。 */
-    private static void setStateGone(Object state) {
-        try {
-            Field vs = fieldOf(state.getClass(), "visibleState");
-            if (vs != null) {
-                vs.setInt(state, 8);   // View.GONE
-            }
-        } catch (Throwable ignored) {
-        }
-        // 父类 ViewState 的 gone / hidden
-        try {
-            Class<?> c = state.getClass();
-            while (c != null && c != Object.class) {
-                for (String name : new String[]{"gone", "hidden"}) {
-                    try {
-                        Field f = c.getDeclaredField(name);
-                        f.setAccessible(true);
-                        f.setBoolean(state, true);
-                    } catch (NoSuchFieldException ignored) {
-                    } catch (Throwable ignored) {
-                    }
-                }
-                c = c.getSuperclass();
-            }
-        } catch (Throwable ignored) {
-        }
-    }
 
     /** 渠道重要性（用户在设置里调的那一项）优先，其次通知自带的重要性；都取不到返回 -1。 */
     private static int importanceOf(View view, StatusBarNotification sbn) {
