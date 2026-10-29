@@ -200,6 +200,19 @@ public final class NotifIconBlock {
                 int imp = sbn == null ? -1 : importanceOf(v, sbn);
                 boolean hide = imp >= 0 && imp <= IMPORTANCE_MIN;
                 setHidden(v, hide);
+                // [诊断] 确认这个 View 是否真的是状态栏在用的那一个（防误判 ancora）。
+                if (hide && sbn != null) {
+                    String key = sbn.getKey();
+                    if (key != null && key.contains(DBG_PKG)) {
+                        View parent = (View) v.getParent();
+                        LogUtil.logAlways("[诊断V] key=" + key + " 可见=" + v.getVisibility()
+                                + " blocked=" + isBlocked(v)
+                                + " 父=" + (parent == null ? "null" : parent.getClass().getSimpleName())
+                                + " 父子数=" + (parent == null ? -1 : ((android.view.ViewGroup) parent).getChildCount())
+                                + " 宽高=" + v.getWidth() + "x" + v.getHeight()
+                                + " 位置=" + v.getLeft() + "," + v.getTop());
+                    }
+                }
                 if (!hide && sbn != null) {
                     LogUtil.logAlwaysOnce("icon-restore-" + sbn.getKey(),
                             "[图标屏蔽] 已恢复 statusbar icon key=" + sbn.getKey());
@@ -241,6 +254,21 @@ public final class NotifIconBlock {
     }
 
     private static java.lang.reflect.Method sSetBlocked;
+
+    /** [诊断] 只打印这个包的图标详情。 */
+    private static final String DBG_PKG = "taskerm";
+
+    /** [诊断] 读当前 blocked 状态。 */
+    private static boolean isBlocked(View v) {
+        try {
+            java.lang.reflect.Method m = v.getClass().getMethod("isIconBlocked");
+            m.setAccessible(true);
+            Object r = m.invoke(v);
+            return r instanceof Boolean && (Boolean) r;
+        } catch (Throwable th) {
+            return false;
+        }
+    }
 
     private static void apply(XposedInterface.Chain chain, View view, StatusBarNotification sbn) {
         if (!MainHook.sNotifImportanceFlag.get()) {
