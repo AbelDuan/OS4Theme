@@ -12,7 +12,7 @@ android {
         minSdk 33
         targetSdk 34
         versionCode 437
-        versionName '3.290.3'
+        versionName '3.290.5'
     }
 
     signingConfigs {

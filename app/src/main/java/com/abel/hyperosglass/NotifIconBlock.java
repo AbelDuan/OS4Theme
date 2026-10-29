@@ -208,9 +208,11 @@ public final class NotifIconBlock {
                     // 否则一次缓存未命中就会把已隐藏的图标全部放出来。
                     continue;
                 }
-                boolean hide = imp <= IMPORTANCE_MIN;
-                setHidden(v, hide);
-                if (!hide) {
+                // v3.290.5：这里只「恢复」，不再新增屏蔽。
+                // 屏蔽统一交给 installRenderListFilter 从渲染列表剔除，
+                // 两条链路同时改同一个 View 会导致恢复不干净、留下空白占位。
+                if (imp > IMPORTANCE_MIN) {
+                    setHidden(v, false);
                     LogUtil.logAlwaysOnce("icon-restore-" + sbn.getKey(),
                             "[图标屏蔽] 已恢复 statusbar icon key=" + sbn.getKey());
                 }
@@ -306,9 +308,10 @@ public final class NotifIconBlock {
                     if (raw instanceof StatusBarNotification) {
                         StatusBarNotification sbn = (StatusBarNotification) raw;
                         sViews.put(child, Boolean.TRUE);
+                        // 同上：容器里不再改 blocked，单调由渲染列表过滤负责。
                         int imp = importanceOf(child, sbn);
-                        if (imp >= 0) {
-                            setHidden(child, imp <= IMPORTANCE_MIN);
+                        if (imp > IMPORTANCE_MIN) {
+                            setHidden(child, false);
                         }
                     }
                 } catch (Throwable ignored) {
@@ -384,14 +387,21 @@ public final class NotifIconBlock {
                                     if (arg instanceof java.util.List) {
                                         java.util.List<?> src = (java.util.List<?>) arg;
                                         java.util.ArrayList<Object> keep = new java.util.ArrayList<>(src.size());
+                                        StringBuilder detail = new StringBuilder();
                                         for (Object e : src) {
-                                            if (e != null && importanceOfEntry(e) > IMPORTANCE_MIN) {
+                                            if (e == null) {
+                                                continue;
+                                            }
+                                            int imp = importanceOfEntry(e);
+                                            String key = entryKey(e);
+                                            detail.append(" [").append(key).append("=").append(imp).append(']');
+                                            if (imp > IMPORTANCE_MIN) {
                                                 keep.add(e);
                                             }
                                         }
                                         if (keep.size() != src.size()) {
                                             LogUtil.logAlways("[过滤] 渲染列表 "
-                                                    + src.size() + " → " + keep.size());
+                                                    + src.size() + " → " + keep.size() + detail);
                                             return chain.proceedWith(chain.getThisObject(), new Object[]{keep});
                                         }
                                     }
@@ -405,6 +415,32 @@ public final class NotifIconBlock {
             LogUtil.logAlways("[图标屏蔽] 已挂钩 StackCoordinator$attach$1.onAfterRenderList（照抄 HyperCeiler）");
         } catch (Throwable th) {
             LogUtil.logAlways("[图标屏蔽] 挂钩渲染列表失败: " + th);
+        }
+    }
+
+    /** 取条目对应的通知 key，仅用于诊断日志。 */
+    private static String entryKey(Object entry) {
+        try {
+            Object e = entry;
+            try {
+                java.lang.reflect.Method gr = e.getClass().getMethod("getRepresentativeEntry");
+                Object rep = gr.invoke(e);
+                if (rep != null) {
+                    e = rep;
+                }
+            } catch (Throwable ignored) {
+            }
+            java.lang.reflect.Field kf = fieldOf(e.getClass(), "mSbn");
+            if (kf == null) {
+                kf = fieldOf(e.getClass(), "mKey");
+            }
+            Object o = kf == null ? null : kf.get(e);
+            if (o instanceof StatusBarNotification) {
+                return ((StatusBarNotification) o).getPackageName();
+            }
+            return String.valueOf(o);
+        } catch (Throwable ignored) {
+            return "?";
         }
     }
 
@@ -490,14 +526,17 @@ public final class NotifIconBlock {
             return;
         }
         sViews.put(view, Boolean.TRUE);
+        // ⛔ 不再在这里 setBlocked(true)：
+        //   低重要性图标由 installRenderListFilter（HyperCeiler 方案）在
+        //   StackCoordinator$attach$1.onAfterRenderList 里直接从渲染列表剔除，
+        //   容器根本收不到它，自然不留空白。
+        //   这里若再屏蔽一次，改回中高优先级时两条链路互相打架，
+        //   恢复不干净就会留下「空白占位」（用户实测反馈）。
         int importance = importanceOf(view, sbn);
-        if (importance < 0 || importance > IMPORTANCE_MIN) {
-            return;
+        if (importance >= 0) {
+            LogUtil.logAlwaysOnce("icon-seen-" + sbn.getKey(),
+                    "[图标屏蔽] 记录 importance=" + importance + " key=" + sbn.getKey());
         }
-        // 统一走系统的 setBlocked(true)：既不绘制，容器排版也不再给它留宽度。
-        setHidden(view, true);
-        LogUtil.logAlwaysOnce("icon-block-" + sbn.getKey(),
-                "[图标屏蔽] 已屏蔽 importance=" + importance + " key=" + sbn.getKey());
     }
 
     /**
