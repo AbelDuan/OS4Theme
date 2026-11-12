@@ -147,6 +147,44 @@ public class MainHook extends XposedModule {
     /** 边沿刚到时读到的屏幕方向，-1 表示还没读到。 */
     private static volatile int sUnfoldRotation = -1;
     /**
+     * 本次进入内屏是「真的展开」还是「内屏亮屏唤醒」（v3.295.3）。
+     *
+     * <p>用户 2026-11-12 反馈：一直停在内屏、锁屏后再唤醒，屏幕仍是 270°。
+     * 原因是 {@code ACTION_SCREEN_ON} 也走「展开边沿」这条路，
+     * 而展开路径是「先钉 270° 再解除锁定」—— 于是一直在内屏时唤醒，
+     * 也被硬钉回 270°，不会跟随唤醒时的传感器方向。
+     *
+     * <p>所以亮屏时必须区分两种来源：
+     * <ul>
+     *   <li><b>真的展开</b>（外屏→内屏）：仍走「钉 270°」，
+     *       否则展开瞬间系统还没把方向定下来，会被竖屏接住（见上方注释）；</li>
+     *   <li><b>内屏亮屏唤醒</b>：折叠状态没变过，屏幕方向本来就是对的，
+     *       不需要钉，直接按当前传感器解除锁定即可。</li>
+     * </ul>
+     *
+     * <p>用「到期时刻」而不是布尔标记：亮屏会连发多次回调
+     * （{@code SCREEN_ON} 广播 + DisplayListener + 延迟判定），
+     * 谁先到都拿得到正确结论；同时也避免标记残留影响下一次真正的展开。
+     */
+    private static volatile long sScreenOnUntil = 0L;
+    /** 亮屏窗口时长：够覆盖亮屏那一刻的几条连发回调，又不至于盖住后续真正的展开。 */
+    private static final long SCREEN_ON_WINDOW_MS = 1500L;
+
+    /**
+     * 熄屏那一刻的屏幕方向（v3.295.3）。
+     *
+     * <p>用户要求：<b>「熄屏时屏幕在什么方向，点亮后就停在什么方向」</b>。
+     * 这个值既是亮屏后要钉住的方向，也是判断「亮屏后方向是否被带偏」的基准。
+     * -1 表示没有记录（进程重启 / 没收到熄屏广播）。
+     */
+    private static volatile int sScreenOffRotation = -1;
+
+    /** 当前是否处在「刚亮屏」的窗口内。 */
+    private static boolean inScreenOnWindow() {
+        long until = sScreenOnUntil;
+        return until > 0L && System.currentTimeMillis() < until;
+    }
+    /**
      * 当前通知卡片实际宽度（px），由 {@link NotifWidth} 每次算出新值时写入，
      * 仅作调试参考（记录当前卡片宽度）。顶部时间卡片跟随卡片宽度是
      * 直接通过资源 {@code qs_panel_width} 实现的（见 NotifWidth），不依赖这个值。
@@ -298,8 +336,10 @@ public class MainHook extends XposedModule {
      *
      * <p>现在改为**惰性 + 幂等**：任何一次联动入口都会补装一遍，装过就不再重复。
      *
-     * <p>⚠️ 2026-10-25 用户要求：**取消「解锁屏幕」这个触发点**，
-     * 只保留「开内屏」与「点亮屏幕」两种判定（ACTION_USER_PRESENT 已移除）。
+     * <p>⚠️ 2026-10-25 用户曾要求取消「解锁屏幕」触发点；
+     * 2026-11-12 用户**重新要求加回**，但行为与展开/亮屏一致：
+     * 内屏解锁时临时解除方向锁定几秒后恢复（见 {@link #onInnerUnlocked()}）。
+     * 所以现在有三个判定：开内屏、点亮屏幕、解锁屏幕。
      */
     private static void ensureScreenWatchers(final Context ctx) {
         if (sScreenWatchersInstalled || ctx == null) {
@@ -320,27 +360,80 @@ public class MainHook extends XposedModule {
                                     // 点亮屏幕也当作「刚刚打开内屏」判定一次。
                                     // 先清状态，否则会被「已经是内屏」的重复触发挡回去。
                                     sIsInnerNow = false;
+                                    // 🔑 v3.295.3：标记本次来源是「亮屏」而不是「真的展开」。
+                                    //   用到期时刻而不是布尔值：亮屏会连发多次回调，
+                                    //   谁先到都能拿到正确结论（见 sScreenOnUntil 注释）。
+                                    sScreenOnUntil = System.currentTimeMillis() + SCREEN_ON_WINDOW_MS;
+                                    // 🔴 v3.295.3（用户 2026-11-12）：
+                                    //   「熄屏时屏幕在什么方向，点亮后就停在什么方向」。
+                                    //   亮屏瞬间先把屏幕钉回熄屏时的方向，
+                                    //   避免系统在点亮过程中按旧状态把方向带偏。
+                                    //   随后 applyInnerFixedLandscape 会按「亮屏」分支
+                                    //   临时解除锁定几秒（与展开逻辑一致），
+                                    //   让方向能跟随此刻的传感器。
+                                    int offRot = sScreenOffRotation;
+                                    if (offRot >= 0 && isInnerDisplayActiveNow(context)) {
+                                        pinInnerRotation(offRot);
+                                        LogUtil.logAlways("[内屏联动] 亮屏：先钉回熄屏时的方向="
+                                                + offRot);
+                                    }
                                     applyInnerFixedLandscape();
                                     // 补一次延迟判定：亮屏广播可能早于设备状态刷新
                                     applyInnerFixedLandscapeDeferred();
                                 } else if (Intent.ACTION_SCREEN_OFF.equals(a)) {
                                     RotationHint.onScreenStateChanged(false);
+                                    // 🔴 v3.295.4（用户 2026-11-12）：
+                                    //   「竖屏锁屏，等到 AOD 亮起时已经变成横屏了」。
+                                    //
+                                    //   根因是熄屏时的**锁定顺序错了**：
+                                    //   原来先 pinInnerRotation(记录的方向)，
+                                    //   紧接着 relockInner() 内部又调
+                                    //   callWindowManagerRotation(true) —— 那是
+                                    //   setRotationLockForFold(true, -1, false)，
+                                    //   而 -1 的语义是「以**当前**方向为准锁定」。
+                                    //   熄屏瞬间系统可能已按传感器把内容转成横屏，
+                                    //   于是这次 -1 把刚钉好的竖屏覆盖成横屏，
+                                    //   AOD 一亮就是横的。
+                                    //
+                                    //   修法：**只锁一次，且显式锁在熄屏这一刻的方向上**。
+                                    //   不再走 relockInner 的 -1 版锁定。
+                                    // ⚠️ 用按折叠状态明确指认内屏的方式读方向
+                                    //   （OrientationForcer.rotationByFoldState），
+                                    //   而不是 readScreenRotationNow() 挑「第一个 STATE_ON 的屏」——
+                                    //   熄屏瞬间内屏可能已是 OFF/DOZE，挑不到就会读错或读不到。
+                                    boolean wasInner = isInnerDisplayActiveNow(context);
+                                    if (wasInner) {
+                                        sScreenOffRotation =
+                                                OrientationForcer.rotationByFoldState(sInnerCtx);
+                                    } else {
+                                        // 外屏熄屏 → 清掉旧值，避免之后内屏亮屏
+                                        // 误用「上次内屏熄屏」留下的方向。
+                                        sScreenOffRotation = -1;
+                                    }
+                                    LogUtil.logAlways("[内屏联动] 熄屏：记录方向="
+                                            + sScreenOffRotation + "（内屏=" + wasInner + "）");
+                                    if (sScreenOffRotation >= 0) {
+                                        // 显式钉在熄屏这一刻的方向，绝不使用 -1
+                                        pinInnerRotation(sScreenOffRotation);
+                                        // 只写开关值，不再触发任何方向改写
+                                        setInnerAutoRotate(context.getContentResolver(), false);
+                                    }
                                     // 熄屏后重置内屏状态：下次唤醒若仍是展开态，
                                     // 会重新走一遍判定，不会因为状态残留被当成重复触发。
                                     sIsInnerNow = false;
-                                    // 熄屏等同「合上」：取消计时并恢复锁定，
-                                    // 避免计时器在息屏期间到点乱改设置。
-                                    // 钉 270° 同理作废：熄屏后再被回调解锁没有意义。
                                     sUnfoldSettling = false;
                                     sUnfoldGen++;
-                                    try {
-                                        if (sFollowing) {
-                                            cancelFollowTimer();
-                                            relockInner(context.getContentResolver(),
-                                                    "熄屏取消计时，已恢复锁定");
-                                        }
-                                    } catch (Throwable unused) {
-                                    }
+                                    // 跟随窗口一律终止（不调 relockInner，避免它的 -1 锁方向）
+                                    cancelFollowTimer();
+                                    sFollowing = false;
+                                    sOccupyUntil = 0L;
+                                    persistInnerState();
+                                } else if (Intent.ACTION_USER_PRESENT.equals(a)) {
+                                    // 🔴 v3.295.6（用户 2026-11-12 要求）：
+                                    //   在「展开」「亮屏」之外，再增加「解锁」这个触发点，
+                                    //   同样临时解除方向锁定几秒，让屏幕按当前传感器自由旋转。
+                                    //   只在内屏生效（见 onInnerUnlocked 内部判断）。
+                                    onInnerUnlocked();
                                 }
                             } catch (Throwable unused) {
                             }
@@ -348,6 +441,7 @@ public class MainHook extends XposedModule {
                     },
                     new IntentFilter(Intent.ACTION_SCREEN_ON) {{
                         addAction(Intent.ACTION_SCREEN_OFF);
+                        addAction(Intent.ACTION_USER_PRESENT);
                     }});
             LogUtil.logAlways("[旋转提示] 已注册屏幕开关监听（熄屏注销传感器）");
         } catch (Throwable t2) {
@@ -1426,6 +1520,11 @@ public class MainHook extends XposedModule {
     /** 窗口冷却时长。 */
     private static final long INNER_WINDOW_COOLDOWN_MS = 4000L;
 
+    /** 展开钉 270° 时的轮询间隔（v3.295.9）：每 60ms 看一次屏幕是否已到目标方向。 */
+    private static final long UNFOLD_PIN_POLL_MS = 60L;
+    /** 展开钉 270° 的最长等待（v3.295.9）：超过就按超时处理，避免无限等。 */
+    private static final long UNFOLD_PIN_MAX_WAIT_MS = 2000L;
+
     /**
      * 检查用户是否在这期间**手动改过**设置。
      *
@@ -1592,9 +1691,19 @@ public class MainHook extends XposedModule {
         // ②' 模块正占用着旋转锁（跟随窗口内）→ 此刻的写入大概率是 MIUI 旋转服务
         //     对刚才解锁动作的同步回推，不是用户在操作。宁可放过，不能误判：
         //     一旦误判成「用户要锁定」，用户自己打开的自动旋转就被永久记住了。
+        // 🔴 v3.295.8（用户 2026-11-12「手动设置的自由旋转被覆盖」）：
+        //   跟随窗口内**不能一律**把设置变化当系统回推。
+        //
+        //   原来只要 occupying 就忽略，于是用户在 5 秒窗口期内
+        //   亲手打开「自由旋转」，这个动作被当成噪声丢掉，
+        //   5 秒一到 relockInner 又把开关写回 0 —— 用户的选择被覆盖。
+        //
+        //   现在区分方向：模块「占用」的是「这把 1 由我写」这件事，
+        //   所以只有「变成 0」（回锁方向的噪声）才忽略；
+        //   **变成 1 一定是用户亲手开的**（模块不会在窗口内自己写 1），必须认。
         boolean occupying = sFollowing
                 || (sOccupyUntil > 0L && System.currentTimeMillis() < sOccupyUntil);
-        if (occupying) {
+        if (occupying && crV == 0) {
             sLastSeenCr = crV;
             LogUtil.logAlways("[用户意志] 跟随窗口内的设置变化（" + crV
                     + "）视为系统回推，不记为用户选择");
@@ -2011,6 +2120,29 @@ public class MainHook extends XposedModule {
                     if (!sFollowing) {
                         return;   // 已被合上 / 熄屏取消
                     }
+                    // 🔴 v3.295.10（用户 2026-11-12「手动开关展开后几秒被覆盖」）：
+                    //   恢复锁定前必须再确认一次「开关还是模块打开的那个」。
+                    //
+                    //   ⚠️ 判据不能用 sOccupyUntil 是否过期：
+                    //     它是「跟随窗口 + 3000ms 自愈余量」= 8 秒，
+                    //     而回锁发生在 5 秒 → 到点这一刻它永远没过期，
+                    //     拿它判断等于什么都没判。
+                    //
+                    //   正确判据：跟随开始时我们把 sLockSnapshot 记成 1，
+                    //   表示「此刻键上的值是我写的」。到点再看：
+                    //     · 键上已经不是 1（用户关掉了）→ 走下面的 isAutoRotateOn 分支；
+                    //     · 键上还是 1，但 sUserIntent==1 → 用户中途打开过，不能回锁；
+                    //   两个分支之后才是「确实还是模块的那把 1」→ 回锁。
+                    //
+                    //   这里额外加一条：若占用标记已被用户操作清零
+                    //   （onInnerSwitchMaybeChanged 会置 0L），也不再回锁。
+                    if (sOccupyUntil <= 0L) {
+                        sFollowing = false;
+                        persistInnerState();
+                        LogUtil.logAlways("[内屏联动] 计时结束：占用已被用户操作清零，"
+                                + "开关不归模块管，保持现状不回锁");
+                        return;
+                    }
                     // 用户在窗口期内自己动了开关 → 已记为用户意志，最高优先级
                     if (sUserIntent == 1) {
                         sFollowing = false;
@@ -2090,6 +2222,29 @@ public class MainHook extends XposedModule {
         }
     }
 
+    /**
+     * 屏幕当前是否处于点亮可交互状态（v3.295.4）。
+     *
+     * <p>熄屏后 SystemUI 仍会收到 DisplayListener / 延迟判定等回调，
+     * 这些回调会走进「展开」流程并把方向改成 270°，导致 AOD 亮起时是横屏。
+     * 用 PowerManager.isInteractive() 挡住它们。
+     */
+    private static boolean isInteractiveNow(Context ctx) {
+        try {
+            if (ctx == null) {
+                ctx = sInnerCtx;
+            }
+            if (ctx == null) {
+                return true;      // 拿不到 Context 时不拦截，保持原行为
+            }
+            android.os.PowerManager pm =
+                    (android.os.PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
+            return pm == null || pm.isInteractive();
+        } catch (Throwable unused) {
+            return true;
+        }
+    }
+
     static boolean isUnfoldWindowActive() {
         return sUnfoldSettling || (sFollowing && sInnerFollowRotation.get());
     }
@@ -2131,6 +2286,23 @@ public class MainHook extends XposedModule {
             }
 
             boolean isInnerActive = isInnerDisplayActive(dm, cr);
+
+            // 🔴 v3.295.4（用户 2026-11-12「竖屏锁屏，AOD 亮起时已变横屏」）：
+            //   **熄屏期间一律不进入「展开」判定**。
+            //
+            //   日志实测：熄屏 130ms 后仍会收到 DisplayListener / 延迟判定回调，
+            //   sIsInnerNow 已被熄屏分支清成 false，于是被当成「刚展开」，
+            //   走「钉 270° → 700ms 后解除锁定 5 秒 → 再锁在当前方向」的完整流程。
+            //   结果就是：熄屏那一刻的竖屏，被这一整套流程改成了横屏，
+            //   AOD 一亮就是横的。
+            //
+            //   熄屏时屏幕不面向用户，没有任何「展开/跟随」的意义，
+            //   方向已在熄屏分支里显式钉死，这里直接返回即可。
+            if (!isInteractiveNow(ctx)) {
+                LogUtil.logAlwaysOnce("inner-sleep",
+                        "[内屏联动] 熄屏期间，跳过展开/跟随判定");
+                return;
+            }
 
             // 每次进来都先自愈一次「上次跟随被打断」的遗留（进程重启也能收回来）
             boolean healed = healInnerLockIfStale("联动入口");
@@ -2214,15 +2386,31 @@ public class MainHook extends XposedModule {
                     relockInner(cr, "检测到上次跟随的遗留占用，已恢复锁定（自愈）");
                     return;
                 }
-                // 记住这是用户的选择，之后展开/亮屏都不再介入
-                if (sUserIntent != 1) {
-                    sUserIntent = 1;
-                    persistInnerState();
+                // 🔴 v3.295.8（用户 2026-11-12「手动设置的自由旋转被覆盖」）：
+                //   **不能**因为「此刻开关是开的」就无条件记成用户意志并落盘。
+                //
+                //   原来的写法有两个后果：
+                //     ① 模块刚写完 1（展开/亮屏就会写），下一轮进来看到 1，
+                //        立刻把这个 1 当成「用户的选择」永久落盘；
+                //     ② 一旦落盘成 sUserIntent==1，之后所有「回锁」都被跳过，
+                //        用户后来手动关掉开关，模块也不会再管 —— 状态彻底错乱。
+                //
+                //   判据改为「这把 1 不是模块所写」：只有确认不是模块写的，
+                //   才算用户亲手打开，值得永久记住并让位。
+                boolean selfWritten = sSelfWrittenCr == 1
+                        && android.os.SystemClock.uptimeMillis() - sSelfWriteAt < 1500L;
+                if (!selfWritten) {
+                    if (sUserIntent != 1) {
+                        sUserIntent = 1;
+                        persistInnerState();
+                    }
+                    sFollowing = false;
+                    LogUtil.logAlways("[内屏联动] 旋转锁本来就是打开且不是模块所写"
+                            + " → 视为用户选择自由旋转，联动让位");
+                    return;
                 }
-                sFollowing = false;
-                LogUtil.logAlways("[内屏联动] 旋转锁本来就是打开且不是模块所写"
-                        + " → 视为用户选择自由旋转，联动让位");
-                return;
+                // 是模块刚写的 1 → 不是用户意志，继续走正常流程
+                LogUtil.logAlways("[内屏联动] 开关为 1 但是模块刚写的（非用户意志），继续联动流程");
             }
 
             // 规则 1：锁定中 → 先钉住 270°，稳定后再解除锁定跟随
@@ -2231,9 +2419,39 @@ public class MainHook extends XposedModule {
             //   此时直接解除锁定，那一次短暂的「竖屏」就会被当成当前方向接住，
             //   表现为「展开后是竖屏（摄像头在顶部）」，偶尔发生、复现靠时序。
             //   所以改成：边沿到达 → 立刻钉 270° → 等系统把方向定下来 → 再解除锁定。
-            if (Constants.PIN_INNER_270_ON_UNFOLD) {
+            //
+            // 🔴 v3.295.3（用户 2026-11-12）：**内屏亮屏唤醒不钉 270°**。
+            //   一直停在内屏、锁屏后再唤醒时，也走这条「展开」路径，
+            //   于是被硬钉回 270°，不跟随唤醒时的传感器方向。
+            //   亮屏场景下屏幕方向本来就是对的（折叠状态没变过），
+            //   不需要「先钉再放」，直接走下面的解除锁定即可。
+            //
+            //   ⚠️ 用「亮屏窗口」判断而不是一次性标记：亮屏会连发多次回调
+            //   （SCREEN_ON 广播 + DisplayListener + 延迟判定），无论谁先到都能正确分类。
+            boolean screenOnEdge = inScreenOnWindow();
+            if (Constants.PIN_INNER_270_ON_UNFOLD && !screenOnEdge) {
                 enterUnfoldSettle(cr);
                 return;
+            }
+            if (screenOnEdge) {
+                // 🔴 v3.295.7（用户 2026-11-12「解锁没回到可旋转」）：
+                //   亮屏时若上一次「钉 270°」的标志位还挂着，必须在这里作废。
+                //
+                //   日志实证：
+                //     ... 展开：先钉 3°，等 700ms 稳定后再解除锁定  ← sUnfoldSettling=true
+                //     ... 内屏亮屏唤醒：不钉 270°...                 ← 绕过了 enterUnfoldSettle
+                //     ... 展开：已放开旋转锁，5000ms 后恢复锁定       ← 标志位从未复位
+                //     ... 解锁：正在展开钉 270° 窗口内，交给展开流程   ← 解锁被永久挡住
+                //
+                //   钉住窗口的 700ms 回调只在 enterUnfoldSettle 里注册，
+                //   而亮屏这条路根本没进去 → 回调不存在 → 标志位永久停在 true。
+                //   之后每次解锁都被这个死标志挡住，永远不解除锁定。
+                if (sUnfoldSettling) {
+                    sUnfoldSettling = false;
+                    sUnfoldGen++;
+                    LogUtil.logAlways("[内屏联动] 亮屏：作废遗留的钉 270° 标志位");
+                }
+                LogUtil.logAlways("[内屏联动] 内屏亮屏唤醒：不钉 270°，直接按当前方向解除锁定");
             }
             // —— 以下为「不钉 270°」的原始路径（关闭「展开钉 270°」时） ——
             // 窗口冷却：同一次亮屏里 DisplayListener / SCREEN_ON 会连续进来，
@@ -2268,6 +2486,94 @@ public class MainHook extends XposedModule {
             scheduleRelock(cr, Constants.INNER_FOLLOW_DURATION_MS);
         } catch (Throwable th) {
             LogUtil.logAlways("[内屏联动] 异常: " + th);
+        }
+    }
+
+    /**
+     * 内屏「解锁」触发：临时解除方向锁定，让屏幕按当前传感器自由旋转，
+     * {@link Constants#INNER_FOLLOW_DURATION_MS} 后自动恢复锁定。
+     *
+     * <p>🔴 v3.295.6（用户 2026-11-12 要求）：
+     * 在「展开」「亮屏」之外，**再增加解锁这个触发点**，行为完全一致。
+     *
+     * <h2>为什么不直接调 applyInnerFixedLandscape</h2>
+     * 那个方法里有「已是内屏就直接 return」的守卫（{@code if (sIsInnerNow) return;}），
+     * 而解锁时用户本来就在内屏、sIsInnerNow 通常已经是 true ——
+     * 走那条路会被守卫直接挡掉，解锁永远不生效。所以这里单独开一个入口，
+     * 只做「解锁让位」这一件事，不参与展开边沿的识别。
+     *
+     * <h2>生效范围</h2>
+     * 只在内屏生效（用户要求）；外屏解锁完全不受影响。
+     */
+    static void onInnerUnlocked() {
+        if (!sInnerFollowRotation.get()) {
+            return;
+        }
+        if (!isSystemUiProc()) {
+            return;
+        }
+        Context ctx = sInnerCtx;
+        if (ctx == null) {
+            return;
+        }
+        try {
+            // 熄屏期间不解锁（此时屏幕不面向用户，方向已由熄屏分支钉死）
+            if (!isInteractiveNow(ctx)) {
+                return;
+            }
+            // 只在内屏生效
+            if (!isInnerDisplayActiveNow(ctx)) {
+                return;
+            }
+            // 正在钉 270° 的展开窗口里：交给展开流程，别抢
+            if (sUnfoldSettling) {
+                LogUtil.logAlways("[内屏联动] 解锁：正在展开钉 270° 窗口内，交给展开流程");
+                return;
+            }
+            // 已经在跟随计时中：不重复开窗
+            if (sFollowing) {
+                LogUtil.logAlways("[内屏联动] 解锁：跟随计时中，忽略");
+                return;
+            }
+            // 用户自己开着自动旋转 → 尊重用户，不接管
+            android.content.ContentResolver cr = ctx.getContentResolver();
+            int userSwitch = readSysInt(cr, "accelerometer_rotation", -1);
+            boolean switchOn = userSwitch >= 0 ? userSwitch != 0 : isAutoRotateOn(cr);
+            if (switchOn) {
+                if (sOccupyUntil > 0L) {
+                    relockInner(cr, "解锁：检测到上次跟随的遗留占用，已恢复锁定（自愈）");
+                    return;
+                }
+                // 🔴 v3.295.8：同样只在「不是模块所写」时才算用户意志
+                boolean selfWritten = sSelfWrittenCr == 1
+                        && android.os.SystemClock.uptimeMillis() - sSelfWriteAt < 1500L;
+                if (!selfWritten) {
+                    if (sUserIntent != 1) {
+                        sUserIntent = 1;
+                        persistInnerState();
+                    }
+                    LogUtil.logAlways("[内屏联动] 解锁：旋转锁本来就是用户打开的，联动让位");
+                    return;
+                }
+                LogUtil.logAlways("[内屏联动] 解锁：开关为 1 但是模块刚写的（非用户意志），继续");
+
+            }
+            // 模块上次跟随的遗留占用：先收回，再开新窗口
+            healInnerLockIfStale("解锁触发");
+
+            sFollowing = true;
+            callWindowManagerRotation(false);
+            setInnerAutoRotate(cr, true);
+            sLockSnapshot = 1;
+            sOccupyUntil = System.currentTimeMillis()
+                    + Constants.INNER_FOLLOW_DURATION_MS + 3000L;
+            persistInnerState();
+            LogUtil.logAlways("[内屏联动] 解锁：已解除方向锁定，按传感器自由旋转，"
+                    + Constants.INNER_FOLLOW_DURATION_MS + "ms 后恢复锁定");
+            RotationHint.reconcileRotationHint("内屏联动：解锁后临时放开锁定");
+            scheduleRelock(cr, Constants.INNER_FOLLOW_DURATION_MS);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[内屏联动] 解锁处理异常: " + th);
         }
     }
 
@@ -2309,7 +2615,22 @@ public class MainHook extends XposedModule {
         RotationHint.reconcileRotationHint("内屏联动：展开钉 270°");
 
         final Context ctx = sInnerCtx;
-        sInnerHandler.postDelayed(new Runnable() {
+        // 🔴 v3.295.9（用户 2026-11-12「展开时不是 270 而是 0 度」）：
+        //   **不能固定等 700ms 就解除锁定**。
+        //
+        //   日志实证：
+        //     展开：先钉 3°（此刻屏幕方向=0）   ← 展开时屏幕还是竖的
+        //     setRotationLockForFold(true, 3)   ← 钉了 270
+        //     [700ms 后]
+        //     setRotationLockForFold(false,-1)  ← 立刻解除锁定
+        //   屏幕从 0 转到 3 实际要 900ms+，700ms 时还没转完，
+        //   一解除锁定系统就按「当时实际方向 0」处理 → 展开后是竖屏。
+        //
+        //   修法：**轮询等屏幕真的到达目标方向**再解除锁定，
+        //   而不是靠猜一个固定时长。最多等 UNFOLD_PIN_MAX_WAIT_MS 兜底。
+        final Runnable[] step = new Runnable[1];
+        final long startAt = android.os.SystemClock.uptimeMillis();
+        step[0] = new Runnable() {
             @Override
             public void run() {
                 if (gen != sUnfoldGen) {
@@ -2318,10 +2639,32 @@ public class MainHook extends XposedModule {
                 if (!sUnfoldSettling) {
                     return;
                 }
+                // 屏幕还没转到目标方向 → 继续等（这才是「稳定」的真正含义）
+                int now = OrientationForcer.rotationByFoldState(ctx);
+                long waited = android.os.SystemClock.uptimeMillis() - startAt;
+                if (now != Constants.UNFOLD_PIN_ROTATION
+                        && waited < UNFOLD_PIN_MAX_WAIT_MS) {
+                    sInnerHandler.postDelayed(this, UNFOLD_PIN_POLL_MS);
+                    return;
+                }
+                if (now == Constants.UNFOLD_PIN_ROTATION) {
+                    LogUtil.logAlways("[内屏联动] 屏幕已到达 270°（等待 " + waited + "ms），解除锁定");
+                } else {
+                    LogUtil.logAlways("[内屏联动] 等待 " + waited + "ms 仍未到 270°（当前="
+                            + now + "），按超时处理");
+                }
                 try {
                     // 开关被关掉 / 已经合上 → 不往下走，由对应入口收尾
                     if (!sInnerFollowRotation.get() || !isSystemUiProc()) {
                         sUnfoldSettling = false;
+                        return;
+                    }
+                    // 🔴 v3.295.4：这 700ms 里若熄屏了，本次钉住直接作废，
+                    //   否则会在熄屏后继续「解除锁定 5 秒 → 锁在当前方向」，
+                    //   把熄屏分支钉好的方向改掉（AOD 变横屏的成因之一）。
+                    if (!isInteractiveNow(ctx)) {
+                        sUnfoldSettling = false;
+                        LogUtil.logAlways("[内屏联动] 钉 270° 等待期间已熄屏，本次作废");
                         return;
                     }
                     boolean inner = isInnerDisplayActive(
@@ -2357,7 +2700,8 @@ public class MainHook extends XposedModule {
                     LogUtil.logAlways("[内屏联动] 钉 270° 结束处理失败: " + th);
                 }
             }
-        }, Constants.UNFOLD_PIN_SETTLE_MS);
+        };
+        sInnerHandler.postDelayed(step[0], UNFOLD_PIN_POLL_MS);
     }
 
     /** 显式把内屏锁到指定方向（只影响本次，不写 Settings）。 */
