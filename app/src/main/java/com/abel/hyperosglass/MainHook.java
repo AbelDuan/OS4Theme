@@ -134,6 +134,19 @@ public class MainHook extends XposedModule {
     /** 上一次看到的活跃屏是否为内屏，用于识别展开边沿。 */
     private static volatile boolean sIsInnerNow = false;
     /**
+     * 展开时「先钉到 270°」是否还在进行中（v3.294.0）。
+     *
+     * <p>展开那一刻 system_server 还没把屏幕一脚踢回竖屏（0），
+     * 此时直接解除锁定就会被竖屏「接住」。所以边沿到达后先钉住 270°，
+     * 等 {@link Constants#UNFOLD_PIN_SETTLE_MS} 再解除锁定。
+     * 置位期间 {@link #applyInnerFixedLandscape()} 只做校验，不再重复排队。
+     */
+    private static volatile boolean sUnfoldSettling = false;
+    /** 本次「钉 270°」属于哪一次展开（代际号），用来丢弃过期回调。 */
+    private static volatile int sUnfoldGen = 0;
+    /** 边沿刚到时读到的屏幕方向，-1 表示还没读到。 */
+    private static volatile int sUnfoldRotation = -1;
+    /**
      * 当前通知卡片实际宽度（px），由 {@link NotifWidth} 每次算出新值时写入，
      * 仅作调试参考（记录当前卡片宽度）。顶部时间卡片跟随卡片宽度是
      * 直接通过资源 {@code qs_panel_width} 实现的（见 NotifWidth），不依赖这个值。
@@ -317,6 +330,9 @@ public class MainHook extends XposedModule {
                                     sIsInnerNow = false;
                                     // 熄屏等同「合上」：取消计时并恢复锁定，
                                     // 避免计时器在息屏期间到点乱改设置。
+                                    // 钉 270° 同理作废：熄屏后再被回调解锁没有意义。
+                                    sUnfoldSettling = false;
+                                    sUnfoldGen++;
                                     try {
                                         if (sFollowing) {
                                             cancelFollowTimer();
@@ -1340,6 +1356,21 @@ public class MainHook extends XposedModule {
     /** 模块当前是否持有「未还原的改动」。 */
     /** 是否正处于「展开后跟随」的 5 秒窗口内 —— 期间不再重复触发，否则会把计时器重置。 */
     private static volatile boolean sFollowing = false;
+
+    /**
+     * 🔑 v3.294.4：折叠状态**由边沿事件记录**，不做实时查询。
+     *
+     * <p>用户 2026-11-12 的要求：「在屏幕展开或折叠的时候写个值，后面读取这个值就好了」。
+     *
+     * <p>原因：{@code current_device_state} 在展开/合上的**过渡期**会短暂停留旧值，
+     * 而 {@code Display.getState()} 在两块屏交接时可能同时为 ON —— 实时查询得到的
+     * 结果取决于「查询那一刻恰好发生了什么」，这正是「有时能转、有时转不动」的根源。
+     * 边沿事件是确定性的，记下来之后读取永远一致。
+     */
+    private static volatile boolean sInnerActive = false;
+
+    /** 这个状态值是什么时候写下的（uptimeMillis），仅用于日志与诊断。 */
+    private static volatile long sInnerStateAt = 0L;
     /** 合上时我们是否主动关闭了旋转锁定（用于判断后续开关是否被别人改动）。 */
     /** 我们写入（或期望）的 accelerometer_rotation_inner 值：1=未锁定 0=锁定。 */
     private static volatile int sLockSnapshot = -1;
@@ -1886,8 +1917,14 @@ public class MainHook extends XposedModule {
                     cr, "current_device_state", -1);
             if (st >= 0) {
                 boolean inner = (st == 3);
-                LogUtil.logAlways("[内屏固定] current_device_state=" + st
-                        + " → 内屏=" + inner);
+                // 🔑 v3.294.6（用户 2026-11-12 要求「我不懂为什么要轮询」）：
+                //   这里原来无条件打日志，而这个方法会被高频调用（每次屏幕事件、
+                //   每次 reconcile 都走一遍），实测每秒刷十几次 —— 既费资源又会掩盖
+                //   真正的信号。改成只在状态**发生变化**时记录。
+                if (inner != sInnerActive) {
+                    LogUtil.logAlways("[内屏固定] current_device_state=" + st
+                            + " → 内屏=" + inner);
+                }
                 return inner;
             }
         } catch (Throwable th) {
@@ -2005,6 +2042,58 @@ public class MainHook extends XposedModule {
         }, delayMs);
     }
 
+    /**
+     * 内屏是否处于「展开中 / 可自由旋转」的窗口期。
+     *
+     * <p>v3.294.1（用户 2026-11-12）：这期间系统本来就允许屏幕自由旋转，
+     * 旋钮不该出现 —— 展开动作本身还会制造「方向不一致」，导致
+     * 「手机还没完全展开旋钮就冒出来」。两类窗口都算：
+     * <ol>
+     *   <li>钉 270° 的防抖窗口：{@link #sUnfoldSettling}；</li>
+     *   <li>解除锁定后的跟随窗口：{@link #sFollowing}。</li>
+     * </ol>
+     * 合上 / 熄屏会立刻把这两个标志清掉，所以外屏不受影响。
+     */
+    /**
+     * 折叠状态：当前是否内屏（**读边沿记录的值**，不做实时查询）。
+     *
+     * <p>🔑 v3.294.4（用户 2026-11-12 要求）：屏幕翻转相关的判断一律用这个值，
+     * 不再每次去查 {@code current_device_state} / {@code Display.getState()} ——
+     * 过渡期那两者都不可靠，实时查询的结果取决于「查询那一刻恰好发生了什么」，
+     * 这正是「有时能转、有时转不动」的根源。
+     *
+     * <p>只在展开/合上边沿写入；进程刚启动还没经历过边沿时，
+     * 用一次实时值做初值（仅此一次）。
+     */
+    static boolean isInnerScreenRemembered(Context ctx) {
+        if (sInnerStateAt > 0L) {
+            return sInnerActive;
+        }
+        // 首次读取：进程刚起来，还没经历过任何边沿，用实时值初始化一次
+        boolean now = isInnerDisplayActiveNow(ctx);
+        sInnerActive = now;
+        sInnerStateAt = android.os.SystemClock.uptimeMillis();
+        LogUtil.logAlways("[内屏固定] 初值：内屏=" + now + "（此后只读边沿记录）");
+        return now;
+    }
+
+    /** 实时读一次折叠状态（只用于初始化记忆值，业务逻辑不要直接调用）。 */
+    private static boolean isInnerDisplayActiveNow(Context ctx) {
+        try {
+            android.hardware.display.DisplayManager dm =
+                    (android.hardware.display.DisplayManager)
+                            ctx.getSystemService(Context.DISPLAY_SERVICE);
+            android.content.ContentResolver cr = ctx.getContentResolver();
+            return isInnerDisplayActive(dm, cr);
+        } catch (Throwable unused) {
+            return sInnerActive;
+        }
+    }
+
+    static boolean isUnfoldWindowActive() {
+        return sUnfoldSettling || (sFollowing && sInnerFollowRotation.get());
+    }
+
     static void applyInnerFixedLandscape() {
         if (!sInnerFollowRotation.get()) {
             // 诊断用：开关没生效时也能在日志里看到，不再"静默无反应"
@@ -2052,8 +2141,17 @@ public class MainHook extends XposedModule {
                     LogUtil.logAlways("[内屏联动] 已合上");
                 }
                 sIsInnerNow = false;
+                // 🔑 v3.294.4：合上边沿写状态值（内屏 → 外屏）
+                sInnerActive = false;
+                sInnerStateAt = android.os.SystemClock.uptimeMillis();
                 // 折叠状态真的变了 → 清掉窗口冷却，下次展开照常解锁
                 sLastWindowEndAt = 0L;
+                // 钉 270° 还没结束就合上了 → 作废，避免迟到的回调在合上后解锁
+                if (sUnfoldSettling) {
+                    sUnfoldSettling = false;
+                    sUnfoldGen++;
+                    LogUtil.logAlways("[内屏联动] 钉 270° 期间合上，本次钉住作废");
+                }
                 // 规则 3：5 秒内合上 → 立即停止计时，并把旋转锁打开
                 if (sFollowing) {
                     cancelFollowTimer();
@@ -2077,6 +2175,9 @@ public class MainHook extends XposedModule {
                 return;
             }
             sIsInnerNow = true;
+            // 🔑 v3.294.4：展开边沿写状态值（外屏 → 内屏）
+            sInnerActive = true;
+            sInnerStateAt = android.os.SystemClock.uptimeMillis();
             LogUtil.logAlways("[内屏联动] 检测到展开");
 
             // 已在计时中（多次入口重复触发）：忽略
@@ -2124,7 +2225,17 @@ public class MainHook extends XposedModule {
                 return;
             }
 
-            // 规则 1：锁定中 → 关掉锁定，5 秒后恢复
+            // 规则 1：锁定中 → 先钉住 270°，稳定后再解除锁定跟随
+            // ⚠️ v3.294.0 修复「偶尔展开后是竖屏」：
+            //   展开边沿到达时，system_server 还没把屏幕踢回 ROTATION_0 ——
+            //   此时直接解除锁定，那一次短暂的「竖屏」就会被当成当前方向接住，
+            //   表现为「展开后是竖屏（摄像头在顶部）」，偶尔发生、复现靠时序。
+            //   所以改成：边沿到达 → 立刻钉 270° → 等系统把方向定下来 → 再解除锁定。
+            if (Constants.PIN_INNER_270_ON_UNFOLD) {
+                enterUnfoldSettle(cr);
+                return;
+            }
+            // —— 以下为「不钉 270°」的原始路径（关闭「展开钉 270°」时） ——
             // 窗口冷却：同一次亮屏里 DisplayListener / SCREEN_ON 会连续进来，
             // 冷却期内不再开第二个窗口（折叠状态没变时才生效）
             long sinceEnd = android.os.SystemClock.uptimeMillis() - sLastWindowEndAt;
@@ -2158,6 +2269,137 @@ public class MainHook extends XposedModule {
         } catch (Throwable th) {
             LogUtil.logAlways("[内屏联动] 异常: " + th);
         }
+    }
+
+    /**
+     * 展开边沿：先把屏幕钉到 270°（摄像头在右上角的横屏），稳定后再解除锁定。
+     *
+     * <h2>为什么必须「先钉再放」</h2>
+     * 用户要的是「展开默认 270°」。原来的做法是边沿一到就 {@code callWindowManagerRotation(false)}
+     * 解除锁定，而那一刻屏幕往往还是 ROTATION_0（外屏竖屏刚切过来），
+     * 于是「解除锁定」解在了竖屏上 —— 这就是「偶尔展开是竖屏」的根因。
+     *
+     * <h2>钉哪个值</h2>
+     * {@code setRotationLockForFold(locked, -1, false)} 的语义是「以当前方向为准锁定」，
+     * 当前是竖屏就锁成竖屏，等于把这个 bug 固定下来。所以这里必须**显式传 270**，
+     * 和不钉时用 -1 的调用区分开。这是本模块唯一会写方向值的地方，
+     * 与「联动只切开关」的铁律不冲突：它不写 Settings，只在本次展开的瞬间决定
+     * 「锁在哪」，随后立刻解除锁定交还给系统。
+     *
+     * <p>钉住期间不写任何 Settings：界面显示「已锁定」是必然的，
+     * 写 {@code accelerometer_rotation} 反而会让用户看到开关自己闪一下。
+     */
+    private static void enterUnfoldSettle(final android.content.ContentResolver cr) {
+        if (sUnfoldSettling) {
+            LogUtil.logAlways("[内屏联动] 正在钉 270°，忽略重复触发");
+            return;
+        }
+        final int gen = ++sUnfoldGen;
+        sUnfoldSettling = true;
+        sFollowing = false;
+        // 记录折叠状态（边沿写入，后续只读这个值）
+        sInnerActive = true;
+        sInnerStateAt = android.os.SystemClock.uptimeMillis();
+        sUnfoldRotation = readScreenRotationNow();
+        LogUtil.logAlways("[内屏联动] 展开：先钉 " + Constants.UNFOLD_PIN_ROTATION
+                + "°，等 " + Constants.UNFOLD_PIN_SETTLE_MS + "ms 稳定后再解除锁定"
+                + "（此刻屏幕方向=" + sUnfoldRotation + "）");
+        pinInnerRotation(Constants.UNFOLD_PIN_ROTATION);
+        // 让旋钮收起：马上要解除锁定，屏幕会自己转
+        RotationHint.reconcileRotationHint("内屏联动：展开钉 270°");
+
+        final Context ctx = sInnerCtx;
+        sInnerHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (gen != sUnfoldGen) {
+                    return;      // 期间又展开/合上过，这次作废
+                }
+                if (!sUnfoldSettling) {
+                    return;
+                }
+                try {
+                    // 开关被关掉 / 已经合上 → 不往下走，由对应入口收尾
+                    if (!sInnerFollowRotation.get() || !isSystemUiProc()) {
+                        sUnfoldSettling = false;
+                        return;
+                    }
+                    boolean inner = isInnerDisplayActive(
+                            (android.hardware.display.DisplayManager)
+                                    ctx.getSystemService(Context.DISPLAY_SERVICE), cr);
+                    if (!inner) {
+                        sUnfoldSettling = false;
+                        return;      // 合上的入口已经处理
+                    }
+                    sUnfoldSettling = false;
+                    if (healInnerLockIfStale("展开钉 270° 结束")) {
+                        return;
+                    }
+                    if (readSysInt(cr, "accelerometer_rotation", -1) != 0) {
+                        // 用户本来就开着自动旋转 → 尊重用户，不接管
+                        LogUtil.logAlways("[内屏联动] 自动旋转本来就是开的，解除钉住后不接管");
+                        callWindowManagerRotation(false);
+                        return;
+                    }
+                    sFollowing = true;
+                    callWindowManagerRotation(false);
+                    setInnerAutoRotate(cr, true);
+                    sLockSnapshot = 1;
+                    sOccupyUntil = System.currentTimeMillis()
+                            + Constants.INNER_FOLLOW_DURATION_MS + 3000L;
+                    persistInnerState();
+                    LogUtil.logAlways("[内屏联动] 钉 270° 结束：已解除锁定，"
+                            + Constants.INNER_FOLLOW_DURATION_MS + "ms 后恢复锁定");
+                    RotationHint.reconcileRotationHint("内屏联动：解除锁定开始跟随");
+                    scheduleRelock(cr, Constants.INNER_FOLLOW_DURATION_MS);
+                } catch (Throwable th) {
+                    sUnfoldSettling = false;
+                    LogUtil.logAlways("[内屏联动] 钉 270° 结束处理失败: " + th);
+                }
+            }
+        }, Constants.UNFOLD_PIN_SETTLE_MS);
+    }
+
+    /** 显式把内屏锁到指定方向（只影响本次，不写 Settings）。 */
+    private static void pinInnerRotation(int rotation) {
+        Object wm = getWindowManagerService();
+        if (wm == null) {
+            LogUtil.logAlways("[内屏固定] 取不到 IWindowManager，钉 " + rotation + "° 失败");
+            return;
+        }
+        try {
+            java.lang.reflect.Method m = wm.getClass()
+                    .getMethod("setRotationLockForFold", boolean.class, int.class, boolean.class);
+            m.setAccessible(true);
+            m.invoke(wm, true, rotation, false);
+            LogUtil.logAlways("[内屏固定] setRotationLockForFold(true, " + rotation
+                    + ", false) 已钉住内屏");
+        } catch (Throwable th) {
+            LogUtil.logAlways("[内屏固定] 钉住内屏失败: " + th);
+        }
+    }
+
+    /** 当前活跃屏（STATE_ON）的方向；读不到返回 -1。 */
+    private static int readScreenRotationNow() {
+        try {
+            Context ctx = sInnerCtx;
+            if (ctx == null) {
+                return -1;
+            }
+            android.hardware.display.DisplayManager dm =
+                    (android.hardware.display.DisplayManager)
+                            ctx.getSystemService(Context.DISPLAY_SERVICE);
+            if (dm == null) {
+                return -1;
+            }
+            for (android.view.Display d : dm.getDisplays()) {
+                if (d != null && d.isValid() && d.getState() == android.view.Display.STATE_ON) {
+                    return d.getRotation();
+                }
+            }
+        } catch (Throwable unused) {
+        }
+        return -1;
     }
 
     /**

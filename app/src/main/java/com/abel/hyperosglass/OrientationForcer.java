@@ -93,6 +93,10 @@ final class OrientationForcer {
     private static volatile Context sCtx;
     /** 残留开关是否已经清理过（每次进程注入只清一次）。 */
     private static volatile boolean sStaleCleared = false;
+    /** 上一次「第一级就成功」的校验流水号，用来合并重复请求。 */
+    private static volatile int sVerifySeq = 0;
+    /** 已确认转到目标方向（下次同方向点击直接返回，不再走 700ms 校验）。 */
+    private static volatile boolean sReached = false;
 
     /** 校验延时：锁完方向后等这么久再看屏幕有没有转过去。 */
     private static final long VERIFY_DELAY_MS = 700L;
@@ -127,22 +131,58 @@ final class OrientationForcer {
             LogUtil.logAlways(TAG + " 参数非法：ctx=" + ctx + " target=" + targetRotation);
             return false;
         }
+        // 同一方向、上一次已经转到位、且还在强制期内 → 立即成功返回，
+        // 不再走一级锁 + 700ms 校验（用户重复点同一个方向时零等待）
+        if (targetRotation == sTarget && sReached && isActive()) {
+            LogUtil.logAlways(TAG + " 已处于 rotation=" + targetRotation + "，无需重复强制");
+            startWatchdog();
+            return true;
+        }
+        // 🔑 v3.294.0：锁定态下的点击不做任何状态重置。
+        //   原来这里每次都重设 sStartAt / sOtherPkg（看门狗的「已切走应用」判据），
+        //   连着点两次就等于把「这个应用已经被强制」这件事忘掉，
+        //   第一次点击会在 700ms 校验窗口里被第二次点击打断 —— 表现为「第一次很慢」。
         sCtx = ctx;
+        final int previous = sTarget;
         sTarget = targetRotation;
-        sStartAt = SystemClock.uptimeMillis();
-        sOtherPkg = null;
-        sForcedPkg = normalizePkg(topPackage(ctx));
+        if (previous != targetRotation) {
+            // 换成另一个方向才算「新的一次强制」：重新计超时与应用基线
+            sStartAt = SystemClock.uptimeMillis();
+            sOtherPkg = null;
+            sForcedPkg = normalizePkg(topPackage(ctx));
+        } else {
+            sForcedPkg = null;      // 同一方向重复点击：不重置基线
+        }
+        // ═══ 临时诊断 ═══
+        final boolean diagOuter = isOuterScreen(ctx);
+        final int diagBefore = currentRotation(ctx);
+        LogUtil.logAlways("[诊断] 下发 isFold=" + diagOuter + "（true=外屏/false=内屏）"
+                + " target=" + targetRotation
+                + " 下发前屏幕rotation=" + diagBefore
+                + " 内屏记忆=" + MainHook.isInnerScreenRemembered(ctx));
+        // ═══ 诊断结束 ═══
         LogUtil.logAlways(TAG + " 开始强制 → rotation=" + targetRotation
                 + "（" + reason + "，前台=" + sForcedPkg
-                + "，外屏=" + isOuterScreen(ctx) + "）");
+                + "，外屏=" + diagOuter + "）");
 
         // ① 一级：只锁方向（支持该方向的应用到这一步就转过去了）
-        boolean locked = lockRotation(ctx, targetRotation);
+        final boolean locked = lockRotation(ctx, targetRotation);
 
-        // ② 校验 → 不达标就逐级升级
+        // ② 校验：**只记录，不追加任何改写**。
+        //
+        //   🔑 v3.294.6（用户 2026-11-12）："根据旋钮方向进行屏幕旋转就可以了，
+        //   不用再去读取什么东西"。方向已经由 ① 精确下发到对应屏，
+        //   剩下的交给系统完成过渡。校验存在的唯一意义是写日志 / 兜底告警，
+        //   它绝不能再去改 fixed-to-user-rotation / ignore-orientation-request /
+        //   thaw+freeze —— 那些会互相覆盖，实测正是"转了之后被顶回去"的成因。
+        final int seq = ++sVerifySeq;
+        sReached = false;
         sMain.postDelayed(new Runnable() {
             @Override
             public void run() {
+                if (seq != sVerifySeq) {
+                    return;
+                }
                 verify(ctx, targetRotation, 1);
             }
         }, locked ? VERIFY_DELAY_MS : 0L);
@@ -162,32 +202,23 @@ final class OrientationForcer {
             return;      // 期间又被点了别的方向 / 已经释放
         }
         int now = currentRotation(ctx);
+        // ═══ 临时诊断 ═══
+        LogUtil.logAlways("[诊断] 校验 期望=" + targetRotation + " 实际=" + now
+                + (now == targetRotation ? " ✔一致" : " ✘不一致"));
+        // ═══ 诊断结束 ═══
         if (now == targetRotation) {
+            sReached = true;
             LogUtil.logAlways(TAG + " ✅ 已转到 " + targetRotation + "（" + levelName(level) + "）");
             return;
         }
         switch (level) {
             case 1:
-                LogUtil.logAlways(TAG + " 锁方向后仍是 " + now + "，应用锁死了方向 → "
-                        + "打开 fixed-to-user-rotation 再锁一次");
-                if (!setFixedToUserRotation(ctx, true)) {
-                    LogUtil.logAlways(TAG + " fixed-to-user-rotation 调用失败，直接进兜底");
-                    step3(ctx, targetRotation);
-                    return;
-                }
-                lockRotation(ctx, targetRotation);
-                sMain.postDelayed(new Runnable() {
-                    @Override
-                    public void run() {
-                        verify(ctx, targetRotation, 2);
-                    }
-                }, 600L);
-                break;
-            case 2:
-                LogUtil.logAlways(TAG + " fixed-to-user-rotation 仍没转过去（当前=" + now
-                        + "），再打开 ignore-orientation-request 并 thaw+freeze 顶一下");
-                step3(ctx, targetRotation);
-                break;
+                // 🔑 v3.294.6：只记录。方向已由 setRotationLockForFold 精确下发，
+                //   校验再"升级"就会引入互相覆盖的第二套开关，反而把方向顶回去。
+                LogUtil.logAlways(TAG + " ⚠️ 校验：期望=" + targetRotation + " 当前=" + now
+                        + "。方向已下发，不做追加改写（折叠屏的 rotation 与画面朝向差 180°，"
+                        + "此值仅供诊断）");
+                return;
             default:
                 LogUtil.logAlways(TAG + " ❌ 仍然没转过去（当前=" + now + "，目标="
                         + targetRotation + "），该 ROM 可能还有别的方向来源");
@@ -227,6 +258,8 @@ final class OrientationForcer {
     static void release(final String reason) {
         boolean had = sTarget >= 0 || sFixedOn || sIgnoreOn;
         sTarget = -1;
+        sReached = false;
+        sVerifySeq++;
         sForcedPkg = null;
         sOtherPkg = null;
         stopWatchdog();
@@ -307,14 +340,21 @@ final class OrientationForcer {
         } catch (Throwable th) {
             LogUtil.logAlways(TAG + " setRotationLockForFold 不可用: " + th);
         }
-        try {
-            Method m = wm.getClass().getMethod("freezeRotation", int.class, String.class);
-            m.setAccessible(true);
-            m.invoke(wm, targetRotation, "HyperOSGlass");
-            LogUtil.logAlways(TAG + " freezeRotation(" + targetRotation + ") 成功");
-            any = true;
-        } catch (Throwable th) {
-            LogUtil.logAlways(TAG + " freezeRotation 失败: " + th);
+        // ⚠️ v3.294.3：freezeRotation 作用在「当前活动显示」上，折叠屏切换的
+        //   过渡期可能落到另一块屏，甚至把刚设好的内屏方向又改回去。
+        //   setRotationLockForFold 已经按 isFold 精确指定了目标屏 —— 它成功时
+        //   **不再补 freezeRotation**，避免两条路径互相覆盖（这是「有时能转、
+        //   有时转不动」的第三个成因）。
+        if (!any) {
+            try {
+                Method m = wm.getClass().getMethod("freezeRotation", int.class, String.class);
+                m.setAccessible(true);
+                m.invoke(wm, targetRotation, "HyperOSGlass");
+                LogUtil.logAlways(TAG + " freezeRotation(" + targetRotation + ") 成功（回退路径）");
+                any = true;
+            } catch (Throwable th) {
+                LogUtil.logAlways(TAG + " freezeRotation 失败: " + th);
+            }
         }
         return any;
     }
@@ -482,37 +522,68 @@ final class OrientationForcer {
     // ── 系统状态读取 ──────────────────────────────────────────────────────
 
     /** 当前内容屏的方向。 */
+    /**
+     * 当前<b>用户正在看的那块屏</b>的方向。
+     *
+     * <p>🔴 v3.294.2 关键修正：原来用 {@code ctx.getDisplay()} / {@code DEFAULT_DISPLAY}，
+     * 而 {@link RotationHint#currentSurfaceRotation} 用的是「STATE_ON 的活跃屏」——
+     * 折叠屏上这两者**不是同一块**：内屏展开时 DEFAULT_DISPLAY 可能仍是外屏状态，
+     * 于是出现「校验读到 270 说成功了，用户看到的竖屏那块却纹丝不动」
+     * （日志实测：{@code ✅ 已转到 3} 但屏幕没转）。
+     *
+     * <p>现在与显示判定使用同一套规则：优先 STATE_ON 的屏，取不到才回退，
+     * 保证「校验的屏」就是「用户看的屏」。
+     */
     static int currentRotation(Context ctx) {
-        try {
-            Display d = null;
-            if (ctx != null) {
-                d = ctx.getDisplay();
-            }
-            if (d == null) {
-                android.hardware.display.DisplayManager dm =
-                        (android.hardware.display.DisplayManager)
-                                ctx.getSystemService(Context.DISPLAY_SERVICE);
-                if (dm != null) {
-                    d = dm.getDisplay(Display.DEFAULT_DISPLAY);
-                }
-            }
-            if (d != null) {
-                return d.getRotation();
-            }
-        } catch (Throwable unused) {
-        }
-        return -1;
+        Display d = activeDisplay(ctx);
+        return d == null ? -1 : d.getRotation();
     }
 
-    private static int currentDisplayId(Context ctx) {
+    /**
+     * 供 {@link RotationHint} 复用的同一取屏口径：按折叠状态取内/外屏的方向。
+     * 取不到返回 -1（调用方自行回退）。
+     */
+    static int rotationByFoldState(Context ctx) {
+        Display d = innerFolded(ctx);
+        return d == null ? -1 : d.getRotation();
+    }
+
+    /**
+     * 按 {@code current_device_state} **明确指认**内/外屏。
+     *
+     * <p>🔴 v3.294.3：不要再靠「STATE_ON 的屏」去猜。折叠屏切换的过渡期里，
+     * 内屏刚亮、外屏还没灭（或反过来），遍历 {@code getDisplays()} 会<b>先碰到
+     * 另一半屏</b>，读到它的 0°，于是 {@code verify()} 认为「已经转到位」 ——
+     * 这就是「日志说成功、屏幕却没转」的第二种成因（实测：内屏明明已是
+     * {@code mDisplayRotation=ROTATION_270}，却读到了外屏的 0）。
+     *
+     * <p>规则与 {@link #isOuterScreen} 一致：{@code current_device_state == 3}
+     * 表示内屏（Display 0 是内屏；外屏为 Display 1）。读不到状态时才退回默认屏。
+     */
+    private static Display activeDisplay(Context ctx) {
+        Display active = innerFolded(ctx);
+        if (active != null) {
+            return active;
+        }
         try {
-            Display d = ctx.getDisplay();
-            if (d != null) {
-                return d.getDisplayId();
+            if (ctx != null) {
+                return ctx.getDisplay();
             }
         } catch (Throwable unused) {
         }
-        return Display.DEFAULT_DISPLAY;
+        return null;
+    }
+
+    /**
+     * 当前活跃屏的 DisplayId。
+     *
+     * <p>v3.294.2：与 {@link #currentRotation} 保持同一口径（STATE_ON 优先）。
+     * 折叠屏上 {@code ctx.getDisplay()} 与「用户正看的屏」可能不一致，
+     * 用错会把 fixed-to-user-rotation 设到另一块屏上。
+     */
+    private static int currentDisplayId(Context ctx) {
+        Display d = activeDisplay(ctx);
+        return d == null ? Display.DEFAULT_DISPLAY : d.getDisplayId();
     }
 
     /**
@@ -521,14 +592,49 @@ final class OrientationForcer {
      * <p>{@code current_device_state}：3 = 展开（内屏），其它（0/1/2）= 折叠（外屏）。
      * 与 {@code RotationHint#isRotationLocked} 用的是同一套判定。
      */
-    private static boolean isOuterScreen(Context ctx) {
-        try {
-            int state = Settings.Global.getInt(ctx.getContentResolver(),
-                    "current_device_state", -1);
-            return state != 3;
-        } catch (Throwable unused) {
-            return true;
+    /**
+     * 按 {@code current_device_state} 取内屏/外屏实例。
+     *
+     * <p>state == 3 → 内屏（Display 0）；其它（0 合上 / 其它过渡态）→ 外屏（Display 1，
+     * 取不到时退回默认屏）。这是本机实测的端口映射：内屏 port 0，外屏 port 1。
+     */
+    private static Display innerFolded(Context ctx) {
+        if (ctx == null) {
+            return null;
         }
+        try {
+            android.hardware.display.DisplayManager dm =
+                    (android.hardware.display.DisplayManager)
+                            ctx.getSystemService(Context.DISPLAY_SERVICE);
+            if (dm == null) {
+                return null;
+            }
+            if (MainHook.isInnerScreenRemembered(ctx)) {
+                Display inner = dm.getDisplay(0);
+                if (inner != null && inner.isValid()) {
+                    return inner;
+                }
+            } else {
+                Display outer = dm.getDisplay(1);
+                if (outer != null && outer.isValid()) {
+                    return outer;
+                }
+            }
+        } catch (Throwable unused) {
+        }
+        return null;
+    }
+
+    /** 当前是否是外屏（current_device_state != 3）。 */
+    /**
+     * 当前是否外屏。
+     *
+     * <p>🔑 v3.294.4：改读 {@link MainHook#isInnerScreenRemembered}（展开/合上边沿
+     * 写下的状态值），不再实时查 {@code current_device_state} —— 过渡期它会短暂
+     * 停留旧值，导致 isFold 传错、方向设到另一块屏上。
+     */
+    private static boolean isOuterScreen(Context ctx) {
+        return !MainHook.isInnerScreenRemembered(ctx);
     }
 
     static boolean isInteractive(Context ctx) {

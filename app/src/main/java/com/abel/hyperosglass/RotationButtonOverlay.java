@@ -59,6 +59,15 @@ final class RotationButtonOverlay {
     private int mShowingCorner = -1;
     private Runnable mOnClick;
 
+    /** 按下是否发生在按钮上（抬起才触发一次）。 */
+    private volatile boolean mDownInView = false;
+
+    /** 窗口创建时的屏幕尺寸（v3.295.1）：只有真的变了才重建窗口。 */
+    private int mLastW = 0;
+    private int mLastH = 0;
+    /** 上一次 reset 是否走了「保留窗口」分支（v3.295.2）：仅用于日志去重。 */
+    private int mLastSkippedRebuild = -1;
+
     private RotationButtonOverlay() {
     }
 
@@ -96,17 +105,35 @@ final class RotationButtonOverlay {
                     //   而 mAdded 还是 true → updateViewLayout 静默失效，
                     //   表现就是「旋转了没反应、按钮丢了」。
                     //   每次都校验一次真实挂载状态。
-                    if (!mAdded || !mView.isAttachedToWindow()) {
-                        if (mAdded) {
+                    // 🔴 v3.294.9 根因修复（用户 2026-11-12「点了没反应、图标闪一下」）：
+                    //
+                    //   原来用 !mView.isAttachedToWindow() 判断窗口是否还在。
+                    //   但 addView 之后**同一帧内** isAttachedToWindow() 仍然是 false
+                    //   （要等下一次 traversal 才 attach）——于是每次后续的
+                    //   applyPosition 都认为「窗口没挂上」，先 removeViewImmediate
+                    //   再 addView。日志实测：1 秒内重建 4 次。
+                    //
+                    //   后果：窗口永远处在「刚加上就被摘掉」的状态，触摸事件找不到
+                    //   稳定的窗口 → onClick 收不到；用户看到的是残留在合成层上的
+                    //   那一帧，也就是「图标闪一下就没反应」。
+                    //
+                    //   正确判据：看 View 有没有 parent（attach 之前 parent 已经是
+                    //   这个 WindowManager 的 ViewRootImpl，addView 后立刻为真）。
+                    //   isAttachedToWindow() 只在「窗口被系统摘掉」时才需要关心，
+                    //   而那种情况 parent 会变成 null，同样能覆盖。
+                    boolean reallyMounted = mAdded && mView.getParent() != null;
+                    if (!reallyMounted) {
+                        if (mView.getParent() != null) {
                             try {
                                 mWm.removeViewImmediate(mView);
                             } catch (Throwable ignored) {
                             }
-                            mAdded = false;
                         }
+                        mAdded = false;
                         mWm.addView(mView, mLp);
                         mAdded = true;
-                        LogUtil.logAlways(TAG + " 已添加窗口 corner=" + corner);
+                        LogUtil.logAlways(TAG + " 已添加窗口 corner=" + corner
+                                + " parent=" + (mView.getParent() != null));
                     } else {
                         // 关键：只改 x/y，一次调用就到位，不拆建窗口
                         mWm.updateViewLayout(mView, mLp);
@@ -268,11 +295,68 @@ final class RotationButtonOverlay {
      * 折叠屏切换后那块屏的尺寸变了，而窗口还留在原屏幕上。
      */
     void reset() {
+        // 🔴 v3.295.1（用户 2026-11-12「多次旋转后点击不马上旋转、图标闪一下没反应」）：
+        //
+        //   原来这里**无条件**销毁并重建窗口。而调用方
+        //   MainHook 的 DisplayListener.onDisplayChanged 会在屏幕尺寸/状态发生**任何**
+        //   变化时触发（旋转过程中每帧都可能变），于是出现：
+        //
+        //     16:30:13.456  ACTION_DOWN 收到 (57,51)   ← 手指按下
+        //     16:30:13.472  使用系统图标资源 ...       ← 16ms 后窗口被销毁重建
+        //     16:30:13.486  已添加窗口 corner=2         ← 新窗口
+        //     （之后没有 ACTION_UP / onClick）
+        //
+        //   手指还按在**旧窗口**上，UP 永远送不到新窗口 → 点击被整段丢弃。
+        //   用户看到的就是「图标闪一下、没反应」，且因为每转一次都会重建，
+        //   所以「多次旋转后」特别容易踩到。
+        //
+        //   现在只在「确实换了屏」或「屏幕尺寸真的变了」时才重建；
+        //   单纯的 onDisplayChanged（方向未变时也会回调）不再动窗口。
         final int corner = mShowingCorner;
-        final Context ctx = mLastCtx;
+        final Context lastCtx = mLastCtx;
         Runnable r = new Runnable() {
             @Override
             public void run() {
+                // 判定是否需要真的重建
+                boolean needRebuild = mView == null || !mAdded;
+                android.view.Display nowDisplay = null;
+                try {
+                    if (mView != null) {
+                        nowDisplay = mView.getDisplay();
+                    }
+                } catch (Throwable ignored) {
+                }
+                int newW = 0, newH = 0;
+                if (nowDisplay != null) {
+                    android.util.DisplayMetrics dm = new android.util.DisplayMetrics();
+                    nowDisplay.getRealMetrics(dm);
+                    newW = dm.widthPixels;
+                    newH = dm.heightPixels;
+                }
+                // 屏幕尺寸变了（折叠切换 内屏↔外屏）才算「换了屏」
+                if (!needRebuild && mLastW > 0 && newW > 0
+                        && (mLastW != newW || mLastH != newH)) {
+                    needRebuild = true;
+                    LogUtil.logAlways(TAG + " 屏幕尺寸变化 "
+                            + mLastW + "x" + mLastH + " → " + newW + "x" + newH + "，重建窗口");
+                }
+                // ⚠️ 只在读到了有效尺寸时才更新基准：
+                //   窗口不存在时 newW=0，若拿 0 覆盖基准，下次比较就永远判不出变化。
+                if (newW > 0) {
+                    mLastW = newW;
+                    mLastH = newH;
+                }
+                if (!needRebuild) {
+                    // 只是 onDisplayChanged 的空转：不动窗口，保住正在进行的手势。
+                    // ⚠️ 这条路径在转屏过程中会被高频触发，只在「状态从重建切到保留」时打一次，
+                    //    避免刷屏淹没真正有用的日志。
+                    if (mLastSkippedRebuild != 1) {
+                        mLastSkippedRebuild = 1;
+                        LogUtil.logAlways(TAG + " 屏幕回调但尺寸未变，保留窗口（不重建）");
+                    }
+                    return;
+                }
+                mLastSkippedRebuild = 0;
                 try {
                     if (mView != null && mAdded) {
                         mWm.removeViewImmediate(mView);
@@ -287,8 +371,8 @@ final class RotationButtonOverlay {
                 mSizePx = 0;
                 mMarginPx = 0;
                 // 之前在显示 → 立刻按新屏幕重建，避免按钮凭空消失
-                if (corner >= 0 && ctx != null) {
-                    show(ctx, corner);
+                if (corner >= 0 && lastCtx != null) {
+                    show(lastCtx, corner);
                 }
             }
         };
@@ -335,9 +419,86 @@ final class RotationButtonOverlay {
         }
         iv.setImageDrawable(icon);
         iv.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        // 🔴 v3.294.5（用户 2026-11-12 反馈「点到外圈背景不生效，内圈图标才生效」）：
+        //   窗口是 56dp，而系统图标用 CENTER_INSIDE 缩在中间只有 24dp 左右，
+        //   外圈那片是**完全透明**的 —— 透明像素不接收触摸，事件直接穿透到下面的应用，
+        //   所以用户必须精确点到中间的小图标才行。
+        //
+        //   修法：给图标加内边距，让它在 56dp 里占满（视觉大小不变，可点区域覆盖整块窗口），
+        //   再铺一层透明背景，保证整个 56dp 都是有效触摸目标。
+        int iconPad = (int) (10 * d);
+        iv.setPadding(iconPad, iconPad, iconPad, iconPad);
+        iv.setBackgroundColor(android.graphics.Color.TRANSPARENT);
+        // 🔑 v3.294.1：回到 setOnClickListener（系统在 ACTION_UP 时判定 performClick）。
+        //
+        //   ⚠️ v3.294.0 曾改成「按下即触发」的 OnTouchListener 并且 return true ——
+        //   那是错的：无条件消费 ACTION_DOWN 会让视图不请求触摸目标（不调
+        //   requestDisallowInterceptTouchEvent / 也不算 handled），系统随后就把
+        //   这个窗口排除在这次手势之外，ACTION_UP 派发不到，点击被整段丢弃。
+        //   现象正是「旋钮闪一下，但屏幕不转、日志里连点击入口都没有」。
+        //
+        //   真正要避免的是「点击处理器里立刻 removeViewImmediate，把窗口在
+        //   ACTION_UP 之前摘掉」。那件事改由 onClick 内部延后到下一帧执行
+        //   （见 RotationHint.applyRotationSuggestion 的 sClickPending 延迟收起），
+        //   这样 ACTION_UP 一定先到，点击不会被吞。
+        // 🔑 v3.294.10（用户 2026-11-12「一段时间内第一次点击无效，连点两次才生效」）：
+        //
+        //   setOnClickListener 要求完整的 DOWN+UP 落在**同一个窗口对象**上。
+        //   而 applyPosition() 在按钮显示后还会被多次调用，每次都可能重建窗口
+        //   （日志实测 1 秒内重建 4 次）。如果第一次点击的 DOWN 落在旧窗口上、
+        //   UP 落在新窗口上，这次 click 就**永远凑不齐** —— 正好就是
+        //   「第一次点了没反应，再点一次就好」。
+        //
+        //   现在改成自己管理触摸状态：只要 UP 时手指仍在按钮内就触发，
+        //   不依赖系统拼 DOWN+UP。同时 return true 让视图声明「我处理了」，
+        //   避免父容器抢走后续事件。
+        iv.setOnTouchListener(new View.OnTouchListener() {
+            @Override
+            public boolean onTouch(View v, android.view.MotionEvent e) {
+                switch (e.getActionMasked()) {
+                    case android.view.MotionEvent.ACTION_DOWN:
+                        mDownInView = true;
+                        LogUtil.logAlways(TAG + " ACTION_DOWN 收到 ("
+                                + (int) e.getX() + "," + (int) e.getY() + ")");
+                        v.animate().scaleX(0.88f).scaleY(0.88f)
+                                .setDuration(60L).start();
+                        // 🔴 v3.295.2 根因修复（用户 2026-11-12 第三次反馈
+                        //   「点击不马上旋转、图标闪烁一下没反应」）：
+                        //
+                        //   之前是「按下 → 等抬起 → performClick」。
+                        //   而点击处理器会立刻让屏幕转起来，转屏又会触发
+                        //   屏幕尺寸/显示状态变化 —— 一旦窗口在手指抬起**之前**
+                        //   被任何原因重建/摘除，ACTION_UP 就永远到不了，
+                        //   这次点击被整段丢弃。日志实测：DOWN 之后 16ms 窗口就被重建。
+                        //
+                        //   旋转按钮不是危险操作（误触最多转个屏，再点一次就回去），
+                        //   所以**按下即执行**：不等 UP，按下那一下就立刻旋转。
+                        //   这样无论后面窗口发生什么，方向都已经下发出去了。
+                        Runnable r = mOnClick;
+                        if (r != null) {
+                            LogUtil.logAlways(TAG + " 按下即触发旋转");
+                            r.run();
+                        }
+                        return true;
+                    case android.view.MotionEvent.ACTION_MOVE:
+                        return true;
+                    case android.view.MotionEvent.ACTION_UP:
+                        v.animate().scaleX(1f).scaleY(1f).setDuration(90L).start();
+                        mDownInView = false;
+                        return true;
+                    case android.view.MotionEvent.ACTION_CANCEL:
+                        v.animate().scaleX(1f).scaleY(1f).setDuration(90L).start();
+                        mDownInView = false;
+                        return true;
+                    default:
+                        return false;
+                }
+            }
+        });
         iv.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
+                LogUtil.logAlways(TAG + " onClick 收到");
                 Runnable r = mOnClick;
                 if (r != null) {
                     r.run();
@@ -360,6 +521,17 @@ final class RotationButtonOverlay {
         lp.y = 0;
         mLp = lp;
         mWm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
+        // v3.295.1：记录创建时的屏幕尺寸，供 reset() 判断「是否真的换了屏」
+        try {
+            android.util.DisplayMetrics dm0 = new android.util.DisplayMetrics();
+            android.view.Display disp0 = ctx.getDisplay();
+            if (disp0 != null) {
+                disp0.getRealMetrics(dm0);
+                mLastW = dm0.widthPixels;
+                mLastH = dm0.heightPixels;
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     /**
@@ -515,6 +687,18 @@ final class RotationButtonOverlay {
         d.getRealMetrics(dm);
         int sw = dm.widthPixels;
         int sh = dm.heightPixels;
+        // 🔑 v3.294.0：以「当前窗口容器」的尺寸为准。
+        //   系统在 orientation 变化时会先缩容器、再旋转，这中间
+        //   Display#getRotation 已经是新值而容器还是旧尺寸 ——
+        //   只按 getRealMetrics 算，按钮会落到屏幕外（表现为「点了没反应」）。
+        View parent = mAdded ? mView : null;
+        if (parent != null && parent.getParent() instanceof View) {
+            View root = (View) parent.getParent();
+            if (root.getWidth() > mSizePx && root.getHeight() > mSizePx) {
+                sw = root.getWidth();
+                sh = root.getHeight();
+            }
+        }
         int right = sw - mSizePx - mMarginPx;
         int bottom = sh - mSizePx - mMarginPx;
         switch (corner) {

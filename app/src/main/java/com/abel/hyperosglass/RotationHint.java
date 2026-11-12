@@ -264,6 +264,33 @@ public final class RotationHint {
     private static volatile boolean sOurShowRequest = false;
     /** 传感器此刻感知到的手机物理姿态（Surface.ROTATION_*），落点与显示判断都用它。 */
     private static volatile int sSensorTargetRotation = -1;
+    /**
+     * 这个时刻之前，忽略「方向变化 → 收起旋钮」。
+     *
+     * <p>只由「用户点击了旋钮」置位：点击代表意图已经明确，接下来屏幕自己会转，
+     * 期间任何传感器尾帧都不该再把按钮拉走。
+     */
+    private static volatile long sSuppressedUntil = 0L;
+
+    /**
+     * 按钮当前**视觉上代表的方向**快照（v3.294.7）。
+     *
+     * <p>只在 {@link #showNow} 真正把按钮画出来时写入，之后传感器怎么抖都不改它。
+     * 点击时读这个值，保证「看到哪个方向就转到哪个方向」。
+     */
+    private static volatile int sShownForAt = -1;
+    /** 点击后的静默时长：够系统转完 + 校验一次，又不至于把后续真实旋转吞掉。 */
+    private static final long CLICK_QUIET_MS = 700L;
+    /**
+     * 显示旋钮前要求方向稳定的时长（v3.294.1，用户 2026-11-12 要求）。
+     *
+     * <p>太短会被传感器抖动和「拿手机时的过渡姿态」骗到；太长用户会觉得慢。
+     * 180ms 与原来 STABLE_MS 一致，是实测过「能滤掉转动过程、又不嫌迟滞」的值，
+     * 这里把它推广到所有显示入口（不再只用于传感器上报路径）。
+     */
+    private static final long HINT_STABLE_MS = 180L;
+    /** 稳态复检任务（单例，避免堆积）。 */
+    private static volatile Runnable sStableRecheck;
     /** 屏幕锁定方向（Surface.ROTATION_*），0/1/2/3。用于把角落顺时针补转。 */
     private static volatile int sScreenRotation = -1;
     /** 系统 FloatingRotationButton 实例 */
@@ -485,7 +512,41 @@ public final class RotationHint {
      * <p>开关 {@link MainHook#sForceRotateEnable} 关掉时退回老行为。
      */
     private static void applyRotationSuggestion() {
-        final int target = sSensorTargetRotation;
+        // 🔑 v3.294.0：点击那一刻就把目标方向「冻结」下来。
+        //
+        //   修的是「锁定方向后转一下，第一次点旋钮要么没反应、要么很慢」：
+        //   原实现里 target 是在这里现读的 sSensorTargetRotation，
+        //   而只要传感器方向一变（包括手指在按钮上按下的轻微晃动、
+        //   或者稳态计时还没走完），onOrientationDegrees 就会先 hideButtonNow()
+        //   把窗口 removeViewImmediate 掉 —— 这次点击落在「已摘除的窗口」上，
+        //   系统根本不会派发；用户看到的就是「点了没反应」，
+        //   再点一次（此时按钮已重新出现、方向也稳定了）才生效。
+        //
+        //   所以点击路径上**绝不使用**可能被传感器改写的实时值，
+        //   只用「按钮是为哪个方向显示的」这个已冻结的意图。
+        // 🔴 v3.294.7：按钮"代表的方向"必须是**用户看到那个按钮时**的方向。
+        //
+        //   原来取 sShownFor，但它会在传感器跳动时被改写（日志实测：按钮为 0 显示，
+        //   传感器 0→2→3 连跳后 sShownFor 变成 3，用户点下去期望转 0，实际下发 3，
+        //   表现就是"点了没用/转错方向"）。
+        //
+        //   现在取 sShownForAt 快照 —— 在 showNow 里写下、只有真正重新显示时才更新，
+        //   点击瞬间的传感器抖动不会污染它。传感器值只在没有快照时兜底。
+        final int shown = sShownForAt;
+        final int target = (shown >= 0) ? shown : sSensorTargetRotation;
+        // ═══ 临时诊断（v3.294.8-diag）═══
+        // 目的：一次性确定「点了没反应」到底是哪一层错了。
+        // 判定依据见输出：按钮快照 / 传感器 / 屏幕 rotation / 折叠状态 / isFold
+        final int diagScreen = OrientationForcer.currentRotation(sContext);
+        final boolean diagInner = MainHook.isInnerScreenRemembered(sContext);
+        LogUtil.logAlways("[诊断] 点击 ===== 按钮快照=" + shown
+                + " 传感器=" + sSensorTargetRotation
+                + " 屏幕rotation=" + diagScreen
+                + " 内屏=" + diagInner
+                + " 最终target=" + target);
+        // ═══ 诊断结束 ═══
+        LogUtil.logAlways("[旋转提示] 点击旋钮：目标方向=" + target
+                + "（按钮所代表的方向=" + shown + "，传感器=" + sSensorTargetRotation + "）");
         if (target < 0) {
             // ⚠️ 以前这里直接 return，用户看到的就是「点了没反应」且没有任何日志。
             LogUtil.logAlways("[旋转提示] 点击失败：还没有传感器方向（target=-1）");
@@ -493,7 +554,22 @@ public final class RotationHint {
             return;
         }
         final Context ctx = sContext;
-        hideButtonNow();
+        // 🔑 v3.294.0：用户已经明确点了方向，就关闭「方向变了自动收起」这条通道，
+        //   直到转完 / 超时。否则点击后转屏的 300~600ms 里若有传感器尾帧进来，
+        //   onOrientationDegrees 会先把窗口摘掉 —— 第一下的强制看上去「没了」，
+        //   必须再点一次才生效。
+        sSuppressedUntil = android.os.SystemClock.uptimeMillis() + CLICK_QUIET_MS;
+        // 🔴 v3.295.0：点击后的收起**不在这里做**。
+        //
+        //   原来这里 post 一帧去 hideOverlayKeepIntent()，等于「一按就消失」，
+        //   而屏幕真正转过去要 300~600ms —— 用户看到的就是
+        //   「图标闪一下就没了」，不知道点没点上；紧接着转屏过程中
+        //   传感器又报中间角度，于是再弹一个指向别处的旋钮（问题 2）。
+        //
+        //   现在改成：点击后按钮**保留不透明**，由 {@link #rotateSuggestionUntilIdle}
+        //   接管 —— 等屏幕转到目标方向（或静默期结束）再收起。
+        //   这样「点下去 → 立刻有前提反馈 → 转到位后收起」是一条连贯的动作。
+        rotateSuggestionUntilIdle(target);
         if (MainHook.sForceRotateEnable.get() && ctx != null
                 && OrientationForcer.force(ctx, target, "点击旋钮")) {
             LogUtil.logAlways("[旋转提示] 已请求强制旋转 → rotation=" + target);
@@ -681,6 +757,30 @@ public final class RotationHint {
         return true;
     }
 
+    /**
+     * 陷入稳态复检：等 {@code delayMs} 后重新走一遍完整判定。
+     *
+     * <p>单例任务：只有最后一个生效，避免传感器高频上报时堆积一堆到点任务
+     * （那会让按钮在几毫秒内反复 show/hide）。
+     */
+    private static void scheduleStableRecheck(long delayMs) {
+        Runnable prev = sStableRecheck;
+        if (prev != null) {
+            sMain.removeCallbacks(prev);
+        }
+        final Runnable r = new Runnable() {
+            @Override
+            public void run() {
+                if (sStableRecheck == this) {
+                    sStableRecheck = null;
+                }
+                reconcileRotationHint("稳态复检");
+            }
+        };
+        sStableRecheck = r;
+        sMain.postDelayed(r, Math.max(16L, delayMs));
+    }
+
     /** 到点后重新走一遍完整判定（方向盘稳了再说）。 */
     private static void scheduleForceHint(long delay) {
         Runnable prev = sForceHintTask;
@@ -700,6 +800,22 @@ public final class RotationHint {
     }
 
     private static void showNow(int targetRotation, int current) {
+        // 🔴 v3.295.0（用户 2026-11-12 问题 2 的根因修复）：
+        //   这是**所有显示路径的唯一出口**，点击后的静默期必须在这里判，
+        //   而且必须判在**最前面**。
+        //
+        //   原实现把静默判断放在 showNow 开头是对的，但漏了同一次点击后的另外两条路：
+        //     · rotateSuggestionUntilIdle 里「方向一致 → hideButtonNow()」先把按钮收了；
+        //     · 屏幕转到位后 DisplayListener → reconcile → sensor==screen → 收起。
+        //   于是「点了 → 转过去了 → 传感器再报一次中间角度 → 又弹一个指向别处的旋钮」，
+        //   用户看到的就是「马上又转到别的方向、旋钮乱蹦」。
+        //
+        //   现在静默期统一在 {@link #isClickQuiet()} 里判，三个入口全走它。
+        if (isClickQuiet()) {
+            LogUtil.logAlwaysOnce("quiet-show",
+                    "[旋转提示] 点击后静默期内，忽略显示请求（目标=" + targetRotation + "）");
+            return;
+        }
         Context ctx = sContext;
         if (ctx == null) {
             return;
@@ -740,6 +856,8 @@ public final class RotationHint {
         // ⚠️ 不在这里停止轮询：按钮显示之后用户很可能继续转，
         //   而方向事件是 on-change 类型会漏报，必须有人继续盯着。
         //   轮询会在「确认静止」后自行停止（见轮询里的静止判断）。
+        // 快照：按钮此刻代表的方等于 targetRotation，点击时以此为准
+        sShownForAt = targetRotation;
         LogUtil.logAlways("[旋转提示] 已显示（当前=" + current
                 + " 目标=" + targetRotation + " 角落=" + corner + "）");
     }
@@ -891,6 +1009,19 @@ public final class RotationHint {
             // v3.292.0：拿到 Context 后清一次可能残留的「忽略应用方向请求」
             // （SystemUI 被重启时，WMS 里那个全局开关不会跟着复位）
             OrientationForcer.clearStale(ctx);
+            // 🔴 v3.295.0（用户 2026-11-12 问题 2）：点击后的静默期内，
+            //   「显示」和「因方向一致而收起」都交给 rotateSuggestionUntilIdle 决定。
+            //
+            //   原来这里（DisplayListener 触发的重算）不看静默期：
+            //   点击 → 屏幕转到目标方向 → DisplayListener 立刻重算 →
+            //   sensor==screen → 「收起」，看起来正常；但转屏过程中传感器报的
+            //   中间角度会先让 sensor != screen，于是又弹一个指向别处的旋钮。
+            //   两条路打架，用户看到的就是「刚转过去又冒出别的方向」。
+            if (isClickQuiet()) {
+                LogUtil.logAlwaysOnce("quiet-reconcile",
+                        "[旋转提示] " + reason + "：点击后静默期内，交给点击收尾处理");
+                return;
+            }
             int screen = currentSurfaceRotation(ctx);
             int sensor = sSensorTargetRotation;
             if (screen < 0) {
@@ -901,6 +1032,26 @@ public final class RotationHint {
                 // 还不知道物理姿态（进程刚起 / 刚亮屏）：用一路短时重力采样补一个值，
                 // 拿到后 onOrientationDegrees 会自己回到这里重算。
                 startGravityPolling();
+                return;
+            }
+            // 🔑 v3.294.1（用户 2026-11-12 要求）：内屏联动正在「可自由旋转」的窗口期，
+            //   一律不显示旋钮，并收起已显示的。
+            //
+            //   原因：展开内屏后前几秒系统本来允许自由旋转（等到点才回锁），
+            //   这期间屏幕自己会转，弹旋钮毫无意义；而且展开动作本身（手机还在
+            //   翻开的过渡姿态）就会制造「方向不一致」，于是经常出现
+            //   「手机还没完全展开，旋钮就先冒出来」。
+            //
+            //   判据同时覆盖：① 联动窗口期 sFollowing（马上要解锁跟随）；
+            //   ② 钉 270° 的防抖窗口（MainHook.isUnfoldSettling）。
+            if (MainHook.isUnfoldWindowActive()) {
+                if (sShownFor >= 0) {
+                    LogUtil.logAlways("[旋转提示] " + reason
+                            + "：内屏正在展开/可自由旋转窗口期，收起旋钮且不显示");
+                    hideButtonNow();
+                } else {
+                    LogUtil.logAlwaysOnce("unfold-quiet", "[旋转提示] 内屏展开窗口期，抑制旋钮");
+                }
                 return;
             }
             if (!isRotationLocked(ctx)) {
@@ -922,6 +1073,38 @@ public final class RotationHint {
             }
             if (sShownFor == sensor) {
                 return;      // 已经在为这个方向显示，别重置超时
+            }
+            // 🔑 v3.294.1：稳态钳制（用户 2026-11-12 要求）。
+            //   原来 reconcile 一被触发就直接 showNow，于是传感器在临界角度
+            //   抖一下（0↔1↔2↔3 来回跳，日志里实测出现过「目标=2 / 目标=0」交替）
+            //   就会弹一个按钮，用户拿手机的过渡动作也会被当成旋屏意向。
+            //   现在要求：方向至少稳定 HINT_STABLE_MS 才显示；不够就挂一个
+            //   到点重算的延时任务，且**不显示**。
+            // 稳态 = 「同一个方向已经持续了多久」。每次方向变化都会把
+            // sStableSince 重置成当下（见 onOrientationDegrees），所以这里
+            // 算出来的就是真实稳定时长。不足就挂一个「到点再算一次」的延时：
+            // 到点若方向仍没变就弹出；期间又转了，sStableSince 被重置，
+            // 那次复检会发现仍不足并接着等 —— 也就是「转着不弹、停下够久才弹」。
+            // 🔑 v3.294.5（用户 2026-11-12 反馈「快速转到某方向不显示，要再转一下才出来」）：
+            //   稳态时间戳原来只在 onOrientationDegrees 里方向变化时更新。
+            //   但 reconcile 还会被 ShowTrigger 等路径触发 —— 那时 sSensorTargetRotation
+            //   可能已经更新过（值相同），计时却没跟着重置/推进，就会出现
+            //   「方向明明稳定了，这里却算出一段很短的时间 → 一直判定不稳定 → 不显示」
+            //   （日志实测：屏幕方向=0 + 目标=2，离 180ms 就差一点点，never 弹出）。
+            //
+            //   修法：把「稳态基准」与传感器回调解耦 —— 这里以 sStableTarget 为准，
+            //   只要当前目标方向与基准不同就重置；相同则沿用已有时间戳。
+            if (sStableTarget != sensor) {
+                sStableTarget = sensor;
+                sStableSince = android.os.SystemClock.uptimeMillis();
+            }
+            long stableFor = android.os.SystemClock.uptimeMillis() - sStableSince;
+            if (stableFor < HINT_STABLE_MS) {
+                long remain = HINT_STABLE_MS - stableFor;
+                LogUtil.logAlways("[旋转提示] " + reason + "：方向仅稳定 " + stableFor
+                        + "ms（需 " + HINT_STABLE_MS + "ms），" + remain + "ms 后再判定");
+                scheduleStableRecheck(remain);
+                return;
             }
             LogUtil.logAlways("[旋转提示] " + reason + "：锁着且方向不一致（当前="
                     + screen + " 目标=" + sensor + "），显示旋钮");
@@ -1224,8 +1407,92 @@ public final class RotationHint {
      */
     private static void hideButtonNow() {
         sShownFor = -1;
+        // 🔴 v3.295.2：按钮一收起，快照就失效。
+        //   改成「按下即触发」后，第一次点击若因应用锁死方向没转过去，
+        //   按钮仍在屏幕上；此时若快照还留着旧值，第二次点击就会用旧方向下发，
+        //   而不是用户此刻看到的那个方向。收起时清掉，下次显示会重新写。
+        sShownForAt = -1;
         sMain.removeCallbacks(sAutoHideTask);
         RotationButtonOverlay.get().hideNow();
+    }
+
+
+    /**
+     * 是否处于「点击旋钮后的静默期」。
+     *
+     * <p>静默期的含义：从点击那一刻起 {@link #CLICK_QUIET_MS} 内，屏幕方向由模块
+     * <b>精确下发</b>，传感器在转屏过程中报出的中间角度没有任何参考价值。
+     * 这段时间内：
+     * <ul>
+     *   <li>不显示旋钮（否则会弹一个指向别处的按钮，用户再点就被带去别的方向）；</li>
+     *   <li>不因为「方向一致了」而收起 —— 收起由 {@link #rotateSuggestionUntilIdle}
+     *       在「已转到目标方向」时做。</li>
+     * </ul>
+     */
+    private static boolean isClickQuiet() {
+        return android.os.SystemClock.uptimeMillis() < sSuppressedUntil;
+    }
+
+    /** 轮询「是否已转到目标方向」，用于点击后优雅收起（单例）。 */
+    private static volatile Runnable sRotateSettleTask;
+    /** 轮询间隔：60ms 一次，够快能抓到位，又不至于压占主线程。 */
+    private static final long ROTATE_SETTLE_STEP_MS = 60L;
+
+    /**
+     * 点击后跟随旋转的收尾：等屏幕真正转到目标方向后再收起按钮。
+     *
+     * <p>🔴 v3.295.0（用户 2026-11-12 问题 2 的根因修复）。
+     *
+     * <h2>原来错在哪</h2>
+     * 点击后是立即 {@code hideOverlayKeepIntent()} —— 按钮一按就没了；
+     * 屏幕转屏要 300~600ms，这期间传感器会连续报中间角度，
+     * 每次方向变化都会走 {@code onOrientationDegrees → hideButtonNow()}
+     * 把 {sShownFor} 清成 -1 —— 于是「用户刚点完」，按钮状态已经被清空，
+     * 紧接着下一次重算又按新传感器方向弹出指向别处的旋钮。
+     *
+     * <h2>现在的行为</h2>
+     * <ol>
+     *   <li>点击后按钮保留（不透明、不消失），给用户明确的「点到了」反馈；</li>
+     *   <li>每 {@link #ROTATE_SETTLE_STEP_MS} 读一次屏幕方向：
+     *       等于目标方向 → 收起，这一轮旋转结束；</li>
+     *   <li>静默期到点仍未转到位（应用锁死了方向）→ 也收起，并记录日志；</li>
+     *   <li>收起后清掉静默期，让传感器恢复正常判据。</li>
+     * </ol>
+     */
+    private static void rotateSuggestionUntilIdle(final int target) {
+        Runnable prev = sRotateSettleTask;
+        if (prev != null) {
+            sMain.removeCallbacks(prev);
+            sRotateSettleTask = null;
+        }
+        final Runnable task = new Runnable() {
+            @Override
+            public void run() {
+                if (sRotateSettleTask != this) {
+                    return;        // 被新的一次点击取代
+                }
+                Context ctx = sContext;
+                int now = RotationHint.currentSurfaceRotation(ctx);
+                boolean reached = (now == target);
+                boolean timeout = android.os.SystemClock.uptimeMillis() >= sSuppressedUntil;
+                if (!reached && !timeout) {
+                    sMain.postDelayed(this, ROTATE_SETTLE_STEP_MS);
+                    return;
+                }
+                sRotateSettleTask = null;
+                // 收起与状态复位：这是一轮点击的终点
+                LogUtil.logAlways("[旋转提示] 点击收尾：目标=" + target
+                        + " 当前=" + now + (reached ? " ✔已到位" : " ⏱静默期到点（未转到位）"));
+                hideButtonNow();
+                // 提前结束静默期：目标已达成，让传感器的后续判断恢复正常
+                sSuppressedUntil = 0L;
+                // 到位后可能已经是一个新的合法不一致状态（用户继续转了手机），
+                // 主动重算一次，保证旋钮按新的真实方向重新出现
+                reconcileRotationHint("点击收尾后重算");
+            }
+        };
+        sRotateSettleTask = task;
+        sMain.postDelayed(task, ROTATE_SETTLE_STEP_MS);
     }
 
 
@@ -1962,6 +2229,25 @@ public final class RotationHint {
         if (!MainHook.sRotationHintEnable.get()) {
             return;
         }
+        // 点击旋钮后的静默期：只更新方向（落点仍要正确），
+        // 但不收起、不重新排队 —— 否则会把刚发起的强制旋转显示成「没反应」。
+        // 🔴 v3.295.0：这里必须**更新稳态基准**（sStableTarget + sStableSince）。
+        //   原来只更新 sSensorTargetRotation，而 reconcile 里以 sStableTarget 为准
+        //   判断「这个方向稳定了多久」—— 静默期内传感器改过 0/2/3 之后，
+        //   静默期一结束，reconcile 看到 sStableTarget 还是旧值，
+        //   会拿一个很旧的 sStableSince 去算稳定时长，结论失真。
+        if (isClickQuiet()) {
+            int t = degreesToSurfaceRotation(degrees);
+            if (t >= 0) {
+                sLastSensorReportAt = android.os.SystemClock.uptimeMillis();
+                sSensorTargetRotation = t;
+                if (sStableTarget != t) {
+                    sStableTarget = t;
+                    sStableSince = android.os.SystemClock.uptimeMillis();
+                }
+            }
+            return;
+        }
         final int target = degreesToSurfaceRotation(degrees);
         if (target < 0) {
             return;
@@ -1973,7 +2259,11 @@ public final class RotationHint {
         // ⭐ 记录传感器方向，供落点使用（纯传感器驱动）
         if (sSensorTargetRotation != target) {
             sSensorTargetRotation = target;
-            sStableTarget = target;
+            // 不在这里改 sStableTarget：稳态基准统一由 reconcileRotationHint 维护，
+            // 避免两处各改一半导致「方向变了但计时没重置」。
+            sStableSince = android.os.SystemClock.uptimeMillis();
+            // 🔑 v3.294.2：稳态计时每次方向变化都从 0 开始（用户 2026-11-12 澄清：
+            //   稳态 = 同一个方向保持了多久；继续转就不弹，停下来够久才弹）。
             sStableSince = android.os.SystemClock.uptimeMillis();
             LogUtil.logAlways("[旋转提示] 传感器方向=" + target);
 
@@ -2067,6 +2357,14 @@ public final class RotationHint {
      */
     private static int currentSurfaceRotation(Context ctx) {
         try {
+            // 🔑 v3.294.3：与 OrientationForcer 用**同一套**取屏口径。
+            //   原来这里挑「STATE_ON 的屏」，而折叠切换的过渡期里两块屏可能同时
+            //   是 ON（或外屏还没灭），会读到另一半屏的 0°，导致
+            //   「显示判断看到 0、实际内屏是 270」→ 旋钮位置错、该弹不弹。
+            int byState = OrientationForcer.rotationByFoldState(ctx);
+            if (byState >= 0) {
+                return byState;
+            }
             android.hardware.display.DisplayManager dm =
                     (android.hardware.display.DisplayManager)
                             ctx.getSystemService(Context.DISPLAY_SERVICE);
