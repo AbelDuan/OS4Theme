@@ -136,10 +136,9 @@ public class MainHook extends XposedModule {
     /**
      * 展开时「先钉到 270°」是否还在进行中（v3.294.0）。
      *
-     * <p>展开那一刻 system_server 还没把屏幕一脚踢回竖屏（0），
-     * 此时直接解除锁定就会被竖屏「接住」。所以边沿到达后先钉住 270°，
-     * 等 {@link Constants#UNFOLD_PIN_SETTLE_MS} 再解除锁定。
-     * 置位期间 {@link #applyInnerFixedLandscape()} 只做校验，不再重复排队。
+     * <p>⚠️ v3.9.2 起**不再用这个标志驱动钉 270°**：方向改为在「合上」时
+     * 就预置成 270°，展开第一帧即是 270。这个标志只保留给
+     * {@link #onInnerUnlocked()} 做「展开中不抢锁」的互斥判断。
      */
     private static volatile boolean sUnfoldSettling = false;
     /** 本次「钉 270°」属于哪一次展开（代际号），用来丢弃过期回调。 */
@@ -1557,10 +1556,6 @@ public class MainHook extends XposedModule {
     /** 窗口冷却时长。 */
     private static final long INNER_WINDOW_COOLDOWN_MS = 4000L;
 
-    /** 展开钉 270° 时的轮询间隔（v3.295.9）：每 60ms 看一次屏幕是否已到目标方向。 */
-    private static final long UNFOLD_PIN_POLL_MS = 60L;
-    /** 展开钉 270° 的最长等待（v3.295.9）：超过就按超时处理，避免无限等。 */
-    private static final long UNFOLD_PIN_MAX_WAIT_MS = 2000L;
 
     /**
      * 检查用户是否在这期间**手动改过**设置。
@@ -2369,6 +2364,22 @@ public class MainHook extends XposedModule {
                     // 没有计时器但还留着占用标记：说明键上的 1 是我们的，收回
                     relockInner(cr, "合上时发现跟随遗留，已恢复锁定");
                 }
+                // 🔴 v3.9.2（用户 2026-11-13）：**合上时就把内屏方向定成 270°**。
+                //
+                //   用户原话：「只需要在合上内屏切换到外屏的时候，将内屏的方向
+                //   调到 270 度，这样展开内屏的时候，它的第一画面就是在 270 度，
+                //   然后解除方向锁定之后，根据用户的方向去看传感器方向。」
+                //
+                //   这样比在展开时钉 270° 更干净：展开的第一帧就已经是 270，
+                //   不需要「先转到 270 再被传感器拉回来」那一整套动作。
+                //
+                //   内屏此刻不显示内容，钉它不影响用户；展开时方向已经是 270，
+                //   随后解除锁定即可按传感器走。
+                if (Constants.PIN_INNER_270_ON_UNFOLD) {
+                    pinInnerRotation(Constants.UNFOLD_PIN_ROTATION);
+                    LogUtil.logAlways("[内屏联动] 合上：内屏方向已预置为 "
+                            + Constants.UNFOLD_PIN_ROTATION + "°，展开时第一帧即 270°");
+                }
                 return;
             }
 
@@ -2455,42 +2466,30 @@ public class MainHook extends XposedModule {
             //
             //   ⚠️ 用「亮屏窗口」判断而不是一次性标记：亮屏会连发多次回调
             //   （SCREEN_ON 广播 + DisplayListener + 延迟判定），无论谁先到都能正确分类。
+            // 🔴 v3.9.2（用户 2026-11-13）：**展开不再钉 270°**。
+            //
+            //   用户方案：「合上内屏切换到外屏时把内屏方向调到 270°，
+            //   展开时第一画面就是 270°，然后解除锁定按传感器走。」
+            //
+            //   这样比原来「展开时先钉 270 再解除」干净得多：
+            //   原来钉完解除后，系统立刻按传感器把 270 拉回手机实际朝向，
+            //   视觉上是「转过去又转回来」。
+            //   现在 270 在合上时就设好，展开第一帧即是 270，直接解除锁定跟随。
+            //
+            //   ⚠️ 仍然要作废可能遗留的 sUnfoldSettling，否则解锁会被永久挡住。
+            if (sUnfoldSettling) {
+                sUnfoldSettling = false;
+                sUnfoldGen++;
+                LogUtil.logAlways("[内屏联动] 展开：作废遗留的钉 270° 标志位");
+            }
             boolean screenOnEdge = inScreenOnWindow();
-            if (Constants.PIN_INNER_270_ON_UNFOLD && !screenOnEdge) {
-                enterUnfoldSettle(cr);
-                return;
-            }
             if (screenOnEdge) {
-                // 🔴 v3.295.7（用户 2026-11-12「解锁没回到可旋转」）：
-                //   亮屏时若上一次「钉 270°」的标志位还挂着，必须在这里作废。
-                //
-                //   日志实证：
-                //     ... 展开：先钉 3°，等 700ms 稳定后再解除锁定  ← sUnfoldSettling=true
-                //     ... 内屏亮屏唤醒：不钉 270°...                 ← 绕过了 enterUnfoldSettle
-                //     ... 展开：已放开旋转锁，5000ms 后恢复锁定       ← 标志位从未复位
-                //     ... 解锁：正在展开钉 270° 窗口内，交给展开流程   ← 解锁被永久挡住
-                //
-                //   钉住窗口的 700ms 回调只在 enterUnfoldSettle 里注册，
-                //   而亮屏这条路根本没进去 → 回调不存在 → 标志位永久停在 true。
-                //   之后每次解锁都被这个死标志挡住，永远不解除锁定。
-                if (sUnfoldSettling) {
-                    sUnfoldSettling = false;
-                    sUnfoldGen++;
-                    LogUtil.logAlways("[内屏联动] 亮屏：作废遗留的钉 270° 标志位");
-                }
-                LogUtil.logAlways("[内屏联动] 内屏亮屏唤醒：不钉 270°，直接按当前方向解除锁定");
+                LogUtil.logAlways("[内屏联动] 内屏亮屏唤醒：按当前方向解除锁定");
             }
-            // —— 以下为「不钉 270°」的原始路径（关闭「展开钉 270°」时） ——
             // 窗口冷却：同一次亮屏里 DisplayListener / SCREEN_ON 会连续进来，
-            // 冷却期内不再开第二个窗口（折叠状态没变时才生效）
-            // 🔴 v3.295.11（用户 2026-11-13「唤醒时没有马上解锁，进桌面后才解」）：
-            //   冷却的作用是防止**同一次折叠动作**被多条回调重复触发，
-            //   但亮屏 / 解锁是**用户重新发起的独立事件**，不该被上次跟随的
-            //   冷却挡住。日志实证：
-            //     30.408  内屏亮屏唤醒：不钉 270°，直接按当前方向解除锁定
-            //     30.408  距上次跟随仅 2499ms，冷却中，本次不重复解锁  ← 被挡住
-            //     33.915  解锁：已解除方向锁定（3.5 秒后才生效）
-            //   所以亮屏 / 解锁场景跳过冷却。
+            // 冷却期内不再开第二个窗口。
+            // ⚠️ 亮屏 / 解锁是用户重新发起的独立事件，不该被上次跟随的冷却挡住
+            //   （实测被挡时 3.5 秒后才解锁，正是「进桌面才解」的成因）。
             if (!screenOnEdge) {
                 long sinceEnd = android.os.SystemClock.uptimeMillis() - sLastWindowEndAt;
                 if (sLastWindowEndAt > 0L && sinceEnd >= 0
@@ -2611,132 +2610,6 @@ public class MainHook extends XposedModule {
         }
     }
 
-    /**
-     * 展开边沿：先把屏幕钉到 270°（摄像头在右上角的横屏），稳定后再解除锁定。
-     *
-     * <h2>为什么必须「先钉再放」</h2>
-     * 用户要的是「展开默认 270°」。原来的做法是边沿一到就 {@code callWindowManagerRotation(false)}
-     * 解除锁定，而那一刻屏幕往往还是 ROTATION_0（外屏竖屏刚切过来），
-     * 于是「解除锁定」解在了竖屏上 —— 这就是「偶尔展开是竖屏」的根因。
-     *
-     * <h2>钉哪个值</h2>
-     * {@code setRotationLockForFold(locked, -1, false)} 的语义是「以当前方向为准锁定」，
-     * 当前是竖屏就锁成竖屏，等于把这个 bug 固定下来。所以这里必须**显式传 270**，
-     * 和不钉时用 -1 的调用区分开。这是本模块唯一会写方向值的地方，
-     * 与「联动只切开关」的铁律不冲突：它不写 Settings，只在本次展开的瞬间决定
-     * 「锁在哪」，随后立刻解除锁定交还给系统。
-     *
-     * <p>钉住期间不写任何 Settings：界面显示「已锁定」是必然的，
-     * 写 {@code accelerometer_rotation} 反而会让用户看到开关自己闪一下。
-     */
-    private static void enterUnfoldSettle(final android.content.ContentResolver cr) {
-        if (sUnfoldSettling) {
-            LogUtil.logAlways("[内屏联动] 正在钉 270°，忽略重复触发");
-            return;
-        }
-        final int gen = ++sUnfoldGen;
-        sUnfoldSettling = true;
-        sFollowing = false;
-        sLastUnfoldAt = android.os.SystemClock.uptimeMillis();
-        // 记录折叠状态（边沿写入，后续只读这个值）
-        sInnerActive = true;
-        sInnerStateAt = android.os.SystemClock.uptimeMillis();
-        sUnfoldRotation = readScreenRotationNow();
-        LogUtil.logAlways("[内屏联动] 展开：先钉 " + Constants.UNFOLD_PIN_ROTATION
-                + "°，等 " + Constants.UNFOLD_PIN_SETTLE_MS + "ms 稳定后再解除锁定"
-                + "（此刻屏幕方向=" + sUnfoldRotation + "）");
-        pinInnerRotation(Constants.UNFOLD_PIN_ROTATION);
-        // 让旋钮收起：马上要解除锁定，屏幕会自己转
-        RotationHint.reconcileRotationHint("内屏联动：展开钉 270°");
-
-        final Context ctx = sInnerCtx;
-        // 🔴 v3.295.9（用户 2026-11-12「展开时不是 270 而是 0 度」）：
-        //   **不能固定等 700ms 就解除锁定**。
-        //
-        //   日志实证：
-        //     展开：先钉 3°（此刻屏幕方向=0）   ← 展开时屏幕还是竖的
-        //     setRotationLockForFold(true, 3)   ← 钉了 270
-        //     [700ms 后]
-        //     setRotationLockForFold(false,-1)  ← 立刻解除锁定
-        //   屏幕从 0 转到 3 实际要 900ms+，700ms 时还没转完，
-        //   一解除锁定系统就按「当时实际方向 0」处理 → 展开后是竖屏。
-        //
-        //   修法：**轮询等屏幕真的到达目标方向**再解除锁定，
-        //   而不是靠猜一个固定时长。最多等 UNFOLD_PIN_MAX_WAIT_MS 兜底。
-        final Runnable[] step = new Runnable[1];
-        final long startAt = android.os.SystemClock.uptimeMillis();
-        step[0] = new Runnable() {
-            @Override
-            public void run() {
-                if (gen != sUnfoldGen) {
-                    return;      // 期间又展开/合上过，这次作废
-                }
-                if (!sUnfoldSettling) {
-                    return;
-                }
-                // 屏幕还没转到目标方向 → 继续等（这才是「稳定」的真正含义）
-                int now = OrientationForcer.rotationByFoldState(ctx);
-                long waited = android.os.SystemClock.uptimeMillis() - startAt;
-                if (now != Constants.UNFOLD_PIN_ROTATION
-                        && waited < UNFOLD_PIN_MAX_WAIT_MS) {
-                    sInnerHandler.postDelayed(this, UNFOLD_PIN_POLL_MS);
-                    return;
-                }
-                if (now == Constants.UNFOLD_PIN_ROTATION) {
-                    LogUtil.logAlways("[内屏联动] 屏幕已到达 270°（等待 " + waited + "ms），解除锁定");
-                } else {
-                    LogUtil.logAlways("[内屏联动] 等待 " + waited + "ms 仍未到 270°（当前="
-                            + now + "），按超时处理");
-                }
-                try {
-                    // 开关被关掉 / 已经合上 → 不往下走，由对应入口收尾
-                    if (!sInnerFollowRotation.get() || !isSystemUiProc()) {
-                        sUnfoldSettling = false;
-                        return;
-                    }
-                    // 🔴 v3.295.4：这 700ms 里若熄屏了，本次钉住直接作废，
-                    //   否则会在熄屏后继续「解除锁定 5 秒 → 锁在当前方向」，
-                    //   把熄屏分支钉好的方向改掉（AOD 变横屏的成因之一）。
-                    if (!isInteractiveNow(ctx)) {
-                        sUnfoldSettling = false;
-                        LogUtil.logAlways("[内屏联动] 钉 270° 等待期间已熄屏，本次作废");
-                        return;
-                    }
-                    boolean inner = isInnerDisplayActive(
-                            (android.hardware.display.DisplayManager)
-                                    ctx.getSystemService(Context.DISPLAY_SERVICE), cr);
-                    if (!inner) {
-                        sUnfoldSettling = false;
-                        return;      // 合上的入口已经处理
-                    }
-                    sUnfoldSettling = false;
-                    if (healInnerLockIfStale("展开钉 270° 结束")) {
-                        return;
-                    }
-                    if (readSysInt(cr, "accelerometer_rotation", -1) != 0) {
-                        // 用户本来就开着自动旋转 → 尊重用户，不接管
-                        LogUtil.logAlways("[内屏联动] 自动旋转本来就是开的，解除钉住后不接管");
-                        callWindowManagerRotation(false);
-                        return;
-                    }
-                    sFollowing = true;
-                    callWindowManagerRotation(false);
-                    setInnerAutoRotate(cr, true);
-                    sLockSnapshot = 1;
-                    markOccupy();
-                    persistInnerState();
-                    LogUtil.logAlways("[内屏联动] 钉 270° 结束：已解除锁定，"
-                            + Constants.INNER_FOLLOW_DURATION_MS + "ms 后恢复锁定");
-                    RotationHint.reconcileRotationHint("内屏联动：解除锁定开始跟随");
-                    scheduleRelock(cr, Constants.INNER_FOLLOW_DURATION_MS);
-                } catch (Throwable th) {
-                    sUnfoldSettling = false;
-                    LogUtil.logAlways("[内屏联动] 钉 270° 结束处理失败: " + th);
-                }
-            }
-        };
-        sInnerHandler.postDelayed(step[0], UNFOLD_PIN_POLL_MS);
-    }
 
     /** 显式把内屏锁到指定方向（只影响本次，不写 Settings）。 */
     private static void pinInnerRotation(int rotation) {

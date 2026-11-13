@@ -255,16 +255,6 @@ public final class Constants {
     public static final boolean PIN_INNER_270_ON_UNFOLD = true;
     /** 展开后钉住的方向：270° = 摄像头在右上角的横屏（用户 2026-10-29 定的默认）。 */
     public static final int UNFOLD_PIN_ROTATION = 3;
-    /**
-     * 钉住多久再解除锁定（毫秒）。
-     *
-     * <p>要盖住「展开 → system_server 把屏幕从外屏方向复位到 ROTATION_0」这段时序。
-     * 实测这段在 300~600ms 之间完成；取 约 700ms，留一倍余量。
-     * 数值只影响「展开后多久开始跟手转动」，不影响最终落点。
-     */
-    public static final long UNFOLD_PIN_SETTLE_MS = 700L;
-    /** 展开后先锁定在 270° 保持多久，再解除锁定开始跟随（毫秒）。
-     *  太短会导致 270° 还没生效就被解锁覆盖，内屏仍是竖屏（摄像头在顶部）。 */
     public static final int NOTIF_WIDTH_MARGIN_DP = 48;
 
     /**
