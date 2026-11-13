@@ -179,6 +179,26 @@ public class MainHook extends XposedModule {
      */
     private static volatile int sScreenOffRotation = -1;
 
+    /**
+     * 最近一次「检测到展开」的时刻（uptimeMillis，v3.295.11）。
+     *
+     * <p>展开和 {@code ACTION_SCREEN_ON} 几乎同时到达（实测相差 450ms）。
+     * 亮屏处理必须能分辨「这次亮屏是不是伴随一次真实展开」：
+     * <ul>
+     *   <li>是 → 方向由展开流程决定（270°），亮屏不许钉回熄屏方向；</li>
+     *   <li>否（只是内屏锁屏后唤醒）→ 钉回熄屏方向并立刻解锁跟随。</li>
+     * </ul>
+     */
+    private static volatile long sLastUnfoldAt = 0L;
+    /** 判定「最近这次亮屏是伴随展开」的时间窗。 */
+    private static final long UNFOLD_RECENT_MS = 2000L;
+
+    /** 最近 UNFOLD_RECENT_MS 内是否发生过展开。 */
+    private static boolean unfoldJustHappened() {
+        long t = sLastUnfoldAt;
+        return t > 0L && android.os.SystemClock.uptimeMillis() - t < UNFOLD_RECENT_MS;
+    }
+
     /** 当前是否处在「刚亮屏」的窗口内。 */
     private static boolean inScreenOnWindow() {
         long until = sScreenOnUntil;
@@ -371,8 +391,23 @@ public class MainHook extends XposedModule {
                                     //   随后 applyInnerFixedLandscape 会按「亮屏」分支
                                     //   临时解除锁定几秒（与展开逻辑一致），
                                     //   让方向能跟随此刻的传感器。
+                                    // 🔴 v3.295.11（用户 2026-11-13「展开不是 270 而是锁屏前的角度」）：
+                                    //   **正在展开的过程中到来的亮屏广播，不许把方向钉回去**。
+                                    //
+                                    //   日志实证：
+                                    //     22.556  展开：先钉 3°（此刻屏幕方向=0）
+                                    //     22.885  屏幕已到达 270°，解除锁定        ← 已经钉好 270
+                                    //     23.003  setRotationLockForFold(true, 0) ← 被这里改回 0！
+                                    //     23.004  亮屏：先钉回熄屏时的方向=0
+                                    //
+                                    //   展开时 SCREEN_ON 几乎同时到达，若这里无条件
+                                    //   「钉回熄屏方向」，就把刚刚钉好的 270° 覆盖成 0°。
+                                    //   展开流程自己会把方向定为 270°，此时不该插手。
                                     int offRot = sScreenOffRotation;
-                                    if (offRot >= 0 && isInnerDisplayActiveNow(context)) {
+                                    if (sUnfoldSettling || unfoldJustHappened()) {
+                                        LogUtil.logAlways("[内屏联动] 亮屏：伴随展开，"
+                                                + "不钉回熄屏方向（交给展开流程定 270°）");
+                                    } else if (offRot >= 0 && isInnerDisplayActiveNow(context)) {
                                         pinInnerRotation(offRot);
                                         LogUtil.logAlways("[内屏联动] 亮屏：先钉回熄屏时的方向="
                                                 + offRot);
@@ -2456,12 +2491,22 @@ public class MainHook extends XposedModule {
             // —— 以下为「不钉 270°」的原始路径（关闭「展开钉 270°」时） ——
             // 窗口冷却：同一次亮屏里 DisplayListener / SCREEN_ON 会连续进来，
             // 冷却期内不再开第二个窗口（折叠状态没变时才生效）
-            long sinceEnd = android.os.SystemClock.uptimeMillis() - sLastWindowEndAt;
-            if (sLastWindowEndAt > 0L && sinceEnd >= 0
-                    && sinceEnd < INNER_WINDOW_COOLDOWN_MS) {
-                LogUtil.logAlways("[内屏联动] 距上次跟随仅 " + sinceEnd
-                        + "ms，冷却中，本次不重复解锁");
-                return;
+            // 🔴 v3.295.11（用户 2026-11-13「唤醒时没有马上解锁，进桌面后才解」）：
+            //   冷却的作用是防止**同一次折叠动作**被多条回调重复触发，
+            //   但亮屏 / 解锁是**用户重新发起的独立事件**，不该被上次跟随的
+            //   冷却挡住。日志实证：
+            //     30.408  内屏亮屏唤醒：不钉 270°，直接按当前方向解除锁定
+            //     30.408  距上次跟随仅 2499ms，冷却中，本次不重复解锁  ← 被挡住
+            //     33.915  解锁：已解除方向锁定（3.5 秒后才生效）
+            //   所以亮屏 / 解锁场景跳过冷却。
+            if (!screenOnEdge) {
+                long sinceEnd = android.os.SystemClock.uptimeMillis() - sLastWindowEndAt;
+                if (sLastWindowEndAt > 0L && sinceEnd >= 0
+                        && sinceEnd < INNER_WINDOW_COOLDOWN_MS) {
+                    LogUtil.logAlways("[内屏联动] 距上次跟随仅 " + sinceEnd
+                            + "ms，冷却中，本次不重复解锁");
+                    return;
+                }
             }
             sFollowing = true;
             callWindowManagerRotation(false);
@@ -2603,6 +2648,7 @@ public class MainHook extends XposedModule {
         final int gen = ++sUnfoldGen;
         sUnfoldSettling = true;
         sFollowing = false;
+        sLastUnfoldAt = android.os.SystemClock.uptimeMillis();
         // 记录折叠状态（边沿写入，后续只读这个值）
         sInnerActive = true;
         sInnerStateAt = android.os.SystemClock.uptimeMillis();

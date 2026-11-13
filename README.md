@@ -2,7 +2,7 @@
 
 澎湃OS 4 / HyperOS 4 主题增强 **LSPosed 模块**。应用第三方主题后保留系统界面的「柔光玻璃」模糊，并提供通知、锁屏等多项体验增强。
 
-- 当前版本：**v3.8**（`versionCode` 78）
+- 当前版本：**v3.9**（`versionCode` 470）
 - 包名：`com.abel.hyperosglass`
 - 框架：LibXposed API **102**（`minApiVersion=100`、`targetApiVersion=102`）
 
