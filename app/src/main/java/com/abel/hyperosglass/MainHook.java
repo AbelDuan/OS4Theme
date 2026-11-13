@@ -202,7 +202,8 @@ public class MainHook extends XposedModule {
     /** 当前是否处在「刚亮屏」的窗口内。 */
     private static boolean inScreenOnWindow() {
         long until = sScreenOnUntil;
-        return until > 0L && System.currentTimeMillis() < until;
+        // 用 uptimeMillis（不受 NTP 对时 / 改系统时间影响），与 sLastUnfoldAt 一致
+        return until > 0L && android.os.SystemClock.uptimeMillis() < until;
     }
     /**
      * 当前通知卡片实际宽度（px），由 {@link NotifWidth} 每次算出新值时写入，
@@ -383,7 +384,8 @@ public class MainHook extends XposedModule {
                                     // 🔑 v3.295.3：标记本次来源是「亮屏」而不是「真的展开」。
                                     //   用到期时刻而不是布尔值：亮屏会连发多次回调，
                                     //   谁先到都能拿到正确结论（见 sScreenOnUntil 注释）。
-                                    sScreenOnUntil = System.currentTimeMillis() + SCREEN_ON_WINDOW_MS;
+                                    sScreenOnUntil = android.os.SystemClock.uptimeMillis()
+                                            + SCREEN_ON_WINDOW_MS;
                                     // 🔴 v3.295.3（用户 2026-11-12）：
                                     //   「熄屏时屏幕在什么方向，点亮后就停在什么方向」。
                                     //   亮屏瞬间先把屏幕钉回熄屏时的方向，
@@ -2417,24 +2419,14 @@ public class MainHook extends XposedModule {
             int userSwitch = readSysInt(cr, "accelerometer_rotation", -1);
             boolean switchOn = userSwitch >= 0 ? userSwitch != 0 : isAutoRotateOn(cr);
             if (switchOn) {
-                if (sOccupyUntil > 0L) {
+                // 🔴 v3.9.1：sOccupyUntil 在跟随窗口内恒 >0（now+5000+3000），
+                //   只判 >0 会在刚放行用户选择后立刻又回锁。必须判「已过期」。
+                if (sOccupyUntil > 0L && sOccupyUntil < System.currentTimeMillis()) {
                     relockInner(cr, "检测到上次跟随的遗留占用，已恢复锁定（自愈）");
                     return;
                 }
-                // 🔴 v3.295.8（用户 2026-11-12「手动设置的自由旋转被覆盖」）：
-                //   **不能**因为「此刻开关是开的」就无条件记成用户意志并落盘。
-                //
-                //   原来的写法有两个后果：
-                //     ① 模块刚写完 1（展开/亮屏就会写），下一轮进来看到 1，
-                //        立刻把这个 1 当成「用户的选择」永久落盘；
-                //     ② 一旦落盘成 sUserIntent==1，之后所有「回锁」都被跳过，
-                //        用户后来手动关掉开关，模块也不会再管 —— 状态彻底错乱。
-                //
-                //   判据改为「这把 1 不是模块所写」：只有确认不是模块写的，
-                //   才算用户亲手打开，值得永久记住并让位。
-                boolean selfWritten = sSelfWrittenCr == 1
-                        && android.os.SystemClock.uptimeMillis() - sSelfWriteAt < 1500L;
-                if (!selfWritten) {
+                // 只有「不是模块刚写的 1」才算用户亲手打开（见 isUserOpenedAutoRotate）
+                if (isUserOpenedAutoRotate()) {
                     if (sUserIntent != 1) {
                         sUserIntent = 1;
                         persistInnerState();
@@ -2520,8 +2512,7 @@ public class MainHook extends XposedModule {
             sLockSnapshot = 1;
             // 记下「这段时间这把 1 是模块的」，落盘 —— 即使 SystemUI 下一秒被杀，
             // 下次启动也能认出来并收回，不会永久放养。
-            sOccupyUntil = System.currentTimeMillis()
-                    + Constants.INNER_FOLLOW_DURATION_MS + 3000L;
+            markOccupy();
             persistInnerState();
             LogUtil.logAlways("[内屏联动] 展开：已放开旋转锁，"
                     + Constants.INNER_FOLLOW_DURATION_MS + "ms 后恢复锁定");
@@ -2585,14 +2576,13 @@ public class MainHook extends XposedModule {
             int userSwitch = readSysInt(cr, "accelerometer_rotation", -1);
             boolean switchOn = userSwitch >= 0 ? userSwitch != 0 : isAutoRotateOn(cr);
             if (switchOn) {
-                if (sOccupyUntil > 0L) {
+                // 🔴 v3.9.1：同展开路径，只判 >0 会把窗口内的占用误当遗留
+                if (sOccupyUntil > 0L && sOccupyUntil < System.currentTimeMillis()) {
                     relockInner(cr, "解锁：检测到上次跟随的遗留占用，已恢复锁定（自愈）");
                     return;
                 }
-                // 🔴 v3.295.8：同样只在「不是模块所写」时才算用户意志
-                boolean selfWritten = sSelfWrittenCr == 1
-                        && android.os.SystemClock.uptimeMillis() - sSelfWriteAt < 1500L;
-                if (!selfWritten) {
+                // 同展开路径：只在「不是模块所写」时才算用户意志
+                if (isUserOpenedAutoRotate()) {
                     if (sUserIntent != 1) {
                         sUserIntent = 1;
                         persistInnerState();
@@ -2610,8 +2600,7 @@ public class MainHook extends XposedModule {
             callWindowManagerRotation(false);
             setInnerAutoRotate(cr, true);
             sLockSnapshot = 1;
-            sOccupyUntil = System.currentTimeMillis()
-                    + Constants.INNER_FOLLOW_DURATION_MS + 3000L;
+            markOccupy();
             persistInnerState();
             LogUtil.logAlways("[内屏联动] 解锁：已解除方向锁定，按传感器自由旋转，"
                     + Constants.INNER_FOLLOW_DURATION_MS + "ms 后恢复锁定");
@@ -2734,8 +2723,7 @@ public class MainHook extends XposedModule {
                     callWindowManagerRotation(false);
                     setInnerAutoRotate(cr, true);
                     sLockSnapshot = 1;
-                    sOccupyUntil = System.currentTimeMillis()
-                            + Constants.INNER_FOLLOW_DURATION_MS + 3000L;
+                    markOccupy();
                     persistInnerState();
                     LogUtil.logAlways("[内屏联动] 钉 270° 结束：已解除锁定，"
                             + Constants.INNER_FOLLOW_DURATION_MS + "ms 后恢复锁定");
@@ -2770,6 +2758,23 @@ public class MainHook extends XposedModule {
     }
 
     /** 当前活跃屏（STATE_ON）的方向；读不到返回 -1。 */
+    /**
+     * 当前这把「自动旋转 = 1」是不是用户亲手打开的（v3.9.1 抽公用）。
+     *
+     * <p>只有「不是模块刚写的」才算用户意志 —— 模块自己写完 1 之后，
+     * 下一轮进来会看到 1，那个 1 不能被当成用户的选择永久落盘。
+     */
+    private static boolean isUserOpenedAutoRotate() {
+        return !(sSelfWrittenCr == 1
+                && android.os.SystemClock.uptimeMillis() - sSelfWriteAt < 1500L);
+    }
+
+    /** 记下「从现在起这段时间，开关上的 1 是模块写的」（v3.9.1 抽公用）。 */
+    private static void markOccupy() {
+        sOccupyUntil = System.currentTimeMillis()
+                + Constants.INNER_FOLLOW_DURATION_MS + 3000L;
+    }
+
     private static int readScreenRotationNow() {
         try {
             Context ctx = sInnerCtx;

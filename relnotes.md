@@ -1,3 +1,56 @@
+## v3.9.1 代码审查修正
+
+v3.9 发布后做了一次针对性代码审查，修掉三处问题（前两条是真 bug，第三条是冗余）。
+
+### 1. 「遗留占用」被误判，会在放行用户选择后立刻回锁
+
+```java
+if (sOccupyUntil > 0L) {                    // ❌ 只判非零
+    relockInner(cr, "检测到上次跟随的遗留占用，已恢复锁定（自愈）");
+    return;
+}
+```
+
+`sOccupyUntil` 的值是 `now + 5000 + 3000`（8 秒），而跟随窗口本身就是 5 秒 ——
+**窗口内它必然 > 0**。于是在「你先手动开自由旋转、模块已判定为用户意志放行」
+之后，下一次进入展开/解锁路径时又会立刻回锁。
+
+这与 v3.9 第 5 条里修的回锁判据是**同一个错误**，当时只改了 `scheduleRelock`，
+漏了展开和解锁这两处。
+
+**修复**：两处都改成判「已过期」：
+
+```java
+if (sOccupyUntil > 0L && sOccupyUntil < System.currentTimeMillis()) { ... }
+```
+
+### 2. 亮屏窗口用了 `currentTimeMillis`，会被对时打断
+
+```java
+sScreenOnUntil = System.currentTimeMillis() + SCREEN_ON_WINDOW_MS;   // ❌
+```
+
+`currentTimeMillis` 受 NTP 对时和用户改系统时间影响。如果熄屏期间正好对时跳了几秒，
+这个 1.5 秒的「亮屏窗口」会瞬间失效或异常延长 —— 而它决定的正是
+「这次亮屏要不要钉回熄屏方向」，判错就会重现「展开后是 0°」。
+
+旁边的 `sLastUnfoldAt` 用的已经是 `uptimeMillis`，两者不一致。
+
+**修复**：`sScreenOnUntil` 与 `inScreenOnWindow()` 一并改用 `uptimeMillis`。
+
+### 3. 抽取重复逻辑
+
+| 原位置 | 内容 | 处理 |
+| --- | --- | --- |
+| 展开路径 / 解锁路径 | `selfWritten` 判定（4 行，一字不差） | 抽成 `isUserOpenedAutoRotate()` |
+| 三处 | `sOccupyUntil = now + 5000 + 3000` | 抽成 `markOccupy()` |
+
+行为不变，只是把复制粘贴收敛到一处，避免以后改一处漏一处。
+
+---
+
+版本 v3.9.1 / versionCode 471；无新增开关，作用域无变化。
+
 ## v3.9 内屏联动方向与用户意志修复
 
 这一版把「旋转旋钮」与「内屏联动」两个功能的一批顽固问题一次性修完。
