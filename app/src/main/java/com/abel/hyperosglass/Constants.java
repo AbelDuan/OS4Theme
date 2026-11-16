@@ -131,7 +131,7 @@ public final class Constants {
     public static final String TARGET_PLUGIN_PKG = "miui.systemui.plugin";
     // 日志里打印的模块版本号。⚠️ 必须和 app/build.gradle 的 versionName 一致，
     // 否则排查时会被日志骗（2026-10-25 就发生过：跑的是 3.283.3，日志写 3.41.2）。
-    public static final String VERSION = "3.294.10";
+    public static final String VERSION = "3.301.1";
 
     // ============================================================
     // 通知宽度调节（v3.41.2 新增）
@@ -208,6 +208,35 @@ public final class Constants {
      */
     public static final String PREFS_ROTATION_HINT = "rotation_hint_enable";
     public static final boolean DEFAULT_ROTATION_HINT = true;
+
+    // ── 外屏不锁定旋转（v3.300.0，用户 2026-11-16 要求）──
+    /**
+     * 开关：外屏始终解除旋转锁定。
+     *
+     * <h2>为什么需要它</h2>
+     * 外屏上用户把「旋转锁定」关掉以后，很多应用依然不旋转 —— 原因是这些应用在
+     * 清单里把 {@code screenOrientation} 写死，WMS 的优先级是
+     * <b>应用请求的固定方向 &gt; 用户旋转 / 锁</b>。此时：
+     * <ul>
+     *   <li>屏幕不会跟着转（应用拒绝了）；</li>
+     *   <li>旋钮也弹不出来（{@code showNow} 只在「锁定中」或「强制旋转开着且已等待」时显示，
+     *       而锁定已关 —— 用户觉得「取消了锁定也不转，连旋钮都没有」）。</li>
+     * </ul>
+     *
+     * <p>本开关打开后，只要处于外屏且未锁屏：
+     * <ol>
+     *   <li>把外屏自动旋转强制写为 1（{@code accelerometer_rotation} +
+     *       {@code accelerometer_rotation_outer}），系统层面就不再锁外屏；</li>
+     *   <li>方向与传感器不一致时直接弹出旋钮（不再要求「锁定中」），
+     *       点击即走 {@link OrientationForcer} 强制旋转，绕开应用的固定方向。</li>
+     * </ol>
+     *
+     * <p>⚠️ 严守本机铁律：<b>只切「旋转锁定」这一个开关，绝不写方向值</b>
+     * （{@code user_rotation*} 一律不碰）。
+     */
+    public static final String PREFS_OUTER_UNLOCK = "outer_unlock_rotation";
+    /** ★ 默认**开启**（用户 2026-11-16 明确要求「外屏不锁定旋转」）。 */
+    public static final boolean DEFAULT_OUTER_UNLOCK = true;
 
     /**
      * 内屏展开时联动自动旋转（用户 2026-10-21 最终方案）。
@@ -460,7 +489,7 @@ public final class Constants {
 
     // ⚠️ 这两个数组必须**同序同长**：reloadPrefs 与 StatusProvider 都按下标一一对应取值。
     //    新增开关只能往**末尾追加**，不可插队（v3.41.2 追加了通知宽度总开关）。
-    public static final String[] ALL_PREF_KEYS = {PREFS_GLASS_ENABLED, PREFS_FOCUS_GLASS, PREFS_AOD_BATTERY_SYNC, PREFS_PIN_GLASS, PREFS_NO_FOLD_HISTORY, PREFS_SINK_ENABLED, PREFS_KEEP_NOTIF, PREFS_HIDE_BT_UNLOCK, PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_ALLOW_MANAGE_ALL, PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE, PREFS_ENABLE_LOG, PREFS_NOTIF_IMPORTANCE, PREFS_NOTIF_WIDTH_ENABLE, PREFS_ROTATION_HINT, PREFS_INNER_FOLLOW_ROTATION, PREFS_STATUS_ICON_LIMIT_ENABLE, PREFS_PREVENT_BATTERY_WHITELIST, PREFS_FORCE_ROTATE};
+    public static final String[] ALL_PREF_KEYS = {PREFS_GLASS_ENABLED, PREFS_FOCUS_GLASS, PREFS_AOD_BATTERY_SYNC, PREFS_PIN_GLASS, PREFS_NO_FOLD_HISTORY, PREFS_SINK_ENABLED, PREFS_KEEP_NOTIF, PREFS_HIDE_BT_UNLOCK, PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_ALLOW_MANAGE_ALL, PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE, PREFS_ENABLE_LOG, PREFS_NOTIF_IMPORTANCE, PREFS_NOTIF_WIDTH_ENABLE, PREFS_ROTATION_HINT, PREFS_INNER_FOLLOW_ROTATION, PREFS_STATUS_ICON_LIMIT_ENABLE, PREFS_PREVENT_BATTERY_WHITELIST, PREFS_FORCE_ROTATE, PREFS_OUTER_UNLOCK};
     // ★ 2026-10-24：默认值按「当前在用的那台设备」的实际配置对齐（v3.283.0）。
     //   对齐项：notif_width_enable=true、rotation_hint_enable=true、inner_follow_rotation=true；
     //   同时修掉这里多出来的第 21 个元素——数组曾比 ALL_PREF_KEYS 长 1，
@@ -468,5 +497,12 @@ public final class Constants {
     // ★ 2026-10-29（v3.291.0）：末尾追加 prevent_battery_whitelist=true，
     //   与上一条同样遵守「同序同长」（现在两个数组都是 21 个元素）。
     // ★ 2026-10-29（v3.292.0）：再追加 force_rotate=true（22 个元素，仍然同序同长）。
-    public static final boolean[] ALL_PREF_DEFAULTS = {true, true, true, true, true, false, true, true, true, true, true, false, true, true, false, true, true, true, true, true, true, true};
+    // ★ 2026-11-16（v3.300.0）：再追加 outer_unlock_rotation=true（23 个元素，同序同长）。
+    //
+    //   ⚠️⚠️ 这两个数组**必须永远同长、同序**。StatusProvider.get_prefs 用
+    //   for (i < ALL_PREF_KEYS.length) 取值，只要 DEFAULTS 比 KEYS 短 1，
+    //   就会抛 ArrayIndexOutOfBoundsException —— 整个配置下发失败，
+    //   **所有开关一起失效**（旋屏、玻璃、通知全部失灵），且日志里只有异常堆栈，
+    //   现象极难与单个功能关联。v3.300.0 第一次构建就踩了这个坑。
+    public static final boolean[] ALL_PREF_DEFAULTS = {true, true, true, true, true, false, true, true, true, true, true, false, true, true, false, true, true, true, true, true, true, true, true};
 }
