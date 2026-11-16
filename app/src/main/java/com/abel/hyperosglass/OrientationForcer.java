@@ -102,8 +102,20 @@ final class OrientationForcer {
     private static final long VERIFY_DELAY_MS = 700L;
     /** 看门狗轮询间隔。 */
     private static final long WATCHDOG_INTERVAL_MS = 1200L;
-    /** 兜底超时：10 分钟。 */
-    private static final long FORCE_MAX_MS = 10L * 60L * 1000L;
+    /**
+     * 强制状态的兜底超时。
+     *
+     * <p>🔴 v3.300.9（用户 2026-11-17）：原来是 <b>10 分钟</b>，这是
+     * 「旋转锁关闭后应用都不自动转」「视频回到强制旋转」「桌面图标错位」
+     * 的直接原因 —— 点过一次旋钮后，{@code ignore-orientation-request} 与
+     * {@code fixed-to-user-rotation} 会常驻开启长达 10 分钟，期间**所有**应用
+     * 的方向请求都被压掉，系统自己的旋转流程完全失效。
+     *
+     * <p>用户定的规则是「能转就别管，转不动才介入」，介入必须是<b>短时</b>的。
+     * 12 秒足够覆盖一次旋钮操作的校验（700ms）+ 系统转屏过渡，
+     * 之后立即交还控制权给系统。
+     */
+    private static final long FORCE_MAX_MS = 12L * 1000L;
 
     private OrientationForcer() {
     }
@@ -129,6 +141,18 @@ final class OrientationForcer {
     static boolean force(final Context ctx, final int targetRotation, final String reason) {
         if (ctx == null || targetRotation < 0 || targetRotation > 3) {
             LogUtil.logAlways(TAG + " 参数非法：ctx=" + ctx + " target=" + targetRotation);
+            return false;
+        }
+        // 🔴 v3.300.9（用户 2026-11-17 规则）：桌面上永远不介入。
+        //
+        //   用户反馈「有时候桌面也被旋转了，图标都是错位的」——
+        //   桌面本身会按系统旋转自行重排，模块一旦对它打开
+        //   ignore-orientation-request，桌面的方向请求被压掉，
+        //   图标网格就会错位。桌面属于"系统自己能转"的典型，
+        //   按用户规则（能转就别管）必须完全排除。
+        String topNow = normalizePkg(topPackage(ctx));
+        if (topNow != null && topNow.startsWith("com.miui.home")) {
+            LogUtil.logAlways(TAG + " 当前在桌面（" + topNow + "），不介入旋转");
             return false;
         }
         // 同一方向、上一次已经转到位、且还在强制期内 → 立即成功返回，
@@ -213,11 +237,18 @@ final class OrientationForcer {
         }
         switch (level) {
             case 1:
-                // 🔑 v3.294.6：只记录。方向已由 setRotationLockForFold 精确下发，
-                //   校验再"升级"就会引入互相覆盖的第二套开关，反而把方向顶回去。
-                LogUtil.logAlways(TAG + " ⚠️ 校验：期望=" + targetRotation + " 当前=" + now
-                        + "。方向已下发，不做追加改写（折叠屏的 rotation 与画面朝向差 180°，"
-                        + "此值仅供诊断）");
+                // 🔑 v3.294.6 / v3.300.5：只记录，不做追加改写。
+                //
+                //   方向已经由 setRotationLockForFold 按 isFold 精确下发到对应那块屏
+                //   （外屏 isFold=true，内屏 isFold=false），剩下的交给系统过渡。
+                //   校验只用于日志诊断。
+                //
+                //   ⚠️ 别再在这里补 setIgnoreOrientationRequest：实测本机该接口
+                //   对**外屏 (Display 0) 完全不响应**（-d 0 恒为 false），
+                //   对内屏 (Display 1) 才有效。加了只会制造"日志成功但没效果"的假象。
+                LogUtil.logAlways(TAG + " 校验：期望=" + targetRotation + " 当前=" + now
+                        + (now == targetRotation ? " ✔一致" : " ✘不一致（仅供诊断）"));
+                sReached = (now == targetRotation);
                 return;
             default:
                 LogUtil.logAlways(TAG + " ❌ 仍然没转过去（当前=" + now + "，目标="
@@ -325,6 +356,22 @@ final class OrientationForcer {
         Object wm = MainHook.getWindowManagerServicePublic();
         if (wm == null) {
             LogUtil.logAlways(TAG + " 拿不到 IWindowManager，锁方向失败");
+            return false;
+        }
+        // 🔴 v3.301.1（用户 2026-11-17 决定）：**外屏旋转完全交还系统**。
+        //
+        //   用户原话：「先把外屏所有关于旋转的功能都移除掉，包括旋钮、强制旋转
+        //   等等，全部移除掉，全部交还给系统。」
+        //
+        //   外屏这块此前反复出问题（点了旋钮只有单个应用转、切应用变横屏、
+        //   桌面图标错位、旋转锁关了还不转），根因是外屏的旋转策略
+        //   （fixed-to-user-rotation / ignore-orientation-request）会压掉
+        //   系统自身的旋转流程，而那个流程本来是好的。
+        //
+        //   所以这里直接放弃：外屏不锁方向、不开任何策略，
+        //   完全由系统 + 应用自己决定。内屏逻辑不受影响。
+        if (isOuterScreen(ctx)) {
+            LogUtil.logAlways(TAG + " 当前是外屏，旋转完全交还系统，模块不介入");
             return false;
         }
         boolean any = false;
@@ -602,27 +649,30 @@ final class OrientationForcer {
         if (ctx == null) {
             return null;
         }
+        // 🔴 v3.300.2：不再按 DisplayId 猜内/外屏。
+        //   本机实测（2026-11-17）：展开时 Display 0 = 内屏、Display 1 = 外屏；
+        //   **合上后两者互换**（Display 0 = 外屏 1168×1712，Display 1 = 内屏 1672×2364）。
+        //   原实现写死 getDisplay(0/1)，外屏场景下会把方向下发到另一块屏 ——
+        //   接口成功、日志成功、用户屏幕纹丝不动。
+        //   改按物理面积认屏：面积大的是内屏（1672×2364 > 1168×1712），与 ID 无关。
+        // 🔴 v3.301.1：外屏旋转已整体交还系统，
+        //   取屏逻辑内联到这里。按用户指出的方式：先看折叠状态
+        //   （current_device_state==3 内屏，其它外屏），再取 STATE_ON 的那块 ——
+        //   用户正看着的屏必然点亮，与折叠状态天然一致，不需要猜尺寸。
         try {
             android.hardware.display.DisplayManager dm =
                     (android.hardware.display.DisplayManager)
                             ctx.getSystemService(Context.DISPLAY_SERVICE);
-            if (dm == null) {
-                return null;
-            }
-            if (MainHook.isInnerScreenRemembered(ctx)) {
-                Display inner = dm.getDisplay(0);
-                if (inner != null && inner.isValid()) {
-                    return inner;
-                }
-            } else {
-                Display outer = dm.getDisplay(1);
-                if (outer != null && outer.isValid()) {
-                    return outer;
+            if (dm != null) {
+                for (Display d : dm.getDisplays()) {
+                    if (d != null && d.isValid() && d.getState() == Display.STATE_ON) {
+                        return d;
+                    }
                 }
             }
         } catch (Throwable unused) {
         }
-        return null;
+        return ctx.getDisplay();
     }
 
     /** 当前是否是外屏（current_device_state != 3）。 */
