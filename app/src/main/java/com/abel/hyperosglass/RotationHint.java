@@ -570,7 +570,15 @@ public final class RotationHint {
         //   接管 —— 等屏幕转到目标方向（或静默期结束）再收起。
         //   这样「点下去 → 立刻有前提反馈 → 转到位后收起」是一条连贯的动作。
         rotateSuggestionUntilIdle(target);
-        if (MainHook.sForceRotateEnable.get() && ctx != null
+        // 🔴 v3.301.1（用户 2026-11-17 决定）：外屏旋转**完全交还系统**，
+        //   点旋钮也不再做任何强制。旋钮在外屏本来就不会显示（见上方拦截），
+        //   这里再加一道防御：即使有残留调用，也直接返回，不进任何反射路径
+        //   （包括下面的 freezeRotation 兜底）。内屏行为不受影响。
+        if (ctx == null || isOuterScreen(ctx)) {
+            LogUtil.logAlways("[旋转提示] 外屏不参与旋转，忽略本次点击");
+            return;
+        }
+        if (MainHook.sForceRotateEnable.get()
                 && OrientationForcer.force(ctx, target, "点击旋钮")) {
             LogUtil.logAlways("[旋转提示] 已请求强制旋转 → rotation=" + target);
             return;
@@ -715,14 +723,30 @@ public final class RotationHint {
             android.content.ContentResolver cr = ctx.getContentResolver();
             int state = android.provider.Settings.Global.getInt(
                     cr, "current_device_state", -1);
-            String key = (state == 3)
-                    ? "accelerometer_rotation_inner"
-                    : "accelerometer_rotation";
-            int auto = android.provider.Settings.System.getInt(cr, key, -1);
-            if (auto < 0) {
-                return true;
+            if (state == 3) {
+                // 内屏：专用键
+                int auto = android.provider.Settings.System.getInt(
+                        cr, "accelerometer_rotation_inner", -1);
+                return auto < 0 || auto == 0;
             }
-            return auto == 0;   // 0 = 锁定
+            // 🔴 v3.300.8（用户 2026-11-17）：外屏必须读**专用键**
+            //   accelerometer_rotation_outer。
+            //
+            //   原来外屏读的是通用键 accelerometer_rotation，两者在 MIUI 上
+            //   **并不同步**（实测出现过 outer=1 而 common=0 的组合）。
+            //   读错键会把「用户已取消锁定」误判成「仍锁定」，
+            //   模块于是接管旋转、弹出旋钮 —— 而系统本来能自己转
+            //   （哔哩哔哩等视频应用就是这种情况）。
+            //   表现正是用户说的「不用模块能转，用了模块就得点旋钮」。
+            int outer = android.provider.Settings.System.getInt(
+                    cr, "accelerometer_rotation_outer", -1);
+            if (outer >= 0) {
+                return outer == 0;
+            }
+            // 该 ROM 没有 outer 键时才退回通用键
+            int auto = android.provider.Settings.System.getInt(
+                    cr, "accelerometer_rotation", -1);
+            return auto < 0 || auto == 0;
         } catch (Throwable unused) {
             return true;
         }
@@ -736,6 +760,15 @@ public final class RotationHint {
      */
     private static final long FORCE_HINT_DELAY_MS = 800L;
 
+    /**
+     * 系统自行旋转的宽限时间（v3.300.9）。
+     *
+     * <p>方向稳定后先等这么久：期间只要屏幕方向对上了就完全不干预；
+     * 超过这个时间仍没转，才认定「应用拒绝跟随」，提供旋钮。
+     * 视频类应用转屏一般 300~900ms，取 2000ms 留足余量。
+     */
+    private static final long SELF_ROTATE_GRACE_MS = 2000L;
+
     /** 延迟判定任务（自动旋转场景专用；保持单例，避免被反复 post）。 */
     private static volatile Runnable sForceHintTask;
 
@@ -746,6 +779,14 @@ public final class RotationHint {
      * 没到点就先挂一个延时任务到点再重算，返回 false 让调用方这次先不显示。
      */
     private static boolean allowHintWhileUnlocked(Context ctx) {
+        // 🔑 v3.300.5（用户 2026-11-17 定稿）：外屏与内屏旋钮逻辑完全一致。
+        //
+        //   用户原话：「外屏跟内屏的旋屏逻辑完全一样，除了锁屏亮屏那种解除锁定
+        //   外屏不需要以外，别的功能完全同内屏一模一样。」
+        //
+        //   所以这里**不再给外屏任何特殊分支** —— 未锁定时的可见性判定
+        //   与内屏走完全相同的规则（强制旋转开启 + 稳定 800ms 后给旋钮）。
+        //   之前那套「外屏无条件下发」只会让外屏表现和内屏不一致。
         if (!MainHook.sForceRotateEnable.get()) {
             return false;
         }
@@ -754,6 +795,37 @@ public final class RotationHint {
             scheduleForceHint(FORCE_HINT_DELAY_MS - age + 30L);
             return false;
         }
+        // 🔴 v3.300.8（用户 2026-11-17）：屏幕**已经跟着转了**就别弹旋钮。
+        //
+        //   反应用户的原始反馈：「不用模块时，外屏看 B 站视频会跟着方向转；
+        //   用了模块就要手动点旋钮」。根因就是这里 —— 只看「稳定超过 800ms」
+        //   就认定"应用拒绝旋转"，可视频应用本来就会自己转，
+        //   于是系统转了、旋钮还照弹，用户体感就是"模块把自动旋转弄坏了"。
+        //
+        //   正确的判据是「期望方向 vs 实际方向」：两者一致说明系统已经转好，
+        //   此时不该再提供旋钮，更不该做任何接管。
+        // 期望方向（传感器稳态目标）与当前屏幕方向一致 = 系统已经转好了。
+        //
+        // 🔴 v3.300.9（用户 2026-11-17 规则）：
+        //   「如果软件本身支持旋转，或者它进行了旋转，那我们的模块就不要去干涉；
+        //    如果软件在屏幕切换方向之后没有旋转，我们的模块才介入。」
+        //
+        //   所以这里要**给系统充分的自行旋转时间**：视频类应用（哔哩哔哩）
+        //   转屏通常要 300~900ms，原来 800ms 就判定"转不动"过于激进 ——
+        //   系统正在转的那一刻旋钮就弹出来了，用户体感是"模块在强制旋转"。
+        //   现在统一等 SELF_ROTATE_GRACE_MS，期间只要方向对上了就立刻退出干预。
+        int want = sStableTarget;
+        int now = OrientationForcer.currentRotation(ctx);
+        if (want >= 0 && now >= 0 && want == now) {
+            return false;      // 已经跟随成功，无需介入
+        }
+        if (age < SELF_ROTATE_GRACE_MS) {
+            // 还在系统自行旋转的合理时间内：继续等，先不弹
+            scheduleForceHint(SELF_ROTATE_GRACE_MS - age + 40L);
+            return false;
+        }
+        LogUtil.logAlways("[旋转提示] 自动旋转已开但方向仍为 " + now + "（期望 " + want
+                + "），判定应用确实不跟随，提供旋钮");
         return true;
     }
 
@@ -820,9 +892,18 @@ public final class RotationHint {
         if (ctx == null) {
             return;
         }
-        // 🔑 v3.293.0：外屏桌面不弹旋钮 —— 与锁屏同等对待。
-        //   放在最前面，连「自动旋转下延迟判定」的调度都不进，
-        //   避免桌面上一转身就安排一次无意义的 reconcile。
+        // 🔴 v3.301.1（用户 2026-11-17 决定）：**外屏一律不显示旋钮**。
+        //
+        //   用户原话：「先把外屏所有关于旋转的功能都移除掉，包括旋钮、
+        //   强制旋转等等，全部移除掉，全部交还给系统。」
+        //
+        //   放在最前面：外屏连后续的判定/调度都不进，彻底不参与。
+        //   内屏旋钮行为完全不受影响。
+        if (isOuterScreen(ctx)) {
+            hideButtonNow();
+            return;
+        }
+        // 外屏桌面：现在由上面的外屏总开关统一拦截，这里保留作防御。
         if (isOuterLauncherForeground(ctx)) {
             LogUtil.logAlways("[旋转提示] 外屏桌面，不显示旋钮");
             hideButtonNow();
