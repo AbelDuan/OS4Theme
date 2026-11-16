@@ -110,6 +110,15 @@ public class MainHook extends XposedModule {
      * 但应用拒绝跟随」时也会把旋钮弹出来。详见 {@link OrientationForcer}。
      */
     public static final AtomicBoolean sForceRotateEnable = new AtomicBoolean(true);
+    /**
+     * 外屏不锁定旋转（v3.300.0，用户 2026-11-16 要求）。
+     *
+     * <p>开启后：外屏始终把「旋转锁定」写为关闭，并且在方向与传感器不一致时
+     * 直接弹出旋钮（应用写死方向也能点一下强制转过去）。
+     * 详见 {@link Constants#PREFS_OUTER_UNLOCK}。
+     */
+    public static final AtomicBoolean sOuterUnlockEnable =
+            new AtomicBoolean(Constants.DEFAULT_OUTER_UNLOCK);
     /** 内屏联动的延时任务调度器（独立线程，不打扰主线程）。 */
     private static final android.os.Handler sInnerHandler =
             new android.os.Handler(android.os.Looper.getMainLooper());
@@ -1680,8 +1689,17 @@ public class MainHook extends XposedModule {
             cr.registerContentObserver(
                     android.provider.Settings.System.getUriFor("accelerometer_rotation_inner"),
                     false, obs);
+            // 🔑 v3.301.0（用户 2026-11-17）：外屏专用键也要监听。
+            //
+            //   用户要求：「系统设置里旋屏锁定是关掉的时候，所有应用都能旋转，要保持一致性。」
+            //   外屏的锁定键是 accelerometer_rotation_outer，与通用键并不同步；
+            //   不监听它，就发现不了"用户把外屏旋转锁关掉了"这件事，
+            //   模块接管过的整屏锁定会一直挂着，导致应用都不自动转。
+            cr.registerContentObserver(
+                    android.provider.Settings.System.getUriFor("accelerometer_rotation_outer"),
+                    false, obs);
             sInnerObserverInstalled = true;
-            LogUtil.logAlways("[用户意志] 已监听旋转开关，用户手动改动优先于联动");
+            LogUtil.logAlways("[用户意志] 已监听旋转开关（含外屏专用键），用户手动改动优先于联动");
             // 进程刚起来（可能刚被重启过）先自愈一次遗留占用
             sInnerHandler.postDelayed(new Runnable() {
                 @Override
@@ -2846,6 +2864,10 @@ public class MainHook extends XposedModule {
             boolean forceRotate = bundle.getBoolean(Constants.PREFS_FORCE_ROTATE,
                     Constants.DEFAULT_FORCE_ROTATE);
             sForceRotateEnable.set(forceRotate);
+            // 外屏不锁定旋转（v3.300.0）：默认开启；用户手动关过就以配置为准
+            boolean outerUnlock = bundle.getBoolean(Constants.PREFS_OUTER_UNLOCK,
+                    Constants.DEFAULT_OUTER_UNLOCK);
+            sOuterUnlockEnable.set(outerUnlock);
             // ⚠️ 关掉时必须立刻把 WMS 的「忽略应用方向请求」还回去，
             //    否则强制状态会一直残留到下次熄屏 —— 别的应用会莫名其妙跟着转。
             if (!forceRotate || !sRotationHintEnable.get()) {
@@ -2919,6 +2941,24 @@ public class MainHook extends XposedModule {
         } catch (Throwable unused) {
             return null;
         }
+    }
+
+    /**
+     * 取 SystemUI 的 Context（供模块在非主流程里使用）。
+     *
+     * <p>优先用缓存过的 {@code sInnerCtx}（内屏联动早已持有），
+     * 拿不到再从 {@code ActivityThread.currentApplication()} 取。
+     */
+    static Context currentSystemUiContext() {
+        Context cached = sInnerCtx;
+        if (cached != null) {
+            return cached;
+        }
+        Object app = currentApplication();
+        if (app instanceof Context) {
+            return (Context) app;
+        }
+        return null;
     }
 
     private void installPluginClassLoaderHooks(ClassLoader classLoader) {
