@@ -2570,10 +2570,17 @@ public class MainHook extends XposedModule {
             return;
         }
         try {
-            // 熄屏期间不解锁（此时屏幕不面向用户，方向已由熄屏分支钉死）
-            if (!isInteractiveNow(ctx)) {
-                return;
-            }
+            // 🔴 v3.301.2（用户 2026-11-19 反馈「亮屏/解锁时偶尔没及时解开自动旋转」）：
+            //
+            //   这里原来用 isInteractiveNow() 挡熄屏，但本方法的唯一调用点是
+            //   ACTION_USER_PRESENT —— 那个广播本身**就是**「用户已解锁、屏幕已点亮」
+            //   的权威信号，再查一次 PowerManager.isInteractive() 属于重复判断，
+            //   而且会引入时序竞态：广播发出与 PowerManager 状态更新之间有一帧间隙，
+            //   偶尔读到 false 就直接 return，这次解锁就漏掉了（"偶尔"的来源）。
+            //
+            //   正确的做法：信任广播语义，不在解锁路径上重复判屏幕状态。
+            //   （"熄屏不进入展开判定" 那个场景在 applyInnerFixedLandscape 里另有
+            //    isInteractiveNow 把关，与这里互不影响。）
             // 只在内屏生效
             if (!isInnerDisplayActiveNow(ctx)) {
                 return;
