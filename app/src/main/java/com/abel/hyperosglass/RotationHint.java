@@ -2340,11 +2340,18 @@ public final class RotationHint {
         // ⭐ 记录传感器方向，供落点使用（纯传感器驱动）
         if (sSensorTargetRotation != target) {
             sSensorTargetRotation = target;
-            // 不在这里改 sStableTarget：稳态基准统一由 reconcileRotationHint 维护，
-            // 避免两处各改一半导致「方向变了但计时没重置」。
-            sStableSince = android.os.SystemClock.uptimeMillis();
-            // 🔑 v3.294.2：稳态计时每次方向变化都从 0 开始（用户 2026-11-12 澄清：
-            //   稳态 = 同一个方向保持了多久；继续转就不弹，停下来够久才弹）。
+            // 🔴 v3.301.2（用户 2026-11-19 反馈「第一次旋转经常没及时弹旋钮」）：
+            //
+            //   根因就在这一行。原来这里只更新 sStableSince、**不更新 sStableTarget**
+            //   （注释说"稳态基准统一由 reconcile 维护"）。但 reconcile 一进来就发现
+            //   sStableTarget != sensor，于是又把 sStableSince 重置成"现在" ——
+            //   计时永远从 0 开始，stableFor 必然 < HINT_STABLE_MS，
+            //   所以**每次方向刚变后的第一次判定必定不显示**，必须再等 180ms 复检。
+            //   用户感知就是"第一次转没弹，要再动一下才出来"。
+            //
+            //   正确做法：方向变化时把「基准方向 + 计时起点」一起设好，
+            //   二者始终成对更新，稳定时长才真实反映"这个方向持续了多久"。
+            sStableTarget = target;
             sStableSince = android.os.SystemClock.uptimeMillis();
             LogUtil.logAlways("[旋转提示] 传感器方向=" + target);
 
