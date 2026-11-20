@@ -199,91 +199,6 @@ public final class Constants {
     /** 下限 452dp = 系统原值，保证任何场景都不会比原生更窄 */
     public static final int NOTIF_WIDTH_MIN_DP = 452;
 
-    // ── 锁定方向时的旋转提示（v3.45.0）──
-    /**
-     * 开关：锁定方向时，若传感器方向与屏幕方向不一致就弹出系统原生旋转按钮。
-     *
-     * <p>默认关闭。开启后仅作用于「自动旋转已关闭」的场景 ——
-     * 自动旋转开着时系统会自己转，不需要提示。
-     */
-    public static final String PREFS_ROTATION_HINT = "rotation_hint_enable";
-    public static final boolean DEFAULT_ROTATION_HINT = true;
-
-    // ── 外屏不锁定旋转（v3.300.0，用户 2026-11-16 要求）──
-    /**
-     * 开关：外屏始终解除旋转锁定。
-     *
-     * <h2>为什么需要它</h2>
-     * 外屏上用户把「旋转锁定」关掉以后，很多应用依然不旋转 —— 原因是这些应用在
-     * 清单里把 {@code screenOrientation} 写死，WMS 的优先级是
-     * <b>应用请求的固定方向 &gt; 用户旋转 / 锁</b>。此时：
-     * <ul>
-     *   <li>屏幕不会跟着转（应用拒绝了）；</li>
-     *   <li>旋钮也弹不出来（{@code showNow} 只在「锁定中」或「强制旋转开着且已等待」时显示，
-     *       而锁定已关 —— 用户觉得「取消了锁定也不转，连旋钮都没有」）。</li>
-     * </ul>
-     *
-     * <p>本开关打开后，只要处于外屏且未锁屏：
-     * <ol>
-     *   <li>把外屏自动旋转强制写为 1（{@code accelerometer_rotation} +
-     *       {@code accelerometer_rotation_outer}），系统层面就不再锁外屏；</li>
-     *   <li>方向与传感器不一致时直接弹出旋钮（不再要求「锁定中」），
-     *       点击即走 {@link OrientationForcer} 强制旋转，绕开应用的固定方向。</li>
-     * </ol>
-     *
-     * <p>⚠️ 严守本机铁律：<b>只切「旋转锁定」这一个开关，绝不写方向值</b>
-     * （{@code user_rotation*} 一律不碰）。
-     */
-    public static final String PREFS_OUTER_UNLOCK = "outer_unlock_rotation";
-    /** ★ 默认**开启**（用户 2026-11-16 明确要求「外屏不锁定旋转」）。 */
-    public static final boolean DEFAULT_OUTER_UNLOCK = true;
-
-    /**
-     * 内屏展开时联动自动旋转（用户 2026-10-21 最终方案）。
-     *
-     * <p>语义：
-     * <ul>
-     *   <li><b>关</b>：展开内屏 → 直接设成横屏（摄像头右上角）并保持锁定。</li>
-     *   <li><b>开</b>：展开时若内屏**已锁定方向**，则先打开自动旋转，
-     *       跟随传感器 3 秒，3 秒后把当时的方向重新锁定下来；
-     *       若内屏本来就是自动旋转状态，则不做任何额外动作。</li>
-     * </ul>
-     */
-    public static final String PREFS_INNER_FOLLOW_ROTATION = "inner_follow_rotation";
-    /** ★ v3.283.0：默认改为**开启**，与当前在用的设备配置保持一致。 */
-    public static final boolean DEFAULT_INNER_FOLLOW_ROTATION = true;
-
-    /**
-     * 点击旋钮 = 强制旋转（v3.292.0，用户 2026-10-29 要求）。
-     *
-     * <p>背景：外屏（以及内屏）上有大量应用在清单里把 {@code screenOrientation}
-     * 写死成竖屏，WMS 会以「应用请求的方向」为准，我们点旋钮时只调
-     * {@code freezeRotation()} 改的是「用户旋转」，优先级低于应用请求 ——
-     * 于是点击没有任何反应。
-     *
-     * <p>开启后点旋钮会额外让 WMS **忽略应用的固定方向请求**
-     * （{@code IWindowManager#setIgnoreOrientationRequest}，就是
-     * {@code wm set-ignore-orientation-request} 那条系统命令背后的接口），
-     * 屏幕就一定会转到旋钮指示的方向，应用被强制旋转（必要时由系统加黑边）。
-     *
-     * <p>同时，当「自动旋转」开着、但应用拒绝跟随旋转时，也会把旋钮弹出来，
-     * 让用户有一个「手动强制」的入口（原来这种情况下旋钮是不出现的）。
-     */
-    public static final String PREFS_FORCE_ROTATE = "force_rotate";
-    /** ★ 默认**开启**（用户 2026-10-29 明确要求「点击旋钮即强制旋转」）。 */
-    public static final boolean DEFAULT_FORCE_ROTATE = true;
-
-    /** 开启联动时，跟随传感器的时长（毫秒）。 */
-    public static final long INNER_FOLLOW_DURATION_MS = 5000L;
-
-    /**
-     * 展开时是否「先钉住 270° 再解除锁定」（v3.294.0，修复「偶尔展开是竖屏」）。
-     *
-     * <p>关掉即退回旧行为（边沿一到立刻解除锁定）。
-     */
-    public static final boolean PIN_INNER_270_ON_UNFOLD = true;
-    /** 展开后钉住的方向：270° = 摄像头在右上角的横屏（用户 2026-10-29 定的默认）。 */
-    public static final int UNFOLD_PIN_ROTATION = 3;
     public static final int NOTIF_WIDTH_MARGIN_DP = 48;
 
     /**
@@ -489,7 +404,7 @@ public final class Constants {
 
     // ⚠️ 这两个数组必须**同序同长**：reloadPrefs 与 StatusProvider 都按下标一一对应取值。
     //    新增开关只能往**末尾追加**，不可插队（v3.41.2 追加了通知宽度总开关）。
-    public static final String[] ALL_PREF_KEYS = {PREFS_GLASS_ENABLED, PREFS_FOCUS_GLASS, PREFS_AOD_BATTERY_SYNC, PREFS_PIN_GLASS, PREFS_NO_FOLD_HISTORY, PREFS_SINK_ENABLED, PREFS_KEEP_NOTIF, PREFS_HIDE_BT_UNLOCK, PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_ALLOW_MANAGE_ALL, PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE, PREFS_ENABLE_LOG, PREFS_NOTIF_IMPORTANCE, PREFS_NOTIF_WIDTH_ENABLE, PREFS_ROTATION_HINT, PREFS_INNER_FOLLOW_ROTATION, PREFS_STATUS_ICON_LIMIT_ENABLE, PREFS_PREVENT_BATTERY_WHITELIST, PREFS_FORCE_ROTATE, PREFS_OUTER_UNLOCK};
+    public static final String[] ALL_PREF_KEYS = {PREFS_GLASS_ENABLED, PREFS_FOCUS_GLASS, PREFS_AOD_BATTERY_SYNC, PREFS_PIN_GLASS, PREFS_NO_FOLD_HISTORY, PREFS_SINK_ENABLED, PREFS_KEEP_NOTIF, PREFS_HIDE_BT_UNLOCK, PREFS_MUTE_SCREEN_ON, PREFS_CANCEL_VIBRATE_SCREEN_ON, PREFS_ALLOW_MANAGE_ALL, PREFS_HIDE_LOCK_FOD, PREFS_HIDE_DISMISS_BTN, PREFS_QS_EDIT_HIDE, PREFS_ENABLE_LOG, PREFS_NOTIF_IMPORTANCE, PREFS_NOTIF_WIDTH_ENABLE, PREFS_STATUS_ICON_LIMIT_ENABLE, PREFS_PREVENT_BATTERY_WHITELIST};
     // ★ 2026-10-24：默认值按「当前在用的那台设备」的实际配置对齐（v3.283.0）。
     //   对齐项：notif_width_enable=true、rotation_hint_enable=true、inner_follow_rotation=true；
     //   同时修掉这里多出来的第 21 个元素——数组曾比 ALL_PREF_KEYS 长 1，

@@ -5,5 +5,5 @@ description=HyperOS 4 主题增强：三方主题柔光玻璃通知 / 锁屏通�
 minApiVersion=100
 targetApiVersion=102
 version=3.9.3
-versionCode=473
+versionCode=480
 scope=com.android.systemui,com.android.settings,miui.systemui.plugin,com.miui.powerkeeper
