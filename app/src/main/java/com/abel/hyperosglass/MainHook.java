@@ -142,9 +142,11 @@ public class MainHook extends XposedModule {
             LogUtil.attach(this);
             reloadPrefs();
             syncRealPrefsAsync();
-            LogUtil.logAlways("==== 模块已加载 v" + Constants.VERSION + "（LibXposed API " + getApiVersion() + "，进程=" + moduleLoadedParam.getProcessName() + "）====");
+            // ★ 2026-11-24：加载里程碑不受日志开关影响（每进程一条），
+            //   其余运行日志严格跟随开关，关闭时零 IPC。
+            LogUtil.logStartup("==== 模块已加载 v" + Constants.VERSION + "（LibXposed API " + getApiVersion() + "，进程=" + moduleLoadedParam.getProcessName() + "）====");
         } catch (Throwable th) {
-            LogUtil.logAlways("onModuleLoaded 异常: " + th);
+            LogUtil.logStartup("onModuleLoaded 异常: " + th);
         }
     }
 

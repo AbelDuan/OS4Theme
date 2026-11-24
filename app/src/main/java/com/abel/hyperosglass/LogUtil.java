@@ -19,6 +19,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class LogUtil {
     private static final int MAX_PENDING = 200;
     private static final int MAX_PUSH_RETRY = 15;
+    /** 一次 IPC 最多打包推送的日志行数（2026-11-24 批量推送）。 */
+    private static final int MAX_PUSH_BATCH = 100;
     private static volatile Context sCtx = null;
     private static volatile boolean sEnabled = false;
     private static volatile XposedModule sLogger;
@@ -57,11 +59,34 @@ public final class LogUtil {
         }
     }
 
+    /**
+     * 运行日志：**严格跟随设置里的「日志记录」开关**。
+     *
+     * ★ 2026-11-24 修复：旧实现 logAlways 绕过了 sEnabled，开关关着也会
+     *   ① 写 logcat / Xposed 日志；② 每条日志 enqueue 后 contentResolver.call()
+     *   推一次模块 App 进程。通知栏高频事件（过滤/图标屏蔽）每秒数条 ⇒
+     *   模块 App 被杀又被拉起，「墓碑统计」里的后台唤醒主要就来自这里。
+     *   现在关闭时直接返回：零日志、零 IPC、零开销。
+     */
     public static void logAlways(String str) {
+        if (!sEnabled) {
+            return;
+        }
+        writeAlways(str);
+    }
+
+    /**
+     * 进程级里程碑（模块加载、版本号等）：每个进程只有一两条，
+     * 不受日志开关影响，方便确认模块有没有被加载、加载的是哪个版本。
+     */
+    public static void logStartup(String str) {
         writeAlways(str);
     }
 
     public static void logAlwaysOnce(String str, String str2) {
+        if (!sEnabled) {
+            return;
+        }
         if (sOnceKeys.add(str)) {
             writeAlways(str2);
         }
@@ -111,7 +136,15 @@ public final class LogUtil {
                                         LogUtil.sWorker = null;
                                         return;
                                     }
-                                    str2 = (String) LogUtil.sQueue.poll();
+                                    // ★ 2026-11-24：批量发送——一次 IPC 最多带 MAX_PUSH_BATCH 行，
+                                    //   不再一行一个 contentResolver.call()（后者会把模块 App 拉起 N 次）。
+                                    StringBuilder sb = new StringBuilder();
+                                    int batch = 0;
+                                    while (!LogUtil.sQueue.isEmpty() && batch < LogUtil.MAX_PUSH_BATCH) {
+                                        sb.append((String) LogUtil.sQueue.poll());
+                                        batch++;
+                                    }
+                                    str2 = sb.toString();
                                 }
                                 try {
                                     zPushToApp = LogUtil.pushToApp(str2);
@@ -171,14 +204,20 @@ public final class LogUtil {
             if (arrayList == null) {
                 return true;
             }
+            // ★ 2026-11-24：积压日志也合成一条发，别逐条 call
+            StringBuilder sbPending = new StringBuilder();
             for (String str2 : arrayList) {
-                Bundle bundle2 = new Bundle();
-                bundle2.putString(Constants.KEY_LOG_LINE, str2);
-                try {
-                    sCtx.getContentResolver().call(Uri.parse(Constants.STATUS_URI), Constants.METHOD_APPEND_LOG, (String) null, bundle2);
-                } catch (Throwable unused) {
-                    return true;
+                sbPending.append(str2);
+                if (!str2.endsWith("\n")) {
+                    sbPending.append('\n');
                 }
+            }
+            Bundle bundle2 = new Bundle();
+            bundle2.putString(Constants.KEY_LOG_LINE, sbPending.toString());
+            try {
+                sCtx.getContentResolver().call(Uri.parse(Constants.STATUS_URI), Constants.METHOD_APPEND_LOG, (String) null, bundle2);
+            } catch (Throwable unused) {
+                return true;
             }
             return true;
         } catch (Throwable unused2) {

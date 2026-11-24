@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    android:versionCode="480"
-    android:versionName="3.9.3"
+    android:versionCode="481"
+    android:versionName="3.9.4"
     android:compileSdkVersion="37"
     android:compileSdkVersionCodename="17"
     package="com.abel.hyperosglass"
