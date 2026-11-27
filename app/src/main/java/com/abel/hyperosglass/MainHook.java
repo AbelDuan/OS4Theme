@@ -299,6 +299,12 @@ public class MainHook extends XposedModule {
         } catch (Throwable th) {
             LogUtil.logAlways("[通知宽度] 挂载失败: " + th);
         }
+        // v3.9.7：顶部「时钟 / 日期」跟随卡片宽度
+        try {
+            NotifHeaderAlign.install(this, classLoader);
+        } catch (Throwable th) {
+            LogUtil.logAlways("[顶部对齐] 挂载失败: " + th);
+        }
         // ⚠️ 这里**不再**挂 NotifTopAlign。
         // 早期版本为了「让锁屏状态栏左右块对齐卡片」去改 MiuiKeyguardStatusBarView
         // 里 mKeyguardLeftSide / mKeyguardRightSide 的 margin，结果把**锁屏状态栏
@@ -1253,9 +1259,16 @@ public class MainHook extends XposedModule {
             // 比例做一次范围兜底：配置可能被手工改坏，越界会导致宽度离谱
             widthRatio = clampRatio(widthRatio);
             widthRatioLand = clampRatio(widthRatioLand);
+            boolean widthChanged = sNotifWidthEnable.get() != widthOn
+                    || sNotifWidthRatio.get() != widthRatio
+                    || sNotifWidthRatioLand.get() != widthRatioLand;
             sNotifWidthEnable.set(widthOn);
             sNotifWidthRatio.set(widthRatio);
             sNotifWidthRatioLand.set(widthRatioLand);
+            if (widthChanged) {
+                // 比例变了：通知卡片会自己重新测量，顶部时钟那一行不会，必须主动催一次
+                NotifHeaderAlign.refresh();
+            }
             // 状态栏通知图标上限 + 溢出圆点（v3.45.x）：开关走 boolean 体系，
             // 数量与模式是连续值，走单独 int 通道
             sStatusIconLimitEnable.set(bundle.getBoolean(Constants.PREFS_STATUS_ICON_LIMIT_ENABLE,
