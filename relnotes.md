@@ -1,3 +1,46 @@
+## v3.9.6 修复：关了「通知清除按钮」也照样被隐藏
+
+### 现象
+
+设置里把「通知清除按钮」关掉，通知栏的清除按钮（✕）依旧不出现；重启 SystemUI
+后偶尔正常，改一次设置又会消失。
+
+### 根因（两条链，都指向同一件事：目标进程拿不到真实配置）
+
+1. `onModuleLoaded` / 重载广播走 `reloadPrefs()`，它用 `getRemotePreferences()`
+   拼 Bundle。SystemUI 进程读不到模块 App 的私有 prefs，`getBoolean` 全部返回
+   **默认值**，而默认值里 `hide_dismiss_btn=true`。于是「设置页一改开关 → 发重载
+   广播 → 默认值把真实配置覆盖成 true → 清除按钮继续隐藏」，开关形同废纸。
+2. 启动瞬间 provider 还没起来（首次 `getContentResolver().call` 通常 1~2 秒后才
+   成功），这段时间 `sHideDismissFlag` 还是字段初值 `true`。钩子把按钮移出屏外并
+   设成 INVISIBLE，之后再拿到 `false` 也没有任何还原路径 —— 隐藏是不可逆的。
+
+实测日志（v3.9.5）：
+
+```
+applyRealPrefs in hideDismiss=true log=false      ← 远程 prefs 只给了默认值
+syncRealPrefs BAD result=null                    ← provider 首次调用返回 null
+attach flag hideDismiss=true                     ← 这段窗口里按钮被隐藏
+syncRealPrefs OK hideDismiss=false log=false     ← 真值到得太晚，已无法还原
+```
+
+### 修了什么
+
+- `reloadPrefs()` 只信 provider 的 `get_prefs`：取不到就保留上次已知状态并记一条
+  日志，**不再拿默认值当真实配置**。
+- 新增 `sPrefsLoaded`：配置没到手之前，清除按钮钩子一律不动视图，杜绝「按默认值
+  先隐藏、之后再无法还原」。
+- 隐藏时把 icon 与容器记进 `sHiddenDismissViews`；开关关掉时在主线程成对还原
+  （`setVisibility(VISIBLE)` + `translationY=0`），不必重启 SystemUI。
+
+### 验证
+
+| 场景 | 结果 |
+| --- | --- |
+| `hide_dismiss_btn=false` 重启 SystemUI | 清除按钮显示 |
+| `hide_dismiss_btn=true` 重启 SystemUI | 日志 `[清除按钮] 已隐藏：图标 INVISIBLE + 容器下移…` |
+| 隐藏状态下关掉开关 + 重载广播（不重启） | 日志 `[清除按钮] 开关已关闭，已还原 1 个被隐藏的按钮` |
+
 ## v3.9.3 干净重建（正式版）
 
 v3.9.2 发布时构建环境被误清，只能借用旧的 `Constants.class` 合并生成 dex，
