@@ -58,6 +58,19 @@ public class MainHook extends XposedModule {
     private static volatile boolean sClassLoadGuardInstalled = false;
     private static final AtomicBoolean sHideLockFodFlag = new AtomicBoolean(true);
     private static final AtomicBoolean sHideDismissFlag = new AtomicBoolean(true);
+
+    /**
+     * 真实配置是否已从模块 App 同步到手（v3.9.6）。
+     *
+     * <p>跨进程读不到模块 App 私有 prefs 时，getBoolean 只会给默认值；默认值里
+     * hide_dismiss_btn=true，直接在钩子里信默认值就会「用户关了也照样隐藏」。把这个
+     * 状态位放在钩子前面：配置没到手就不动视图，等 provider 回真值再决定。
+     */
+    private static final AtomicBoolean sPrefsLoaded = new AtomicBoolean(false);
+
+    /** 已隐藏的清除按钮：icon → 被下移的容器。开关关掉时按这张表原样还原。 */
+    private static final java.util.Map<View, View> sHiddenDismissViews =
+            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<View, View>());
     private static final AtomicBoolean sFocusGlassFlag = new AtomicBoolean(true);
     private static final AtomicBoolean sAodBatterySyncFlag = new AtomicBoolean(true);
     private static volatile boolean sAodDozing = false;
@@ -1125,41 +1138,22 @@ public class MainHook extends XposedModule {
 
     /* JADX INFO: Access modifiers changed from: private */
     public void reloadPrefs() {
-        if (this.sPrefs == null) {
-            return;
-        }
-        try {
-            Bundle bundle = new Bundle();
-            for (int i = 0; i < Constants.ALL_PREF_KEYS.length; i++) {
-                bundle.putBoolean(Constants.ALL_PREF_KEYS[i], this.sPrefs.getBoolean(Constants.ALL_PREF_KEYS[i], Constants.ALL_PREF_DEFAULTS[i]));
-            }
-            // ★ v3.41.2 通知宽度比例：连续值不在 ALL_PREF_KEYS（那是 boolean[]）里，
-            //   必须单独补一行，否则 applyRealPrefs 里的 getInt 永远拿默认值。
-            try {
-                bundle.putInt(Constants.KEY_NOTIF_WIDTH_RATIO,
-                        this.sPrefs.getInt(Constants.PREFS_NOTIF_WIDTH_RATIO, Constants.DEFAULT_NOTIF_WIDTH_RATIO));
-            } catch (Throwable unused) {
-                bundle.putInt(Constants.KEY_NOTIF_WIDTH_RATIO, Constants.DEFAULT_NOTIF_WIDTH_RATIO);
-            }
-            // ★ v3.44.5 横屏比例：与竖屏分开，同样走这条 int 通道
-            try {
-                bundle.putInt(Constants.KEY_NOTIF_WIDTH_RATIO_LAND,
-                        this.sPrefs.getInt(Constants.PREFS_NOTIF_WIDTH_RATIO_LAND,
-                                Constants.DEFAULT_NOTIF_WIDTH_RATIO_LAND));
-            } catch (Throwable unused) {
-                bundle.putInt(Constants.KEY_NOTIF_WIDTH_RATIO_LAND,
-                        Constants.DEFAULT_NOTIF_WIDTH_RATIO_LAND);
-            }
-            applyRealPrefs(bundle);
+        // ★ v3.9.6 根因修复：这里过去用 this.sPrefs（跨进程 XSharedPreferences）拼 Bundle。
+        //   目标进程（SystemUI 等）读不到模块 App 的私有 prefs，getBoolean 全部返回默认值，
+        //   而默认值里 hide_dismiss_btn=true —— 于是「设置页改开关 → 重载广播 → 默认值
+        //   覆盖真实配置 → 清除按钮继续被隐藏」，用户关了开关也不生效。
+        //   现在唯一可信来源是 provider 的 get_prefs；取不到就保持上次已知状态，
+        //   绝不拿默认值当真实配置用。
+        if (trySyncRealPrefsOnce()) {
             // 状态栏通知图标：设置变化时对活着的容器重放（尽量不重启 SystemUI 也能生效）
             try {
                 StatusIconLimit.onPrefsChanged();
             } catch (Throwable unused) {
                 // 容器尚未创建时为空遍历，不影响
             }
-        } catch (Throwable th) {
-            LogUtil.logAlways("读取设置失败: " + th);
+            return;
         }
+        LogUtil.logAlways("重载设置失败：模块 App 未响应，保留上次已知配置（不套用默认值）");
     }
 
     /* JADX INFO: Access modifiers changed from: private */
@@ -1293,7 +1287,11 @@ public class MainHook extends XposedModule {
             this.sHideLockFod = z3;
             sHideLockFodFlag.set(z3);
             this.sHideDismissBtn = z4;
-            sHideDismissFlag.set(z4);
+            boolean wasHideDismiss = sHideDismissFlag.getAndSet(z4);
+            sPrefsLoaded.set(true);
+            if (wasHideDismiss && !z4) {
+                restoreHiddenDismissViews();
+            }
             this.sFocusGlass = z5;
             sFocusGlassFlag.set(z5);
             sAodBatterySyncFlag.set(z6);
@@ -2569,7 +2567,8 @@ public class MainHook extends XposedModule {
                 private volatile int sId;
 
                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                    if (!MainHook.sHideDismissFlag.get()) {
+                    // 配置没到手时不动视图：默认值代表不了用户意图
+                    if (!MainHook.sPrefsLoaded.get() || !MainHook.sHideDismissFlag.get()) {
                         return chain.proceed();
                     }
                     Object thisObject = chain.getThisObject();
@@ -2603,6 +2602,7 @@ public class MainHook extends XposedModule {
                             view2.setTranslationX(0.0f);
                             view2.setTranslationY(i + (f * 20.0f));
                             view.setVisibility(4);
+                            MainHook.sHiddenDismissViews.put(view, view2);
                             if (LogUtil.hitOnce("dismiss-hide")) {
                                 LogUtil.logAlways("[清除按钮] 已隐藏：图标 INVISIBLE + 容器下移到屏底之外（+" + i + "px）按钮类=" + view.getClass().getName() + " 容器类=" + view2.getClass().getName());
                             }
@@ -2619,6 +2619,43 @@ public class MainHook extends XposedModule {
     }
 
 
+
+    /**
+     * 把之前隐藏的清除按钮原样放回去（v3.9.6）。
+     *
+     * <p>隐藏是「图标 INVISIBLE + 容器下移一屏」，二者都必须成对撤销，否则按钮虽然
+     * 在布局里也看不见。必须在主线程改 View，configure 同步在 worker 线程上跑。
+     */
+    private static void restoreHiddenDismissViews() {
+        try {
+            new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                @Override // java.lang.Runnable
+                public void run() {
+                    int i = 0;
+                    synchronized (sHiddenDismissViews) {
+                        for (java.util.Map.Entry<View, View> entry : sHiddenDismissViews.entrySet()) {
+                            try {
+                                View icon = entry.getKey();
+                                View container = entry.getValue();
+                                if (icon != null) {
+                                    icon.setVisibility(0);
+                                    i++;
+                                }
+                                if (container != null) {
+                                    container.setTranslationY(0.0f);
+                                }
+                            } catch (Throwable unused) {
+                            }
+                        }
+                        sHiddenDismissViews.clear();
+                    }
+                    LogUtil.logAlways("[清除按钮] 开关已关闭，已还原 " + i + " 个被隐藏的按钮");
+                }
+            });
+        } catch (Throwable th) {
+            LogUtil.logAlways("[清除按钮] 还原失败: " + th);
+        }
+    }
 
     private void installFocusGlassHooks(final ClassLoader classLoader) {
         try {
