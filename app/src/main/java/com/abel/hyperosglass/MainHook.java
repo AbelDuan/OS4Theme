@@ -231,7 +231,22 @@ public class MainHook extends XposedModule {
                     @Override // android.content.BroadcastReceiver
                     public void onReceive(Context context, Intent intent) {
                         try {
-                            MainHook.this.reloadPrefs();
+                            // v3.9.8：优先用广播里带的配置，不再回调模块 App（不拉起进程）
+                            Bundle fromIntent = null;
+                            try {
+                                fromIntent = CfgChannel.decode(intent == null ? null
+                                        : intent.getStringExtra(Constants.EXTRA_CFG));
+                            } catch (Throwable unused) {
+                            }
+                            if (fromIntent != null) {
+                                MainHook.this.applyRealPrefs(fromIntent);
+                                try {
+                                    CfgChannel.writeCfg(context, CfgChannel.encode(fromIntent));
+                                } catch (Throwable unused) {
+                                }
+                            } else {
+                                MainHook.this.reloadPrefs();
+                            }
                             LogUtil.logAlways("收到重载广播，设置已刷新");
                         } catch (Throwable unused) {
                         }
@@ -1164,16 +1179,34 @@ public class MainHook extends XposedModule {
 
     /* JADX INFO: Access modifiers changed from: private */
     public boolean trySyncRealPrefsOnce() {
+        Object app = currentApplication();
+        if (!(app instanceof Context)) {
+            return false;
+        }
+        Context ctx = (Context) app;
+        // ★ v3.9.8：主通道改成 Settings.System —— 读它不会启动模块 App 进程，
+        //   从根上消掉「每次进程加载 = 唤醒一次模块 App」。provider 只留作一次性迁移。
+        Bundle fromSys = CfgChannel.decode(CfgChannel.readCfg(ctx));
+        if (fromSys != null) {
+            applyRealPrefs(fromSys);
+            return true;
+        }
         Bundle bundleCall;
         try {
-            Object objCurrentApplication = currentApplication();
-            if ((objCurrentApplication instanceof Context) && (bundleCall = ((Context) objCurrentApplication).getContentResolver().call(Uri.parse(Constants.STATUS_URI), Constants.METHOD_GET_PREFS, (String) null, (Bundle) null)) != null && bundleCall.getBoolean("ok", false)) {
-                applyRealPrefs(bundleCall);
-                return true;
+            bundleCall = ctx.getContentResolver().call(Uri.parse(Constants.STATUS_URI),
+                    Constants.METHOD_GET_PREFS, (String) null, (Bundle) null);
+            if (bundleCall == null || !bundleCall.getBoolean("ok", false)) {
+                return false;
             }
         } catch (Throwable unused) {
+            return false;
         }
-        return false;
+        applyRealPrefs(bundleCall);
+        // 迁移：把这次拿到的配置写进 Settings.System，之后就不再找模块 App。
+        // SystemUI 自带 WRITE_SETTINGS；写不进去也没关系，下次重试仍是同一条路。
+        CfgChannel.writeCfg(ctx, CfgChannel.encode(bundleCall));
+        LogUtil.logAlways("配置已迁移到 Settings.System，之后不再拉起模块 App");
+        return true;
     }
 
     private void syncRealPrefsAsync() {
@@ -1301,7 +1334,12 @@ public class MainHook extends XposedModule {
             sHideLockFodFlag.set(z3);
             this.sHideDismissBtn = z4;
             boolean wasHideDismiss = sHideDismissFlag.getAndSet(z4);
-            sPrefsLoaded.set(true);
+            boolean firstLoad = sPrefsLoaded.compareAndSet(false, true);
+            if (firstLoad) {
+                // 进程刚起来时顶部容器可能已经按默认宽度量过一轮；拿到真实配置后
+                // 立刻让它按真实卡片宽度重量一次，避免「开机后不重启 SystemUI 就一直错位」。
+                NotifHeaderAlign.refresh();
+            }
             if (wasHideDismiss && !z4) {
                 restoreHiddenDismissViews();
             }
