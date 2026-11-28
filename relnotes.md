@@ -1,3 +1,51 @@
+## v3.9.8 修复：开机后时钟再错位 / 模块 App 被反复唤醒
+
+### 一、开机后时钟又错位
+
+v3.9.7 的 onMeasure 钩子**其实没挂上**：`MiuiNotificationHeaderView` 没有自己声明
+`onMeasure(int,int)`，`getDeclaredMethod` 直接抛 `NoSuchMethodException`，
+日志里只有一行「onMeasure 挂钩失败」。所以只在「比例变化」时靠 requestLayout 碰巧
+修好，开机后没有任何东西触发重排，时钟就停在旧 x 上，直到重启 SystemUI。
+
+现在改成**事件驱动 + 写死几何**（按「不要重算」的思路）：
+
+1. 抓 `normal_notification_header_view` 与 `notification_stack_scroller` 实例，
+   给两个 View 挂 `addOnLayoutChangeListener`：列表宽度一变，就把顶部容器宽度
+   对齐到**实测**值；容器自己布局完也再校一次。没有每帧开销，也不依赖钩子是否
+   命中某个方法。
+2. 每次实测到宽度，写进 `Settings.System` 的 `hsg_geom`（`w` 竖屏 / `wl` 横屏 /
+   `inset` 内边距）。开机后第一次布局先用上次写死的值，随后被实测值纠正 ——
+   这就是「调节时固定写入位置」，不再依赖运行时推算。
+3. 进程首次成功读到配置后主动 `refresh()` 一次，兜住「先按默认宽度量过一轮」的时序。
+
+### 二、OS4 Themer 后台唤醒 50+ 次
+
+根因是**每次作用域进程加载都会把模块 App 拉起来一次**，两条路：
+
+| 路径 | 说明 |
+| --- | --- |
+| `LogUtil.logStartup` → `writeAlways` → `enqueue` → `contentResolver.call(append_log)` | 每开一个 SystemUI/设置/插件/省电服务进程就推一条启动日志给 App |
+| `get_prefs` 走 `ContentResolver.call(StatusProvider, ...)` | 这是配置主通道，provider 空闲 5 秒还会自杀，下次再拉起 |
+
+改法：
+
+1. 启动里程碑只进 logcat；只有「日志开关打开」时才推给 App。
+2. 配置通道换成 `Settings.System`（`hsg_cfg`，一行 `k=v;` 文本）：
+   - 读它不会启动任何应用进程；
+   - 模块 App 改设置时把配置**随重载广播一起发**（`cfg` extra），SystemUI 直接套用；
+   - 首次升级时若 `hsg_cfg` 还不存在，才回调一次 provider 做迁移，随后写回
+     `Settings.System`，之后再也不碰 App。
+3. 配置文本带版本前缀 `v=1;`，避免把同名外来键当成配置。
+
+### 验证（真机）
+
+| 项 | 结果 |
+| --- | --- |
+| 冷启 SystemUI 后直接下拉（不重启、不调比例） | 时钟左缘 ≈ 卡片左缘（卡片 1489px 宽，内边距 26px） |
+| 冷启 SystemUI 的模块 App 进程拉起次数 | 0（`am_proc_start` 计数） |
+| 打开系统设置页（另一个作用域进程） | 依然 0 |
+| `Settings.System` 几何 | `w` / `wl` / `inset` 已写入 |
+
 ## v3.9.7 修复：调整通知宽度后，顶部时钟不跟着移动
 
 ### 现象
