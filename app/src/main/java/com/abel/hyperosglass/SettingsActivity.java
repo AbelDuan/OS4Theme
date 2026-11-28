@@ -65,6 +65,8 @@ public class SettingsActivity extends Activity {
             StatusProvider.noteActivityStarted();
         } catch (Throwable unused) {
         }
+        // v3.9.8：把既有配置同步一份到 Settings.System（首次升级后由这里补齐）
+        mirrorCfg();
         try {
             getWindow().setNavigationBarColor(Color.parseColor("#F5F6F8"));
             getWindow().getDecorView().setSystemUiVisibility(getWindow().getDecorView().getSystemUiVisibility() | 16);
@@ -235,6 +237,20 @@ public class SettingsActivity extends Activity {
             }
             editorEdit.commit();
             editorEdit2.commit();
+            mirrorCfg();
+        } catch (Throwable unused) {
+        }
+    }
+
+    /**
+     * 把当前 prefs 镜像到 {@code Settings.System}（v3.9.8）。
+     *
+     * <p>SystemUI 侧只读这里，不再向模块 App 的 provider 取配置 ——
+     * 否则每次进程加载都会把模块 App 拉起来一次（第三方统计里的「后台唤醒」）。
+     */
+    private void mirrorCfg() {
+        try {
+            CfgChannel.writeCfg(this, CfgChannel.fromPrefs(sp()));
         } catch (Throwable unused) {
         }
     }
@@ -244,6 +260,7 @@ public class SettingsActivity extends Activity {
         try {
             sp().edit().putBoolean(str, z).commit();
             ceSp().edit().putBoolean(str, z).commit();
+            mirrorCfg();
         } catch (Throwable unused) {
         }
     }
@@ -259,6 +276,7 @@ public class SettingsActivity extends Activity {
         try {
             sp().edit().putInt(str, i).commit();
             ceSp().edit().putInt(str, i).commit();
+            mirrorCfg();
         } catch (Throwable unused) {
         }
     }
@@ -845,6 +863,9 @@ public class SettingsActivity extends Activity {
             String[] strArr = new String[1];
             Intent intent = new Intent(Constants.ACTION_RELOAD_PREFS);
             intent.setPackage(Constants.TARGET_PKG);
+            // v3.9.8：配置随广播一起送过去，SystemUI 侧直接套用；
+            // 不再需要「收到广播 → 回调模块 App 取配置」那条会拉起进程的路径。
+            intent.putExtra(Constants.EXTRA_CFG, CfgChannel.fromPrefs(sp()));
             sendBroadcast(intent);
         } catch (Throwable unused) {
         }
