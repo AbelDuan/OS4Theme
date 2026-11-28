@@ -2,6 +2,8 @@ package com.abel.hyperosglass;
 
 /* JADX INFO: loaded from: classes.dex */
 public final class Constants {
+    /** 重载广播里携带的配置负载（CfgChannel.encode 的产物） */
+    public static final String EXTRA_CFG = "cfg";
     public static final String ACTION_RELOAD_PREFS = "com.abel.hyperosglass.action.RELOAD_PREFS";
     public static final int AOD_ARR_LEN = 9;
     public static final String AOD_BATTERY_CLASS = "com.android.systemui.statusbar.views.MiuiBatteryMeterView";
@@ -131,7 +133,7 @@ public final class Constants {
     public static final String TARGET_PLUGIN_PKG = "miui.systemui.plugin";
     // 日志里打印的模块版本号。⚠️ 必须和 app/build.gradle 的 versionName 一致，
     // 否则排查时会被日志骗（2026-10-25 就发生过：跑的是 3.283.3，日志写 3.41.2）。
-    public static final String VERSION = "3.9.7";
+    public static final String VERSION = "3.9.8";
 
     // ============================================================
     // 通知宽度调节（v3.41.2 新增）
