@@ -79,8 +79,22 @@ public final class LogUtil {
      * 进程级里程碑（模块加载、版本号等）：每个进程只有一两条，
      * 不受日志开关影响，方便确认模块有没有被加载、加载的是哪个版本。
      */
+    /**
+     * 进程启动里程碑（v3.9.8 起只进 logcat）。
+     *
+     * <p>旧实现走 {@link #writeAlways}，它会 {@code enqueue} → {@code contentResolver.call}
+     * 推给模块 App —— 每加载一个作用域进程（SystemUI / 设置 / 插件 / 省电服务）就
+     * 把模块 App 拉起来一次。第三方统计里「后台唤醒 50+ 次」就是这么来的。
+     * 里程碑留在 logcat 就够排查用；日志开关打开时才顺带写进 App 侧日志文件。
+     */
     public static void logStartup(String str) {
-        writeAlways(str);
+        try {
+            android.util.Log.i(Constants.LOG_TAG, str);
+        } catch (Throwable ignored) {
+        }
+        if (sEnabled) {
+            enqueue(ts() + " [HyperOSGlass] " + str + "\n");
+        }
     }
 
     public static void logAlwaysOnce(String str, String str2) {
